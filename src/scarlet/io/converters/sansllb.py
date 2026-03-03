@@ -261,34 +261,105 @@ def convert_sansllb_to_scarlet_nxsas_raw(
 
             element_order: List[bytes] = []
 
-            # Element 1: aperture -> NXaperture
-            ap_el = _ensure_group(elements_out, "aperture", "NXaperture")
-            if ap_shape is not None:
-                _write_dataset(ap_el, "shape", ap_shape)
-            if ap_xgap is not None:
-                # x_gap/y_gap in input are usually mm; store meters in SCARLET? (schema doesn't force unit datasets)
-                _write_dataset(ap_el, "x_gap", _mm_or_m_to_m(ap_xgap))
-            if ap_ygap is not None:
-                _write_dataset(ap_el, "y_gap", _mm_or_m_to_m(ap_ygap))
+            collimator_path = f"{inst_in}/collimator"
+            if collimator_path in fin and isinstance(fin[collimator_path], h5py.Group):
+                col_g = fin[collimator_path]
 
-            ap_tr = _ensure_group(ap_el, "transformations", "NXtransformations")
-            # If collimator distance is 0, we still define upstream element at z<0
-            _write_dataset(ap_tr, "translation", np.array([0.0, 0.0, -0.1], dtype=float))
-            element_order.append(b"aperture")
+                def _idx(prefix: str, name: str) -> Optional[int]:
+                    if not name.startswith(prefix):
+                        return None
+                    tail = name[len(prefix) :]
+                    return int(tail) if tail.isdigit() else None
 
-            # Element 2: collimator -> represent as NXguide (allowed in SCARLET v1.0)
-            guide_el = _ensure_group(elements_out, "collimator", "NXguide")
-            if col_len is not None:
-                _write_dataset(guide_el, "length", _mm_or_m_to_m(col_len))
-            # store distance as a hint if available
-            if col_dist is not None:
-                _write_dataset(guide_el, "distance", _mm_or_m_to_m(col_dist))
+                slit_idxs = sorted(
+                    i for i in (_idx("slit", k) for k in col_g.keys()) if i is not None  # type: ignore[arg-type]
+                )
+                guide_idxs = sorted(
+                    i for i in (_idx("guide", k) for k in col_g.keys()) if i is not None  # type: ignore[arg-type]
+                )
 
-            guide_tr = _ensure_group(guide_el, "transformations", "NXtransformations")
-            # Heuristic: place collimator/guide upstream. If length is known, place its exit at z=-0.0 and start at -length.
-            L = _mm_or_m_to_m(col_len) if col_len is not None else 1.0
-            _write_dataset(guide_tr, "translation", np.array([0.0, 0.0, -max(L, 0.1)], dtype=float))
-            element_order.append(b"collimator")
+                max_i = max(slit_idxs[-1] if slit_idxs else -1, guide_idxs[-1] if guide_idxs else -1)
+
+                # Collimation length (used to distribute elements if individual distances are missing)
+                col_total_len = _safe_get(fin, f"{collimator_path}/length")
+                if col_total_len is None:
+                    col_total_len = _safe_get(fin, f"{collimator_path}/geometry/size")
+                total_L = float(_mm_or_m_to_m(col_total_len)) if col_total_len is not None else 1.0
+
+                # Distance from sample to the downstream-most collimation element.
+                # Prefer an explicit /collimator/distance; else use the maximum element distance if present.
+                end_dist = _safe_get(fin, f"{collimator_path}/distance")
+                if end_dist is None:
+                    for i in slit_idxs:
+                        d = _safe_get(fin, f"{collimator_path}/slit{i}/distance")
+                        if d is not None:
+                            end_dist = d
+                end_d = float(_mm_or_m_to_m(end_dist)) if end_dist is not None else 0.1
+
+                # Build physical order: slit0, guide0, slit1, guide1, ...
+                ordered: List[tuple[str, int]] = []
+                for i in range(max_i + 1):
+                    if f"slit{i}" in col_g:
+                        ordered.append(("slit", i))
+                    if f"guide{i}" in col_g:
+                        ordered.append(("guide", i))
+
+                if ordered:
+                    step = (total_L / (len(ordered) - 1)) if len(ordered) > 1 else 0.0
+                    start_d = end_d + total_L
+
+                    for k, (kind, i) in enumerate(ordered):
+                        name = f"{kind}{i}"
+                        src = col_g[name]
+
+                        if kind == "slit":
+                            el = _ensure_group(elements_out, name, "NXslit")
+                            x_gap = _safe_get(fin, f"{collimator_path}/{name}/x_gap")
+                            y_gap = _safe_get(fin, f"{collimator_path}/{name}/y_gap")
+                            if x_gap is not None:
+                                _write_dataset(el, "x_gap", _mm_or_m_to_m(x_gap))
+                            if y_gap is not None:
+                                _write_dataset(el, "y_gap", _mm_or_m_to_m(y_gap))
+                        else:
+                            el = _ensure_group(elements_out, name, "NXguide")
+                            if "m_value" in src:
+                                _write_dataset(el, "m_value", _as_float_scalar(src["m_value"][()]))
+                            if "selection" in src:
+                                _write_dataset(el, "selection", src["selection"][()])
+
+                        d = _safe_get(fin, f"{collimator_path}/{name}/distance")
+                        dist_m = float(_mm_or_m_to_m(d)) if d is not None else (start_d - k * step)
+
+                        tr = _ensure_group(el, "transformations", "NXtransformations")
+                        _write_dataset(tr, "translation", np.array([0.0, 0.0, -dist_m], dtype=float))
+                        element_order.append(name.encode())
+                else:
+                    warnings.append("No slit*/guide* entries found under input collimator; using heuristic collimation.")
+
+            if not element_order:
+                # Heuristic fallback (kept for legacy/partial files)
+                ap_el = _ensure_group(elements_out, "aperture", "NXaperture")
+                if ap_shape is not None:
+                    _write_dataset(ap_el, "shape", ap_shape)
+                if ap_xgap is not None:
+                    _write_dataset(ap_el, "x_gap", _mm_or_m_to_m(ap_xgap))
+                if ap_ygap is not None:
+                    _write_dataset(ap_el, "y_gap", _mm_or_m_to_m(ap_ygap))
+
+                ap_tr = _ensure_group(ap_el, "transformations", "NXtransformations")
+                _write_dataset(ap_tr, "translation", np.array([0.0, 0.0, -0.1], dtype=float))
+                element_order.append(b"aperture")
+
+                guide_el = _ensure_group(elements_out, "collimator", "NXguide")
+                if col_len is not None:
+                    _write_dataset(guide_el, "length", _mm_or_m_to_m(col_len))
+                if col_dist is not None:
+                    _write_dataset(guide_el, "distance", _mm_or_m_to_m(col_dist))
+
+                guide_tr = _ensure_group(guide_el, "transformations", "NXtransformations")
+                L = _mm_or_m_to_m(col_len) if col_len is not None else 1.0
+                _write_dataset(guide_tr, "translation", np.array([0.0, 0.0, -max(L, 0.1)], dtype=float))
+                element_order.append(b"collimator")
 
             _write_dataset(coll_out, "element_order", np.array(element_order, dtype="S"))
 
