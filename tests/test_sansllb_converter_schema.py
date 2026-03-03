@@ -55,15 +55,44 @@ class TestSansLlbConverterSchema(unittest.TestCase):
                 return int(tail) if tail.isdigit() else None
 
             slit_idxs = sorted(i for i in (idx("slit", k) for k in col.keys()) if i is not None)
-            guide_idxs = sorted(i for i in (idx("guide", k) for k in col.keys()) if i is not None)
-            max_i = max(slit_idxs[-1] if slit_idxs else -1, guide_idxs[-1] if guide_idxs else -1)
+            guide_idxs_all = sorted(i for i in (idx("guide", k) for k in col.keys()) if i is not None)
+
+            guide_idxs: list[int] = []
+            for i in guide_idxs_all:
+                gg = col[f"guide{i}"]
+                if "selection" in gg:
+                    sel = gg["selection"][()]
+                    if hasattr(sel, "size") and getattr(sel, "size") == 1:
+                        sel = sel.reshape(()).item() if hasattr(sel, "reshape") else sel[0]
+                    if isinstance(sel, (bytes, bytearray)):
+                        sel_s = sel.decode(errors="replace")
+                    else:
+                        sel_s = str(sel)
+                    if sel_s != "ng":
+                        continue
+                guide_idxs.append(i)
+
+            max_guide = guide_idxs[-1] if guide_idxs else None
+            if max_guide is not None:
+                slit_idxs = [i for i in slit_idxs if i <= max_guide + 1]
 
             expected: list[str] = []
-            for i in range(max_i + 1):
-                if f"slit{i}" in col:
-                    expected.append(f"slit{i}")
-                if f"guide{i}" in col:
-                    expected.append(f"guide{i}")
+            if max_guide is not None:
+                for i in range(max_guide + 1):
+                    if i in slit_idxs and f"slit{i}" in col:
+                        expected.append(f"slit{i}")
+                    if i in guide_idxs and f"guide{i}" in col:
+                        expected.append(f"guide{i}")
+                last_slit = max_guide + 1
+                if last_slit in slit_idxs and f"slit{last_slit}" in col:
+                    expected.append(f"slit{last_slit}")
+            else:
+                max_i = max(slit_idxs[-1] if slit_idxs else -1, guide_idxs[-1] if guide_idxs else -1)
+                for i in range(max_i + 1):
+                    if i in slit_idxs and f"slit{i}" in col:
+                        expected.append(f"slit{i}")
+                    if i in guide_idxs and f"guide{i}" in col:
+                        expected.append(f"guide{i}")
 
         with h5py.File(out, "r") as fout:
             got = [x.decode() if isinstance(x, (bytes, bytearray)) else str(x) for x in fout["/entry/instrument/collimation/element_order"][()]]

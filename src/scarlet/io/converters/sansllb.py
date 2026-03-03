@@ -274,11 +274,28 @@ def convert_sansllb_to_scarlet_nxsas_raw(
                 slit_idxs = sorted(
                     i for i in (_idx("slit", k) for k in col_g.keys()) if i is not None  # type: ignore[arg-type]
                 )
-                guide_idxs = sorted(
+                guide_idxs_all = sorted(
                     i for i in (_idx("guide", k) for k in col_g.keys()) if i is not None  # type: ignore[arg-type]
                 )
 
-                max_i = max(slit_idxs[-1] if slit_idxs else -1, guide_idxs[-1] if guide_idxs else -1)
+                # SANS-LLB exports may include non-guide elements under guide* (e.g. selection="ft").
+                # Keep only neutron guide segments (selection="ng") when selection is available.
+                guide_idxs: List[int] = []
+                for i in guide_idxs_all:
+                    gname = f"guide{i}"
+                    gg = col_g[gname]
+                    if "selection" in gg:
+                        sel = _as_str(gg["selection"][()])
+                        if sel != "ng":
+                            continue
+                    guide_idxs.append(i)
+
+                max_guide = guide_idxs[-1] if guide_idxs else None
+
+                # If we have guides, we expect a slit upstream of each guide and one final slit downstream:
+                # slit0, guide0, slit1, guide1, ..., slitN (with N = max_guide + 1).
+                if max_guide is not None:
+                    slit_idxs = [i for i in slit_idxs if i <= max_guide + 1]
 
                 # Collimation length (used to distribute elements if individual distances are missing)
                 col_total_len = _safe_get(fin, f"{collimator_path}/length")
@@ -298,11 +315,22 @@ def convert_sansllb_to_scarlet_nxsas_raw(
 
                 # Build physical order: slit0, guide0, slit1, guide1, ...
                 ordered: List[tuple[str, int]] = []
-                for i in range(max_i + 1):
-                    if f"slit{i}" in col_g:
-                        ordered.append(("slit", i))
-                    if f"guide{i}" in col_g:
-                        ordered.append(("guide", i))
+                if max_guide is not None:
+                    for i in range(max_guide + 1):
+                        if i in slit_idxs and f"slit{i}" in col_g:
+                            ordered.append(("slit", i))
+                        if i in guide_idxs and f"guide{i}" in col_g:
+                            ordered.append(("guide", i))
+                    last_slit = max_guide + 1
+                    if last_slit in slit_idxs and f"slit{last_slit}" in col_g:
+                        ordered.append(("slit", last_slit))
+                else:
+                    max_i = max(slit_idxs[-1] if slit_idxs else -1, guide_idxs[-1] if guide_idxs else -1)
+                    for i in range(max_i + 1):
+                        if i in slit_idxs and f"slit{i}" in col_g:
+                            ordered.append(("slit", i))
+                        if i in guide_idxs and f"guide{i}" in col_g:
+                            ordered.append(("guide", i))
 
                 if ordered:
                     step = (total_L / (len(ordered) - 1)) if len(ordered) > 1 else 0.0
