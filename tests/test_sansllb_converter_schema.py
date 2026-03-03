@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
-import tempfile
 import unittest
 
 try:
@@ -24,13 +24,15 @@ class TestSansLlbConverterSchema(unittest.TestCase):
         if not sample.exists():
             self.skipTest(f"Missing test input file: {sample}")
 
-        with tempfile.TemporaryDirectory(prefix="scarlet_processed_") as td:
-            processed = Path(td) / "processed_data"
-            processed.mkdir(parents=True, exist_ok=True)
-            out = processed / "sans-llb2025n002339_scarlet_nxsas_raw.h5"
+        # Write output to a persistent location for manual inspection.
+        # Override with SCARLET_TEST_OUTPUT_DIR=/path/to/dir if desired.
+        root = Path(__file__).resolve().parent.parent
+        processed = Path(os.environ.get("SCARLET_TEST_OUTPUT_DIR", root / "data" / "SANSLLB" / "processed"))
+        processed.mkdir(parents=True, exist_ok=True)
+        out = processed / "sans-llb2025n002339_scarlet_nxsas_raw.h5"
 
-            convert_sansllb_to_scarlet_nxsas_raw(sample, out, overwrite=True)
+        convert_sansllb_to_scarlet_nxsas_raw(sample, out, overwrite=True)
 
-            schema = load_schema("scarlet_nxsas_raw_v1.0.yaml")
-            report = validate_nexus_file(out, schema)
-            self.assertTrue(report.ok, "\n".join(report.format_lines()))
+        schema = load_schema("scarlet_nxsas_raw_v1.0.yaml")
+        report = validate_nexus_file(out, schema)
+        self.assertTrue(report.ok, "\n".join(report.format_lines()))
