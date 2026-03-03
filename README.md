@@ -111,7 +111,7 @@ from scarlet.io.adapters.sansllb import convert
 convert("data/SANSLLB/raw/mon_fichier.nxs", "data/SANSLLB/processed/nxsas_raw.nxs")
 ```
 
-Note : par défaut, l’adaptateur utilise `nexusformat` si installé (extra `scarlet-sans[nexus]`), sinon il retombe sur un backend `h5py`. Pour forcer un backend : `convert_sansllb(..., backend="nexusformat")`. Certaines correspondances restent marquées `TODO` dans `src/scarlet/io/adapters/sansllb.py`.
+Note : l’adaptateur utilise `nexusformat` si installé, sinon il retombe sur un backend `h5py`. Pour forcer un backend : `convert_sansllb(..., backend="nexusformat")`. Certaines correspondances restent marquées `TODO` dans `src/scarlet/io/adapters/sansllb.py`.
 Dans les fichiers SANSLLB présents ici, la collimation est récupérée depuis `/.../collimator` (slits/guides) quand disponible (conversion mm→m) ; les distances manquantes restent à `NaN` avec un `TODO`.
 
 ---

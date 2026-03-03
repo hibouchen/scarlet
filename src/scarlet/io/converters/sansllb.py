@@ -59,13 +59,13 @@ def _safe_get(fin: h5py.File, path: str):
 def _ensure_group(g: h5py.Group, name: str, nx_class: Optional[str] = None) -> h5py.Group:
     gg = g.create_group(name)
     if nx_class:
-        gg.attrs["NX_class"] = np.string_(nx_class)
+        gg.attrs["NX_class"] = np.bytes_(nx_class)
     return gg
 
 
 def _write_dataset(g: h5py.Group, name: str, data, *, as_string: bool = False) -> h5py.Dataset:
     if as_string:
-        data = np.string_(str(data))
+        data = np.bytes_(str(data))
     return g.create_dataset(name, data=data)
 
 def _as_float_scalar(x) -> float:
@@ -382,7 +382,7 @@ def convert_sansllb_to_scarlet_nxsas_raw(
 
                 # NXdata view (SCARLET expects /entry/dataN with counts -> link to detector/data)
                 data_out = _ensure_group(entry_out, f"data{i}", "NXdata")
-                data_out.attrs["signal"] = np.string_("counts")
+                data_out.attrs["signal"] = np.bytes_("counts")
 
                 # softlink counts
                 data_out["counts"] = h5py.SoftLink(f"/entry/instrument/detector{i}/data")
