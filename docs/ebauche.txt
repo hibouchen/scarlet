@@ -1,0 +1,157 @@
+/entry (NXentry)
+    definition = "NXsas_raw"            # convention SCARLET pour les données brutes
+    /sample (NXsample)
+    /instrument (NXinstrument)
+        /geometry                         # groupe existant SCARLET (réservé)
+        /source (NXsource)
+        /monochromator (NXmonochromator)
+            wavelenght 
+            wavelenght_errors # wavelenght standard deviation
+            /velocity_selector (NXvelocity_selector)
+        /collimation (NXcollection)       # extension SCARLET (détaillée ci-dessous)
+        /detector0 (NXdetector) 
+        /detector..
+        /beamstop (NXbeamstop)
+        /monitor0 (NXmonitor)
+        /monitor1 (NXmonitor)
+        /monitor ... (NXmonitor)
+
+    /control (NXmonitor)   
+    /data0 (NXdata) #detector0 data (NXlink)
+    /data1 (NXdata) #detector 1 data (NXlink)
+    /data...
+
+
+/collimation (NXcollection)
+    element_order = ["A0","S1","G2",...]
+      /elements (NXcollection)
+        /A0 (NXaperture)
+          shape, x_gap/y_gap ou diameter
+          /transformations (NXtransformations)
+            translation [m] = (x,y,z)  (z<0 amont)
+        /S1 (NXslit) ...
+        /G2 (NXguide) ...
+
+
+/entry (NXentry)
+  definition = "NXsas_raw"
+  schema_version = "1.0"                      (recommandé)
+  title, start_time, end_time, duration       (recommandé)
+
+  /sample (NXsample)
+    name
+    thickness [m]                             (recommandé)
+    transmission [1]                          (optionnel brut)
+    (environment logs optionnels)
+
+  /instrument (NXinstrument)
+    /geometry (NXcollection)                  # SCARLET reserved
+      origin_definition = "sample center"
+      axis_convention   = "+z downstream, +x beam-right, +y up"
+      units_length = "m"
+      units_angle  = "deg"
+
+    /source (NXsource)
+      name, type, probe
+
+    /monochromator (NXmonochromator)
+      wavelength [angstrom]                   (mono)
+      wavelength_error [angstrom]             # écart-type (ou wavelength_errors)
+      /velocity_selector (NXvelocity_selector) (optionnel)
+        rotation_speed [rpm] (optionnel)
+        selector_type, tilt, etc. (optionnel)
+
+    /collimation (NXcollection)               # ta “bonne” collimation détaillée
+      (voir section 2 plus bas)
+
+    /beamstop (NXbeamstop)
+      shape = "circular"|"rectangular"|...
+      diameter [m] / x_gap,y_gap [m]
+      /transformations (NXtransformations)
+        translation [m] = (x,y,z)
+
+    /detector0 (NXdetector)
+      detector_number = 0
+      x_pixel_size [m]
+      y_pixel_size [m]
+      x_pixels, y_pixels
+      /transformations (NXtransformations)
+        translation [m] = (x,y,z)             # z>0 aval
+        rotation [deg] (optionnel)
+      counts (dataset)                        # où vivent réellement les données
+      counts_errors (dataset, optionnel)
+      pixel_mask_static (optionnel)
+      sensitivity_map (optionnel)
+
+    /detector1 (NXdetector)
+      ... idem ...
+    /detectorN (NXdetector)
+      ...
+
+    /monitor0 (NXmonitor)
+        mode    = "monitor"
+        preset  = 5.0e7
+        integral= 4.83e7
+        count_time = 600.0
+        /transformations (NXtransformations)   # optionnel
+            translation [m] = (x,y,z)
+            rotation    [deg] (optionnel)
+
+
+
+    /monitor1 (NXmonitor)
+      ...
+
+/entry/control (NXmonitor)
+  mode    = "timer"
+  preset  = 600.0
+  count_time = 600.2
+
+/entry/data0 (NXdata)         # NXlink vers detector0/counts (+ axes)
+    @signal = "counts"
+    @axes = ["y","x"] ou ["wavelength","y","x"]
+    counts  -> /entry/instrument/detector0/counts
+    counts_errors -> /entry/instrument/detector0/counts_errors (si existe)
+    x, y (optionnel, indices pixel) ou juste axes implicites
+
+/entry/data1 (NXdata)
+    counts -> /entry/instrument/detector1/counts
+    ...
+/entry/dataN (NXdata)
+    ...
+
+
+/entry/instrument/collimation (NXcollection)
+  @description = "SCARLET collimation chain"
+  element_order = ["A0","S1","G2","A3"]
+
+  /elements (NXcollection)
+    /A0 (NXaperture)
+      shape, x_gap/y_gap ou diameter
+      /transformations
+        translation [m] = (x,y,z)   # z<0 amont
+    /S1 (NXslit)
+      x_gap, y_gap, x_center, y_center
+      /transformations/translation
+    /G2 (NXguide)
+      length, entrance/exit sizes, m_value, curvature_radius (opt.)
+      /transformations/translation  # convention: centre du plan d’entrée
+    /A3 (NXaperture)
+      ...
+
+
+    
+TOF mode
+entry/instrument/monitor0 (NXmonitor)
+  mode   = "monitor"
+  preset = 1.0e9
+  data[ntof] = ...
+  integral = sum(data)
+  count_time = ...
+
+
+  /entry/data0 (NXdata)
+  counts -> /entry/instrument/detector0/data
+  counts_errors -> /entry/instrument/detector0/data_errors
+  @signal = "counts"
+  @axes = [...]
