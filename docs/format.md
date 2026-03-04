@@ -92,7 +92,7 @@ Les champs exacts dépendent des instruments, mais on recommande :
 
 - `NXslit` : `x_gap`, `y_gap` (en mètres) + `distance`
 - `NXpinhole` : `diameter` (mètres) + `distance`
-- `NXguide` : géométrie/section (selon vos besoins) + `distance`
+- `NXguide` : `state` ("in" | "out") + géométrie/section (selon vos besoins) + `distance`
 - `NXcollimator` : paramètres de soller/divergence (si disponible) + `distance`
 
 ### Ordre
@@ -126,6 +126,7 @@ with h5py.File("mon_fichier.nxs", "a") as f:
     g1 = coll.require_group("guide_1")
     g1.attrs["NX_class"] = "NXguide"
     g1.create_dataset("distance", data=-6.0).attrs["units"] = "m"
+    g1.create_dataset("state", data=b"in")
 
     s2 = coll.require_group("slit_2")
     s2.attrs["NX_class"] = "NXslit"

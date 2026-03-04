@@ -55,22 +55,7 @@ class TestSansLlbConverterSchema(unittest.TestCase):
                 return int(tail) if tail.isdigit() else None
 
             slit_idxs = sorted(i for i in (idx("slit", k) for k in col.keys()) if i is not None)
-            guide_idxs_all = sorted(i for i in (idx("guide", k) for k in col.keys()) if i is not None)
-
-            guide_idxs: list[int] = []
-            for i in guide_idxs_all:
-                gg = col[f"guide{i}"]
-                if "selection" in gg:
-                    sel = gg["selection"][()]
-                    if hasattr(sel, "size") and getattr(sel, "size") == 1:
-                        sel = sel.reshape(()).item() if hasattr(sel, "reshape") else sel[0]
-                    if isinstance(sel, (bytes, bytearray)):
-                        sel_s = sel.decode(errors="replace")
-                    else:
-                        sel_s = str(sel)
-                    if sel_s != "ng":
-                        continue
-                guide_idxs.append(i)
+            guide_idxs = sorted(i for i in (idx("guide", k) for k in col.keys()) if i is not None)
 
             max_guide = guide_idxs[-1] if guide_idxs else None
             if max_guide is not None:
@@ -98,3 +83,38 @@ class TestSansLlbConverterSchema(unittest.TestCase):
             got = [x.decode() if isinstance(x, (bytes, bytearray)) else str(x) for x in fout["/entry/instrument/collimation/element_order"][()]]
 
         self.assertEqual(got, expected)
+
+        with h5py.File(sample, "r") as fin, h5py.File(out, "r") as fout:
+            entry = "/entry0" if "/entry0" in fin else ("/entry" if "/entry" in fin else "/entry1")
+            inst = None
+            for k, obj in fin[entry].items():
+                if isinstance(obj, h5py.Group) and obj.attrs.get("NX_class", b"") == b"NXinstrument":
+                    inst = f"{entry}/{k}"
+                    break
+            self.assertIsNotNone(inst, "No NXinstrument group found in input file")
+            col = fin[f"{inst}/collimator"]
+
+            for name in expected:
+                if not name.startswith("guide"):
+                    continue
+                gg_in = col[name]
+                if "selection" not in gg_in:
+                    continue
+                sel = gg_in["selection"][()]
+                if hasattr(sel, "size") and getattr(sel, "size") == 1:
+                    sel = sel.reshape(()).item() if hasattr(sel, "reshape") else sel[0]
+                if isinstance(sel, (bytes, bytearray)):
+                    sel_s = sel.decode(errors="replace")
+                else:
+                    sel_s = str(sel)
+
+                state = fout[f"/entry/instrument/collimation/elements/{name}/state"][()]
+                if isinstance(state, (bytes, bytearray)):
+                    state_s = state.decode(errors="replace")
+                else:
+                    state_s = str(state)
+
+                if sel_s == "ft":
+                    self.assertEqual(state_s, "out")
+                elif sel_s == "ng":
+                    self.assertEqual(state_s, "in")

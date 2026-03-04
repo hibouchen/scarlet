@@ -103,6 +103,25 @@ def _wavelength_error_from_spread(wavelength: float, spread: float) -> float:
     return s
 
 
+def _sansllb_guide_state_from_selection(selection) -> str:
+    """
+    Map SANS-LLB guide selection to SCARLET NXguide/state.
+
+    Convention:
+    - selection == "ng" (neutron guide) -> "in"
+    - selection == "ft" (flight tube / not a guide element) -> "out"
+    - missing/other -> "in"
+    """
+    if selection is None:
+        return "in"
+    s = _as_str(selection).strip().lower()
+    if s == "ft":
+        return "out"
+    if s == "ng":
+        return "in"
+    return "in"
+
+
 def convert_sansllb_to_scarlet_nxsas_raw(
     input_path: str | Path,
     output_path: str | Path,
@@ -279,16 +298,8 @@ def convert_sansllb_to_scarlet_nxsas_raw(
                 )
 
                 # SANS-LLB exports may include non-guide elements under guide* (e.g. selection="ft").
-                # Keep only neutron guide segments (selection="ng") when selection is available.
-                guide_idxs: List[int] = []
-                for i in guide_idxs_all:
-                    gname = f"guide{i}"
-                    gg = col_g[gname]
-                    if "selection" in gg:
-                        sel = _as_str(gg["selection"][()])
-                        if sel != "ng":
-                            continue
-                    guide_idxs.append(i)
+                # We keep them, but mark NXguide/state accordingly ("out" for ft, "in" for ng).
+                guide_idxs: List[int] = list(guide_idxs_all)
 
                 max_guide = guide_idxs[-1] if guide_idxs else None
 
@@ -350,6 +361,8 @@ def convert_sansllb_to_scarlet_nxsas_raw(
                                 _write_dataset(el, "y_gap", _mm_or_m_to_m(y_gap))
                         else:
                             el = _ensure_group(elements_out, name, "NXguide")
+                            sel = src["selection"][()] if "selection" in src else None
+                            _write_dataset(el, "state", _sansllb_guide_state_from_selection(sel), as_string=True)
                             if "m_value" in src:
                                 _write_dataset(el, "m_value", _as_float_scalar(src["m_value"][()]))
                             if "selection" in src:
@@ -379,6 +392,7 @@ def convert_sansllb_to_scarlet_nxsas_raw(
                 element_order.append(b"aperture")
 
                 guide_el = _ensure_group(elements_out, "collimator", "NXguide")
+                _write_dataset(guide_el, "state", "in", as_string=True)
                 if col_len is not None:
                     _write_dataset(guide_el, "length", _mm_or_m_to_m(col_len))
                 if col_dist is not None:

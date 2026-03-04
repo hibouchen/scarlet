@@ -95,6 +95,12 @@ nodes:
         - NXaperture
         - NXslit
         - NXguide
+      per_nx_class:
+        NXguide:
+          required_datasets:
+            - state
+          enums:
+            state: ["in", "out"]
 
   # ---------------- Beamstop (optional) ----------------
   - path: /entry/instrument/beamstop

@@ -106,6 +106,7 @@ Collimation is described as an ordered chain of physical elements upstream of th
     /elements (NXcollection)
         /<element_name> (NXaperture | NXslit | NXguide)
             ... geometry fields ...
+            state                 (NXguide only, required: "in" | "out")
             /transformations (NXtransformations)
                 translation [m] = (x,y,z)   # typically z < 0 upstream
                 rotation [deg] (optional)

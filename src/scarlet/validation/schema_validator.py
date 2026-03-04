@@ -217,103 +217,111 @@ def validate_nexus_file(
                     # rules (group-level)
                     rules = node.get("rules", {}) or {}
                     if isinstance(obj, h5py.Group) and rules:
-                        # allowed_nx_classes (alternative to node['nx_class'])
-                        allowed_nx = rules.get("allowed_nx_classes")
-                        if allowed_nx:
-                            found = _nx_class(obj)
-                            if found is not None and found not in allowed_nx:
-                                err(p, f"NX_class must be one of {allowed_nx!r} (found {found!r})")
+                        found_nx = _nx_class(obj)
 
-                        # required_datasets
-                        for name in rules.get("required_datasets", []) or []:
-                            if name not in obj:
-                                err(f"{p}/{name}", "Missing required dataset")
-                            elif not isinstance(obj[name], h5py.Dataset):
-                                err(f"{p}/{name}", "Must be a dataset")
+                        def apply_group_rules(r: Dict[str, Any]) -> None:
+                            # allowed_nx_classes (alternative to node['nx_class'])
+                            allowed_nx = r.get("allowed_nx_classes")
+                            if allowed_nx:
+                                if found_nx is not None and found_nx not in allowed_nx:
+                                    err(p, f"NX_class must be one of {allowed_nx!r} (found {found_nx!r})")
 
-                        # required_groups
-                        for name in rules.get("required_groups", []) or []:
-                            if name not in obj or not isinstance(obj[name], h5py.Group):
-                                err(f"{p}/{name}", "Missing required group")
+                            # required_datasets
+                            for name in r.get("required_datasets", []) or []:
+                                if name not in obj:
+                                    err(f"{p}/{name}", "Missing required dataset")
+                                elif not isinstance(obj[name], h5py.Dataset):
+                                    err(f"{p}/{name}", "Must be a dataset")
 
-                        # required_in_group
-                        for gname, req_list in (rules.get("required_in_group", {}) or {}).items():
-                            if gname not in obj or not isinstance(obj[gname], h5py.Group):
-                                err(f"{p}/{gname}", "Missing required group for required_in_group")
-                                continue
-                            gg = obj[gname]
-                            for field in req_list or []:
-                                if field not in gg:
-                                    err(f"{p}/{gname}/{field}", "Missing required field in group")
+                            # required_groups
+                            for name in r.get("required_groups", []) or []:
+                                if name not in obj or not isinstance(obj[name], h5py.Group):
+                                    err(f"{p}/{name}", "Missing required group")
 
-                        # one_of
-                        if "one_of" in rules:
-                            alts = rules["one_of"] or []
-                            ok = any(all(field in obj for field in alt) for alt in alts)
-                            if not ok:
-                                err(p, f"Must contain one of: {alts}")
-
-                        # enums
-                        for field, allowed in (rules.get("enums", {}) or {}).items():
-                            if field in obj and isinstance(obj[field], h5py.Dataset):
-                                v = _as_str(obj[field][()]).strip().lower()
-                                allowed_l = [str(a).strip().lower() for a in allowed]
-                                if v not in allowed_l:
-                                    err(f"{p}/{field}", f"Invalid value {v!r}, allowed={allowed}")
-
-                        # booleans
-                        for field in rules.get("booleans", []) or []:
-                            if field in obj and isinstance(obj[field], h5py.Dataset):
-                                raw = obj[field][()]
-                                s = _as_str(raw).strip().lower()
-                                if isinstance(raw, (bool, int)):
+                            # required_in_group
+                            for gname, req_list in (r.get("required_in_group", {}) or {}).items():
+                                if gname not in obj or not isinstance(obj[gname], h5py.Group):
+                                    err(f"{p}/{gname}", "Missing required group for required_in_group")
                                     continue
-                                if s not in ("0", "1", "true", "false", "t", "f", "yes", "no"):
-                                    warn(f"{p}/{field}", f"Field present but not clearly boolean: {s!r}")
+                                gg = obj[gname]
+                                for field in req_list or []:
+                                    if field not in gg:
+                                        err(f"{p}/{gname}/{field}", "Missing required field in group")
 
-                        # linked_axis_if_present
-                        for arr_field, axis_field in (rules.get("linked_axis_if_present", {}) or {}).items():
-                            if arr_field in obj and isinstance(obj[arr_field], h5py.Dataset):
-                                arr = obj[arr_field][()]
-                                if getattr(arr, "shape", ()) not in ((), (1,)):
-                                    if axis_field not in obj:
-                                        warn(f"{p}/{axis_field}", f"{arr_field} is non-scalar; expected {axis_field} axis")
+                            # one_of
+                            if "one_of" in r:
+                                alts = r["one_of"] or []
+                                ok = any(all(field in obj for field in alt) for alt in alts)
+                                if not ok:
+                                    err(p, f"Must contain one of: {alts}")
+
+                            # enums
+                            for field, allowed in (r.get("enums", {}) or {}).items():
+                                if field in obj and isinstance(obj[field], h5py.Dataset):
+                                    v = _as_str(obj[field][()]).strip().lower()
+                                    allowed_l = [str(a).strip().lower() for a in allowed]
+                                    if v not in allowed_l:
+                                        err(f"{p}/{field}", f"Invalid value {v!r}, allowed={allowed}")
+
+                            # booleans
+                            for field in r.get("booleans", []) or []:
+                                if field in obj and isinstance(obj[field], h5py.Dataset):
+                                    raw = obj[field][()]
+                                    s = _as_str(raw).strip().lower()
+                                    if isinstance(raw, (bool, int)):
+                                        continue
+                                    if s not in ("0", "1", "true", "false", "t", "f", "yes", "no"):
+                                        warn(f"{p}/{field}", f"Field present but not clearly boolean: {s!r}")
+
+                            # linked_axis_if_present
+                            for arr_field, axis_field in (r.get("linked_axis_if_present", {}) or {}).items():
+                                if arr_field in obj and isinstance(obj[arr_field], h5py.Dataset):
+                                    arr = obj[arr_field][()]
+                                    if getattr(arr, "shape", ()) not in ((), (1,)):
+                                        if axis_field not in obj:
+                                            warn(f"{p}/{axis_field}", f"{arr_field} is non-scalar; expected {axis_field} axis")
+                                        else:
+                                            ax = obj[axis_field][()]
+                                            if hasattr(ax, "shape") and ax.shape != arr.shape:
+                                                warn(
+                                                    f"{p}/{arr_field}",
+                                                    f"{arr_field} shape {arr.shape} differs from {axis_field} shape {getattr(ax, 'shape', None)}",
+                                                )
+
+                            # recommended_attrs
+                            for attr in r.get("recommended_attrs", []) or []:
+                                if attr not in obj.attrs:
+                                    warn(p, f"Recommended attribute {attr!r} missing")
+
+                            # link_targets
+                            for field, rx_s in (r.get("link_targets", {}) or {}).items():
+                                if field not in obj:
+                                    continue
+                                rx = re.compile(rx_s)
+                                target = _get_link_target(obj, field)
+
+                                if strict_links:
+                                    if target is None:
+                                        err(f"{p}/{field}", "Expected SoftLink (NXlink) in strict_links mode")
                                     else:
-                                        ax = obj[axis_field][()]
-                                        if hasattr(ax, "shape") and ax.shape != arr.shape:
-                                            warn(
-                                                f"{p}/{arr_field}",
-                                                f"{arr_field} shape {arr.shape} differs from {axis_field} shape {getattr(ax, 'shape', None)}",
-                                            )
-
-                        # recommended_attrs
-                        for attr in rules.get("recommended_attrs", []) or []:
-                            if attr not in obj.attrs:
-                                warn(p, f"Recommended attribute {attr!r} missing")
-
-                        # link_targets
-                        for field, rx_s in (rules.get("link_targets", {}) or {}).items():
-                            if field not in obj:
-                                continue
-                            rx = re.compile(rx_s)
-                            target = _get_link_target(obj, field)
-
-                            if strict_links:
-                                if target is None:
-                                    err(f"{p}/{field}", "Expected SoftLink (NXlink) in strict_links mode")
+                                        if ":" in target:
+                                            err(f"{p}/{field}", f"External link not allowed: {target}")
+                                        elif not rx.match(target):
+                                            err(f"{p}/{field}", f"Link target {target!r} does not match {rx_s!r}")
+                                        elif target not in h5:
+                                            err(f"{p}/{field}", f"Broken link: target {target!r} does not exist")
                                 else:
-                                    if ":" in target:
-                                        err(f"{p}/{field}", f"External link not allowed: {target}")
-                                    elif not rx.match(target):
-                                        err(f"{p}/{field}", f"Link target {target!r} does not match {rx_s!r}")
-                                    elif target not in h5:
-                                        err(f"{p}/{field}", f"Broken link: target {target!r} does not exist")
-                            else:
-                                if target is not None:
-                                    if ":" in target:
-                                        warn(f"{p}/{field}", f"External link detected: {target}")
-                                    elif not rx.match(target):
-                                        warn(f"{p}/{field}", f"Link target {target!r} does not match {rx_s!r}")
+                                    if target is not None:
+                                        if ":" in target:
+                                            warn(f"{p}/{field}", f"External link detected: {target}")
+                                        elif not rx.match(target):
+                                            warn(f"{p}/{field}", f"Link target {target!r} does not match {rx_s!r}")
+
+                        apply_group_rules(rules)
+
+                        per = rules.get("per_nx_class")
+                        if isinstance(per, dict) and found_nx in per and isinstance(per[found_nx], dict):
+                            apply_group_rules(per[found_nx])
 
     except OSError as e:
         err("<file>", f"Could not open/read file: {e}")
