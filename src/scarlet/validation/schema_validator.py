@@ -223,7 +223,9 @@ def validate_nexus_file(
                             # allowed_nx_classes (alternative to node['nx_class'])
                             allowed_nx = r.get("allowed_nx_classes")
                             if allowed_nx:
-                                if found_nx is not None and found_nx not in allowed_nx:
+                                if found_nx is None:
+                                    err(p, f"Missing NX_class (expected one of {allowed_nx!r})")
+                                elif found_nx not in allowed_nx:
                                     err(p, f"NX_class must be one of {allowed_nx!r} (found {found_nx!r})")
 
                             # required_datasets
@@ -231,6 +233,11 @@ def validate_nexus_file(
                                 if name not in obj:
                                     err(f"{p}/{name}", "Missing required dataset")
                                 elif not isinstance(obj[name], h5py.Dataset):
+                                    err(f"{p}/{name}", "Must be a dataset")
+
+                            # optional_datasets (type-check only if present)
+                            for name in r.get("optional_datasets", []) or []:
+                                if name in obj and not isinstance(obj[name], h5py.Dataset):
                                     err(f"{p}/{name}", "Must be a dataset")
 
                             # required_groups
@@ -322,6 +329,15 @@ def validate_nexus_file(
                         per = rules.get("per_nx_class")
                         if isinstance(per, dict) and found_nx in per and isinstance(per[found_nx], dict):
                             apply_group_rules(per[found_nx])
+
+                        conditional = rules.get("conditional_rules")
+                        if isinstance(conditional, list):
+                            for cond in conditional:
+                                if not isinstance(cond, dict):
+                                    continue
+                                nx = cond.get("apply_if_nx_class")
+                                if isinstance(nx, str) and found_nx == nx:
+                                    apply_group_rules(cond)
 
     except OSError as e:
         err("<file>", f"Could not open/read file: {e}")
