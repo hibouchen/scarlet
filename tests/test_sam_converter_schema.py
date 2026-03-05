@@ -1,0 +1,36 @@
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import unittest
+
+try:
+    import h5py  # noqa: F401
+except Exception:  # pragma: no cover
+    h5py = None  # type: ignore[assignment]
+
+
+from scarlet.io.converters.sam import convert_sam_to_scarlet_nxsas_raw
+from scarlet.validation.schema_loader import load_schema
+from scarlet.validation.schema_validator import validate_nexus_file
+
+
+@unittest.skipIf(h5py is None, "h5py not available")
+class TestSamConverterSchema(unittest.TestCase):
+    def test_sam_sample_validates_with_schema(self) -> None:
+        raw_data = Path(__file__).resolve().parent / "data" / "sam" / "raw_data"
+        sample = raw_data / "011814.nxs"
+        if not sample.exists():
+            self.skipTest(f"Missing test input file: {sample}")
+
+        root = Path(__file__).resolve().parent.parent
+        processed = Path(os.environ.get("SCARLET_TEST_OUTPUT_DIR", root / "data" / "SAM" / "processed"))
+        processed.mkdir(parents=True, exist_ok=True)
+        out = processed / "011814_scarlet_nxsas_raw.h5"
+
+        convert_sam_to_scarlet_nxsas_raw(sample, out, overwrite=True)
+
+        schema = load_schema("scarlet_nxsas_raw_v1.0.yaml")
+        report = validate_nexus_file(out, schema)
+        self.assertTrue(report.ok, "\n".join(report.format_lines()))
+
