@@ -1,0 +1,214 @@
+schema:
+  name: SCARLET NXsas_raw
+  version: "1.1"
+  profile: "mono"   # monochromatic (no TOF)
+  entry_path: /entry
+
+conventions:
+  geometry_origin: sample center
+  axes: "+z downstream, +x beam-right, +y up"
+  units_length: m
+  units_angle: deg
+
+nodes:
+
+  # ---------------- Entry ----------------
+  - path: /entry
+    kind: group
+    nx_class: NXentry
+    required: true
+
+  - path: /entry/definition
+    kind: dataset
+    required: true
+    const: "NXsas_raw"
+
+  - path: /entry/schema_version
+    kind: dataset
+    required: false
+    const: "1.1"
+
+  - path: /entry/sample
+    kind: group
+    nx_class: NXsample
+    required: true
+
+  - path: /entry/instrument
+    kind: group
+    nx_class: NXinstrument
+    required: true
+
+  # ---------------- Geometry ----------------
+  - path: /entry/instrument/geometry
+    kind: group
+    required: true
+    recommended_datasets:
+      - origin_definition
+      - axis_convention
+
+  # ---------------- Source (optional) ----------------
+  - path: /entry/instrument/source
+    kind: group
+    nx_class: NXsource
+    required: false
+
+  # ---------------- Monochromator (required, mono profile) ----------------
+  - path: /entry/instrument/monochromator
+    kind: group
+    nx_class: NXmonochromator
+    required: true
+    rules:
+      required_datasets:
+        - wavelength
+      optional_datasets:
+        - wavelength_error
+    children:
+      - path: velocity_selector
+        kind: group
+        nx_class: NXvelocity_selector
+        required: false
+
+  # ---------------- Collimation (required, aligned with refs_sub) ----------------
+  - path: /entry/instrument/collimation
+    kind: group
+    required: true
+    rules:
+      # baseline (required): same as SCARLET_refs_sub configuration/collimation
+      required_datasets:
+        - collimation_distance
+        - last_aperture_to_sample_distance
+      required_groups:
+        - aperture1
+        - aperture2
+      # optional: more detailed chain (future-proof)
+      optional_datasets:
+        - element_order
+      optional_groups:
+        - elements
+
+  - path: /entry/instrument/collimation/aperture1
+    kind: group
+    required: true
+    rules:
+      allowed_nx_classes:
+        - NXslit
+        - NXpinhole
+      conditional_rules:
+        - apply_if_nx_class: NXslit
+          required_datasets: [x_gap, y_gap]
+        - apply_if_nx_class: NXpinhole
+          required_datasets: [diameter]
+
+  - path: /entry/instrument/collimation/aperture2
+    kind: group
+    required: true
+    rules:
+      allowed_nx_classes:
+        - NXslit
+        - NXpinhole
+      conditional_rules:
+        - apply_if_nx_class: NXslit
+          required_datasets: [x_gap, y_gap]
+        - apply_if_nx_class: NXpinhole
+          required_datasets: [diameter]
+
+  # Optional detailed element chain (if used)
+  - path: /entry/instrument/collimation/elements
+    kind: group
+    required: false
+
+  - path_pattern: '^/entry/instrument/collimation/elements/.+$'
+    kind: group
+    required: false
+    rules:
+      required_groups: [transformations]
+      required_in_group:
+        transformations: [translation]
+      allowed_nx_classes:
+        - NXaperture
+        - NXslit
+        - NXguide
+        - NXpinhole
+
+  # ---------------- Beamstop (optional) ----------------
+  - path: /entry/instrument/beamstop
+    kind: group
+    nx_class: NXbeamstop
+    required: false
+
+  # ---------------- Detectors ----------------
+  - path_pattern: '^/entry/instrument/detector\d+$'
+    kind: group
+    nx_class: NXdetector
+    required: true
+    rules:
+      required_datasets:
+        - data
+        - x_pixel_size
+        - y_pixel_size
+        - beam_center_x
+        - beam_center_y
+        - dead_time
+      required_groups:
+        - transformations
+      required_in_group:
+        transformations: [translation]
+      optional_datasets:
+        - data_errors
+        - local_name
+        - type
+        - pixel_mask
+        - pixel_mask_applied
+        - countrate_correction_applied
+        - flatfield
+        - flatfield_applied
+        - efficiency
+        - wavelength          # only if efficiency depends on wavelength
+        - distance
+        - x_pixel_offset
+        - y_pixel_offset
+        - z_pixel_offset
+      booleans:
+        - pixel_mask_applied
+        - countrate_correction_applied
+        - flatfield_applied
+      linked_axis_if_present:
+        efficiency: wavelength
+
+  # ---------------- Monitors ----------------
+  - path: /entry/control
+    kind: group
+    nx_class: NXmonitor
+    required: false
+    rules:
+      required_datasets: [mode, preset]
+      one_of:
+        - [integral]
+        - [data]
+      enums:
+        mode: ["monitor", "timer"]
+
+  - path_pattern: '^/entry/instrument/monitor\d+$'
+    kind: group
+    nx_class: NXmonitor
+    required: false
+    rules:
+      required_datasets: [mode, preset]
+      one_of:
+        - [integral]
+        - [data]
+      enums:
+        mode: ["monitor", "timer"]
+
+  # ---------------- NXdata Views ----------------
+  - path_pattern: '^/entry/data\d+$'
+    kind: group
+    nx_class: NXdata
+    required: true
+    rules:
+      required_datasets: [counts]
+      optional_datasets: [counts_errors]
+      recommended_attrs: [signal, axes]
+      link_targets:
+        counts: '^/entry/instrument/detector\d+/data$'
+        counts_errors: '^/entry/instrument/detector\d+/data_errors$'

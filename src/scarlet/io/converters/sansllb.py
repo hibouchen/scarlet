@@ -1,94 +1,22 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional
 
 import h5py
 import numpy as np
 
-
-MM_TO_M = 1e-3
-
-
-@dataclass
-class ConvertReport:
-    input_file: Path
-    output_file: Path
-    entry_in: str
-    notes: List[str]
-    warnings: List[str]
-
-
-def _as_str(x) -> str:
-    if isinstance(x, (bytes, bytearray)):
-        return x.decode(errors="replace")
-    if isinstance(x, np.ndarray) and x.dtype.kind in {"S", "O"} and x.size == 1:
-        return _as_str(x[0])
-    return str(x)
-
-
-def _pick_entry(fin: h5py.File, preferred: Optional[str] = None) -> str:
-    """
-    Pick an input NXentry.
-    For SANS_LLB files we usually want /entry0 (raw), not /entry1 (processed).
-    """
-    if preferred and preferred in fin:
-        return preferred
-
-    # Common patterns: /entry0, /entry1, /entry
-    for cand in ("/entry0", "/entry", "/entry1"):
-        if cand in fin:
-            return cand
-
-    # Fallback: first NXentry-like group
-    for k in fin.keys():
-        p = f"/{k}"
-        if isinstance(fin[p], h5py.Group):
-            nx = fin[p].attrs.get("NX_class", None)
-            if nx is not None and _as_str(nx) == "NXentry":
-                return p
-
-    raise ValueError("No NXentry found in file.")
-
-
-def _safe_get(fin: h5py.File, path: str):
-    return fin[path][()] if path in fin else None
-
-
-def _ensure_group(g: h5py.Group, name: str, nx_class: Optional[str] = None) -> h5py.Group:
-    gg = g.create_group(name)
-    if nx_class:
-        gg.attrs["NX_class"] = np.bytes_(nx_class)
-    return gg
-
-
-def _write_dataset(g: h5py.Group, name: str, data, *, as_string: bool = False) -> h5py.Dataset:
-    if as_string:
-        data = np.bytes_(str(data))
-    return g.create_dataset(name, data=data)
-
-def _as_float_scalar(x) -> float:
-    if x is None:
-        return float("nan")
-    if isinstance(x, np.ndarray) and x.size == 1:
-        return float(x.reshape(()))
-    return float(x)
-
-
-def _mm_or_m_to_m(value: float) -> float:
-    """
-    Heuristic: SANS_LLB values in files are often in mm (pixel_size=5.0).
-    We'll treat values > 5 as mm and convert to meters.
-    """
-    if value is None:
-        return float("nan")
-    v = _as_float_scalar(value)
-    # If it's already in meters (e.g. 0.005), keep it.
-    if abs(v) <= 5.0:
-        return v
-    return v * MM_TO_M
-
+from ._report import ConvertReport
+from ._hdf import (
+    as_float_scalar as _as_float_scalar,
+    as_str as _as_str,
+    ensure_group as _ensure_group,
+    pick_entry as _pick_entry,
+    safe_get as _safe_get,
+    safe_get_dataset as _safe_get_dataset,
+    write_dataset as _write_dataset,
+)
+from ._units import MM_TO_M, length_dataset_to_m as _length_dataset_to_m, mm_or_m_to_m as _mm_or_m_to_m
 
 def _wavelength_error_from_spread(wavelength: float, spread: float) -> float:
     """
@@ -103,15 +31,122 @@ def _wavelength_error_from_spread(wavelength: float, spread: float) -> float:
     return s
 
 
-def _sansllb_guide_state_from_selection(selection) -> str:
-    """
-    Map SANS-LLB guide selection to SCARLET NXguide/state.
+def _select_monitor_group(fin: h5py.File, candidates: List[str]) -> Optional[str]:
+    """Return the first existing NXmonitor group among the given absolute paths."""
+    for cand in candidates:
+        if cand in fin and isinstance(fin[cand], h5py.Group):
+            return cand
+    return None
 
-    Convention:
-    - selection == "ng" (neutron guide) -> "in"
-    - selection == "ft" (flight tube / not a guide element) -> "out"
-    - missing/other -> "in"
-    """
+
+def _monitor_index(name: str) -> Optional[int]:
+    """Extract the numeric suffix from ``monitorN`` names used by SANS-LLB."""
+    if not name.startswith("monitor"):
+        return None
+    tail = name[len("monitor") :]
+    if not tail:
+        return None
+    return int(tail) if tail.isdigit() else None
+
+
+def _collect_monitor_sources(fin: h5py.File, entry: str) -> list[tuple[int, str]]:
+    """Collect all raw SANS-LLB monitor groups and map them to output monitor indices."""
+    entry_group = fin[entry]
+    sources: list[tuple[int, str]] = []
+    used_indices: set[int] = set()
+
+    for key, obj in entry_group.items():
+        if not isinstance(obj, h5py.Group):
+            continue
+        if _as_str(obj.attrs.get("NX_class")) != "NXmonitor":
+            continue
+        idx = _monitor_index(key)
+        if idx is None:
+            continue
+        sources.append((idx, f"{entry}/{key}"))
+        used_indices.add(idx)
+
+    if f"{entry}/monitor" in fin and isinstance(fin[f"{entry}/monitor"], h5py.Group):
+        fallback_idx = 0
+        while fallback_idx in used_indices:
+            fallback_idx += 1
+        sources.append((fallback_idx, f"{entry}/monitor"))
+
+    return sorted(sources, key=lambda item: item[0])
+
+
+def _write_control_monitor(
+    fin: h5py.File,
+    entry: str,
+    control_in: Optional[str],
+    entry_out: h5py.Group,
+    warnings: List[str],
+) -> None:
+    """Write the required /entry/control monitor from monitor2 or the input control group."""
+    if control_in is not None:
+        control_src = fin[control_in]
+        control_out = _ensure_group(entry_out, "control", "NXmonitor")
+        _write_dataset(control_out, "mode", "monitor", as_string=True)
+        if "integral" in control_src:
+            preset = _as_float_scalar(control_src["integral"][()])
+            _write_dataset(control_out, "preset", preset)
+            _write_dataset(control_out, "integral", preset)
+        else:
+            warnings.append(f"{control_in}: missing integral; writing NaN preset/integral in /entry/control")
+            _write_dataset(control_out, "preset", float("nan"))
+            _write_dataset(control_out, "integral", float("nan"))
+
+        if f"{entry}/control/count_time" in fin:
+            _write_dataset(control_out, "count_time", _as_float_scalar(fin[f"{entry}/control/count_time"][()]))
+        return
+
+    warnings.append("Missing /monitor2 and /control in input; writing NaN /entry/control.")
+    control_out = _ensure_group(entry_out, "control", "NXmonitor")
+    _write_dataset(control_out, "mode", "monitor", as_string=True)
+    _write_dataset(control_out, "preset", float("nan"))
+    _write_dataset(control_out, "integral", float("nan"))
+
+
+def _write_instrument_monitors(
+    fin: h5py.File,
+    entry: str,
+    monitor_sources: list[tuple[int, str]],
+    inst_out: h5py.Group,
+    warnings: List[str],
+    notes: List[str],
+) -> None:
+    """Write all available SANS-LLB monitor groups under /entry/instrument/monitorN."""
+    if not monitor_sources:
+        notes.append("No monitor groups found in input; instrument monitors omitted.")
+        return
+
+    control_mode = _as_str(fin[f"{entry}/control/mode"][0]) if f"{entry}/control/mode" in fin else "monitor"
+    control_preset = _as_float_scalar(fin[f"{entry}/control/preset"][()]) if f"{entry}/control/preset" in fin else float("nan")
+    control_count_time = _as_float_scalar(fin[f"{entry}/control/count_time"][()]) if f"{entry}/control/count_time" in fin else None
+
+    for monitor_idx, monitor_path in monitor_sources:
+        mon_in = fin[monitor_path]
+        mon_out = _ensure_group(inst_out, f"monitor{monitor_idx}", "NXmonitor")
+
+        mode = _as_str(mon_in["mode"][0]) if "mode" in mon_in else control_mode
+        _write_dataset(mon_out, "mode", mode, as_string=True)
+
+        preset = _as_float_scalar(mon_in["preset"][()]) if "preset" in mon_in else control_preset
+        _write_dataset(mon_out, "preset", preset)
+
+        if "integral" in mon_in:
+            _write_dataset(mon_out, "integral", _as_float_scalar(mon_in["integral"][()]))
+
+        if "data" in mon_in:
+            _write_dataset(mon_out, "data", mon_in["data"][()])
+
+        count_time = _as_float_scalar(mon_in["count_time"][()]) if "count_time" in mon_in else control_count_time
+        if count_time is not None:
+            _write_dataset(mon_out, "count_time", count_time)
+
+
+def _sansllb_guide_state_from_selection(selection) -> str:
+    """Map raw SANS-LLB guide selection strings to SCARLET NXguide/state."""
     if selection is None:
         return "in"
     s = _as_str(selection).strip().lower()
@@ -121,6 +156,224 @@ def _sansllb_guide_state_from_selection(selection) -> str:
         return "in"
     return "in"
 
+
+def _copy_aperture_snapshot(coll_out: h5py.Group, name: str, src: h5py.Group) -> None:
+    """Copy the aperture fields needed by SCARLET from a detailed collimation element."""
+    dst = _ensure_group(coll_out, name, _as_str(src.attrs.get("NX_class")))
+    for field in ("x_gap", "y_gap", "diameter", "shape"):
+        if field in src:
+            units = src[field].attrs.get("units")
+            units_s = _as_str(units) if units is not None else None
+            _write_dataset(dst, field, src[field][()], units=units_s)
+    if "transformations" in src and isinstance(src["transformations"], h5py.Group):
+        src_tr = src["transformations"]
+        dst_tr = _ensure_group(dst, "transformations", _as_str(src_tr.attrs.get("NX_class")))
+        if "translation" in src_tr:
+            units = src_tr["translation"].attrs.get("units")
+            units_s = _as_str(units) if units is not None else None
+            _write_dataset(dst_tr, "translation", src_tr["translation"][()], units=units_s)
+
+
+def _derive_aperture_snapshots(coll_out: h5py.Group, element_names: List[str], warnings: List[str]) -> None:
+    """Derive SCARLET aperture1/aperture2 snapshots from the ordered collimation elements."""
+    elements = coll_out["elements"]
+    aperture_classes = {"NXslit", "NXpinhole", "NXaperture"}
+    aperture_names = [name for name in element_names if _as_str(elements[name].attrs.get("NX_class")) in aperture_classes]
+
+    if not aperture_names:
+        warnings.append("No aperture-like elements available to derive aperture1/aperture2.")
+        return
+
+    aperture1_name: Optional[str] = None
+
+    first_in_guide_idx: Optional[int] = None
+    for idx, name in enumerate(element_names):
+        element = elements[name]
+        if _as_str(element.attrs.get("NX_class")) != "NXguide":
+            continue
+        if "state" in element and _as_str(element["state"][()]) == "in":
+            first_in_guide_idx = idx
+            break
+
+    if first_in_guide_idx is not None:
+        for idx in range(first_in_guide_idx - 1, -1, -1):
+            candidate = element_names[idx]
+            if candidate in aperture_names:
+                aperture1_name = candidate
+                break
+        if aperture1_name is None:
+            for idx in range(first_in_guide_idx + 1, len(element_names)):
+                candidate = element_names[idx]
+                if candidate in aperture_names:
+                    aperture1_name = candidate
+                    warnings.append(
+                        "Could not find an upstream aperture before the first in-guide; using the nearest downstream aperture."
+                    )
+                    break
+
+    if aperture1_name is None:
+        aperture1_name = aperture_names[0]
+        warnings.append("Could not derive aperture1 from guide states; using the first aperture in element_order.")
+
+    _copy_aperture_snapshot(coll_out, "aperture1", elements[aperture1_name])
+
+    # SANS-LLB does not currently expose aperture2 in the raw file.
+    # Use a temporary default rectangular slit until the upstream metadata exists.
+    aperture2 = _ensure_group(coll_out, "aperture2", "NXslit")
+    _write_dataset(aperture2, "x_gap", 0.01, units="m")
+    _write_dataset(aperture2, "y_gap", 0.01, units="m")
+    warnings.append("Using default aperture2 = NXslit 10 mm x 10 mm; not yet available in SANS-LLB raw data.")
+
+
+def _write_collimation(
+    fin: h5py.File,
+    inst_in: str,
+    inst_out: h5py.Group,
+    *,
+    ap_shape,
+    ap_xgap_m: Optional[float],
+    ap_ygap_m: Optional[float],
+    col_dist_m: Optional[float],
+    col_len_m: Optional[float],
+    warnings: List[str],
+) -> None:
+    """Write the full SANS-LLB collimation chain and derived aperture snapshots."""
+    coll_out = _ensure_group(inst_out, "collimation", None)
+    elements_out = _ensure_group(coll_out, "elements", None)
+
+    element_order: List[bytes] = []
+    collimation_distance_m: Optional[float] = None
+    last_aperture_to_sample_distance_m: Optional[float] = None
+
+    collimator_path = f"{inst_in}/collimator"
+    if collimator_path in fin and isinstance(fin[collimator_path], h5py.Group):
+        col_g = fin[collimator_path]
+
+        def idx_for(prefix: str, name: str) -> Optional[int]:
+            """Return the numeric suffix for names like ``slit0`` or ``guide2``."""
+            if not name.startswith(prefix):
+                return None
+            tail = name[len(prefix) :]
+            return int(tail) if tail.isdigit() else None
+
+        slit_idxs = sorted(i for i in (idx_for("slit", k) for k in col_g.keys()) if i is not None)
+        guide_idxs = sorted(i for i in (idx_for("guide", k) for k in col_g.keys()) if i is not None)
+
+        max_guide = guide_idxs[-1] if guide_idxs else None
+        if max_guide is not None:
+            slit_idxs = [i for i in slit_idxs if i <= max_guide + 1]
+
+        col_total_len_m = _length_dataset_to_m(_safe_get_dataset(fin, f"{collimator_path}/length"))
+        if col_total_len_m is None:
+            col_total_len_m = _length_dataset_to_m(_safe_get_dataset(fin, f"{collimator_path}/geometry/size"))
+        total_L = float(col_total_len_m) if col_total_len_m is not None else 1.0
+        collimation_distance_m = float(total_L)
+
+        end_dist_m = _length_dataset_to_m(_safe_get_dataset(fin, f"{collimator_path}/distance"))
+        if end_dist_m is None:
+            for i in slit_idxs:
+                d_m = _length_dataset_to_m(_safe_get_dataset(fin, f"{collimator_path}/slit{i}/distance"))
+                if d_m is not None:
+                    end_dist_m = d_m
+        end_d = float(end_dist_m) if end_dist_m is not None else 0.1
+        last_aperture_to_sample_distance_m = float(end_d)
+
+        ordered: List[tuple[str, int]] = []
+        if max_guide is not None:
+            for i in range(max_guide + 1):
+                if i in slit_idxs and f"slit{i}" in col_g:
+                    ordered.append(("slit", i))
+                if i in guide_idxs and f"guide{i}" in col_g:
+                    ordered.append(("guide", i))
+            last_slit = max_guide + 1
+            if last_slit in slit_idxs and f"slit{last_slit}" in col_g:
+                ordered.append(("slit", last_slit))
+        else:
+            max_i = max(slit_idxs[-1] if slit_idxs else -1, guide_idxs[-1] if guide_idxs else -1)
+            for i in range(max_i + 1):
+                if i in slit_idxs and f"slit{i}" in col_g:
+                    ordered.append(("slit", i))
+                if i in guide_idxs and f"guide{i}" in col_g:
+                    ordered.append(("guide", i))
+
+        if ordered:
+            step = (total_L / (len(ordered) - 1)) if len(ordered) > 1 else 0.0
+            start_d = end_d + total_L
+
+            for k, (kind, i) in enumerate(ordered):
+                name = f"{kind}{i}"
+                src = col_g[name]
+
+                if kind == "slit":
+                    el = _ensure_group(elements_out, name, "NXslit")
+                    x_gap_m = _length_dataset_to_m(_safe_get_dataset(fin, f"{collimator_path}/{name}/x_gap"))
+                    y_gap_m = _length_dataset_to_m(_safe_get_dataset(fin, f"{collimator_path}/{name}/y_gap"))
+                    if x_gap_m is None:
+                        warnings.append(f"{collimator_path}/{name}: missing x_gap; writing NaN")
+                        _write_dataset(el, "x_gap", float("nan"), units="m")
+                    else:
+                        _write_dataset(el, "x_gap", x_gap_m, units="m")
+
+                    if y_gap_m is None:
+                        warnings.append(f"{collimator_path}/{name}: missing y_gap; writing NaN")
+                        _write_dataset(el, "y_gap", float("nan"), units="m")
+                    else:
+                        _write_dataset(el, "y_gap", y_gap_m, units="m")
+                else:
+                    el = _ensure_group(elements_out, name, "NXguide")
+                    sel = src["selection"][()] if "selection" in src else None
+                    _write_dataset(el, "state", _sansllb_guide_state_from_selection(sel), as_string=True)
+                    if "m_value" in src:
+                        _write_dataset(el, "m_value", _as_float_scalar(src["m_value"][()]))
+
+                d_m = _length_dataset_to_m(_safe_get_dataset(fin, f"{collimator_path}/{name}/distance"))
+                dist_m = float(d_m) if d_m is not None else (start_d - k * step)
+                tr = _ensure_group(el, "transformations", "NXtransformations")
+                _write_dataset(tr, "translation", np.array([0.0, 0.0, -dist_m], dtype=float), units="m")
+                element_order.append(name.encode())
+        else:
+            warnings.append("No slit*/guide* entries found under input collimator; using heuristic collimation.")
+
+    if not element_order:
+        ap_el = _ensure_group(elements_out, "aperture", "NXaperture")
+        if ap_shape is not None:
+            _write_dataset(ap_el, "shape", ap_shape)
+        if ap_xgap_m is not None:
+            _write_dataset(ap_el, "x_gap", ap_xgap_m, units="m")
+        if ap_ygap_m is not None:
+            _write_dataset(ap_el, "y_gap", ap_ygap_m, units="m")
+
+        ap_tr = _ensure_group(ap_el, "transformations", "NXtransformations")
+        _write_dataset(ap_tr, "translation", np.array([0.0, 0.0, -0.1], dtype=float), units="m")
+        element_order.append(b"aperture")
+        last_aperture_to_sample_distance_m = 0.1
+
+        guide_el = _ensure_group(elements_out, "collimator", "NXguide")
+        _write_dataset(guide_el, "state", "in", as_string=True)
+        if col_len_m is not None:
+            _write_dataset(guide_el, "length", col_len_m, units="m")
+        if col_dist_m is not None:
+            _write_dataset(guide_el, "distance", col_dist_m, units="m")
+
+        guide_tr = _ensure_group(guide_el, "transformations", "NXtransformations")
+        L = col_len_m if col_len_m is not None else 1.0
+        _write_dataset(guide_tr, "translation", np.array([0.0, 0.0, -max(L, 0.1)], dtype=float), units="m")
+        element_order.append(b"collimator")
+        collimation_distance_m = float(max(L, 0.0))
+
+    if collimation_distance_m is None:
+        collimation_distance_m = float(max(col_len_m, 0.0)) if col_len_m is not None else 1.0
+    if last_aperture_to_sample_distance_m is None:
+        last_aperture_to_sample_distance_m = 0.1
+
+    _derive_aperture_snapshots(
+        coll_out,
+        [name.decode() if isinstance(name, (bytes, bytearray)) else str(name) for name in element_order],
+        warnings,
+    )
+    _write_dataset(coll_out, "collimation_distance", float(collimation_distance_m), units="m")
+    _write_dataset(coll_out, "last_aperture_to_sample_distance", float(last_aperture_to_sample_distance_m), units="m")
+    _write_dataset(coll_out, "element_order", np.array(element_order, dtype="S"))
 
 def convert_sansllb_to_scarlet_nxsas_raw(
     input_path: str | Path,
@@ -142,7 +395,7 @@ def convert_sansllb_to_scarlet_nxsas_raw(
           /collimation (SCARLET detailed)
           /detector0..N
           /monitor0..N (optional)
-        /control (optional)
+        /control (NXmonitor, required by SCARLET schema)
         /data0..N (NXdata softlinks)
     """
     input_path = Path(input_path)
@@ -174,12 +427,9 @@ def convert_sansllb_to_scarlet_nxsas_raw(
         if inst_in not in fin:
             raise ValueError("No NXinstrument group found under input entry.")
 
-        # monitors vary; accept a few common locations
-        monitor_in: Optional[str] = None
-        for cand in (f"{entry}/monitor", f"{entry}/monitor0", f"{entry}/control"):
-            if cand in fin:
-                monitor_in = cand
-                break
+        # SANS-LLB uses monitor2 as the acquisition preset source.
+        control_in = _select_monitor_group(fin, [f"{entry}/monitor2", f"{entry}/control"])
+        monitor_sources = _collect_monitor_sources(fin, entry)
 
         # --- Read key values ---
         wavelength = _safe_get(fin, f"{inst_in}/source/incident_wavelength")
@@ -197,14 +447,14 @@ def convert_sansllb_to_scarlet_nxsas_raw(
 
         # Collimation / aperture / collimator
         ap_shape = _safe_get(fin, f"{inst_in}/aperture/shape")
-        ap_xgap = _safe_get(fin, f"{inst_in}/aperture/x_gap")
-        ap_ygap = _safe_get(fin, f"{inst_in}/aperture/y_gap")
-        col_dist = _safe_get(fin, f"{inst_in}/collimator/distance")
-        col_len = _safe_get(fin, f"{inst_in}/collimator/length")
-        if ap_xgap is None:
-            ap_xgap = _safe_get(fin, f"{inst_in}/collimator/slit0/x_gap")
-        if ap_ygap is None:
-            ap_ygap = _safe_get(fin, f"{inst_in}/collimator/slit0/y_gap")
+        ap_xgap_m = _length_dataset_to_m(_safe_get_dataset(fin, f"{inst_in}/aperture/x_gap"))
+        ap_ygap_m = _length_dataset_to_m(_safe_get_dataset(fin, f"{inst_in}/aperture/y_gap"))
+        col_dist_m = _length_dataset_to_m(_safe_get_dataset(fin, f"{inst_in}/collimator/distance"))
+        col_len_m = _length_dataset_to_m(_safe_get_dataset(fin, f"{inst_in}/collimator/length"))
+        if ap_xgap_m is None:
+            ap_xgap_m = _length_dataset_to_m(_safe_get_dataset(fin, f"{inst_in}/collimator/slit0/x_gap"))
+        if ap_ygap_m is None:
+            ap_ygap_m = _length_dataset_to_m(_safe_get_dataset(fin, f"{inst_in}/collimator/slit0/y_gap"))
 
         # Detector list
         det_names: List[str] = []
@@ -234,7 +484,7 @@ def convert_sansllb_to_scarlet_nxsas_raw(
             # /entry
             entry_out = _ensure_group(fout, "entry", "NXentry")
             _write_dataset(entry_out, "definition", "NXsas_raw", as_string=True)
-            _write_dataset(entry_out, "schema_version", "1.0", as_string=True)
+            _write_dataset(entry_out, "schema_version", "1.3", as_string=True)
 
             # /entry/sample
             sample_out = _ensure_group(entry_out, "sample", "NXsample")
@@ -251,6 +501,8 @@ def convert_sansllb_to_scarlet_nxsas_raw(
             # /entry/instrument
             inst_out = _ensure_group(entry_out, "instrument", "NXinstrument")
 
+            _write_control_monitor(fin, entry, control_in, entry_out, warnings)
+
             # geometry (SCARLET reserved)
             geom_out = _ensure_group(inst_out, "geometry", None)
             _write_dataset(geom_out, "origin_definition", "sample center", as_string=True)
@@ -265,8 +517,9 @@ def convert_sansllb_to_scarlet_nxsas_raw(
                         _write_dataset(src_out, key, src_in[key][()])
                 # Optionally store beam size
                 for key in ("beam_size_x", "beam_size_y"):
-                    if key in src_in:
-                        _write_dataset(src_out, key, _mm_or_m_to_m(src_in[key][()]))
+                    beam_size_m = _length_dataset_to_m(_safe_get_dataset(fin, f"{inst_in}/source/{key}"))
+                    if beam_size_m is not None:
+                        _write_dataset(src_out, key, beam_size_m, units="m")
 
             # monochromator (required by SCARLET mono profile)
             mono_out = _ensure_group(inst_out, "monochromator", "NXmonochromator")
@@ -274,136 +527,17 @@ def convert_sansllb_to_scarlet_nxsas_raw(
             if not np.isnan(wavelength_error):
                 _write_dataset(mono_out, "wavelength_error", wavelength_error)
 
-            # collimation (SCARLET detailed)
-            coll_out = _ensure_group(inst_out, "collimation", None)
-            elements_out = _ensure_group(coll_out, "elements", None)
-
-            element_order: List[bytes] = []
-
-            collimator_path = f"{inst_in}/collimator"
-            if collimator_path in fin and isinstance(fin[collimator_path], h5py.Group):
-                col_g = fin[collimator_path]
-
-                def _idx(prefix: str, name: str) -> Optional[int]:
-                    if not name.startswith(prefix):
-                        return None
-                    tail = name[len(prefix) :]
-                    return int(tail) if tail.isdigit() else None
-
-                slit_idxs = sorted(
-                    i for i in (_idx("slit", k) for k in col_g.keys()) if i is not None  # type: ignore[arg-type]
-                )
-                guide_idxs_all = sorted(
-                    i for i in (_idx("guide", k) for k in col_g.keys()) if i is not None  # type: ignore[arg-type]
-                )
-
-                # SANS-LLB exports may include non-guide elements under guide* (e.g. selection="ft").
-                # We keep them, but mark NXguide/state accordingly ("out" for ft, "in" for ng).
-                guide_idxs: List[int] = list(guide_idxs_all)
-
-                max_guide = guide_idxs[-1] if guide_idxs else None
-
-                # If we have guides, we expect a slit upstream of each guide and one final slit downstream:
-                # slit0, guide0, slit1, guide1, ..., slitN (with N = max_guide + 1).
-                if max_guide is not None:
-                    slit_idxs = [i for i in slit_idxs if i <= max_guide + 1]
-
-                # Collimation length (used to distribute elements if individual distances are missing)
-                col_total_len = _safe_get(fin, f"{collimator_path}/length")
-                if col_total_len is None:
-                    col_total_len = _safe_get(fin, f"{collimator_path}/geometry/size")
-                total_L = float(_mm_or_m_to_m(col_total_len)) if col_total_len is not None else 1.0
-
-                # Distance from sample to the downstream-most collimation element.
-                # Prefer an explicit /collimator/distance; else use the maximum element distance if present.
-                end_dist = _safe_get(fin, f"{collimator_path}/distance")
-                if end_dist is None:
-                    for i in slit_idxs:
-                        d = _safe_get(fin, f"{collimator_path}/slit{i}/distance")
-                        if d is not None:
-                            end_dist = d
-                end_d = float(_mm_or_m_to_m(end_dist)) if end_dist is not None else 0.1
-
-                # Build physical order: slit0, guide0, slit1, guide1, ...
-                ordered: List[tuple[str, int]] = []
-                if max_guide is not None:
-                    for i in range(max_guide + 1):
-                        if i in slit_idxs and f"slit{i}" in col_g:
-                            ordered.append(("slit", i))
-                        if i in guide_idxs and f"guide{i}" in col_g:
-                            ordered.append(("guide", i))
-                    last_slit = max_guide + 1
-                    if last_slit in slit_idxs and f"slit{last_slit}" in col_g:
-                        ordered.append(("slit", last_slit))
-                else:
-                    max_i = max(slit_idxs[-1] if slit_idxs else -1, guide_idxs[-1] if guide_idxs else -1)
-                    for i in range(max_i + 1):
-                        if i in slit_idxs and f"slit{i}" in col_g:
-                            ordered.append(("slit", i))
-                        if i in guide_idxs and f"guide{i}" in col_g:
-                            ordered.append(("guide", i))
-
-                if ordered:
-                    step = (total_L / (len(ordered) - 1)) if len(ordered) > 1 else 0.0
-                    start_d = end_d + total_L
-
-                    for k, (kind, i) in enumerate(ordered):
-                        name = f"{kind}{i}"
-                        src = col_g[name]
-
-                        if kind == "slit":
-                            el = _ensure_group(elements_out, name, "NXslit")
-                            x_gap = _safe_get(fin, f"{collimator_path}/{name}/x_gap")
-                            y_gap = _safe_get(fin, f"{collimator_path}/{name}/y_gap")
-                            if x_gap is not None:
-                                _write_dataset(el, "x_gap", _mm_or_m_to_m(x_gap))
-                            if y_gap is not None:
-                                _write_dataset(el, "y_gap", _mm_or_m_to_m(y_gap))
-                        else:
-                            el = _ensure_group(elements_out, name, "NXguide")
-                            sel = src["selection"][()] if "selection" in src else None
-                            _write_dataset(el, "state", _sansllb_guide_state_from_selection(sel), as_string=True)
-                            if "m_value" in src:
-                                _write_dataset(el, "m_value", _as_float_scalar(src["m_value"][()]))
-                            if "selection" in src:
-                                _write_dataset(el, "selection", src["selection"][()])
-
-                        d = _safe_get(fin, f"{collimator_path}/{name}/distance")
-                        dist_m = float(_mm_or_m_to_m(d)) if d is not None else (start_d - k * step)
-
-                        tr = _ensure_group(el, "transformations", "NXtransformations")
-                        _write_dataset(tr, "translation", np.array([0.0, 0.0, -dist_m], dtype=float))
-                        element_order.append(name.encode())
-                else:
-                    warnings.append("No slit*/guide* entries found under input collimator; using heuristic collimation.")
-
-            if not element_order:
-                # Heuristic fallback (kept for legacy/partial files)
-                ap_el = _ensure_group(elements_out, "aperture", "NXaperture")
-                if ap_shape is not None:
-                    _write_dataset(ap_el, "shape", ap_shape)
-                if ap_xgap is not None:
-                    _write_dataset(ap_el, "x_gap", _mm_or_m_to_m(ap_xgap))
-                if ap_ygap is not None:
-                    _write_dataset(ap_el, "y_gap", _mm_or_m_to_m(ap_ygap))
-
-                ap_tr = _ensure_group(ap_el, "transformations", "NXtransformations")
-                _write_dataset(ap_tr, "translation", np.array([0.0, 0.0, -0.1], dtype=float))
-                element_order.append(b"aperture")
-
-                guide_el = _ensure_group(elements_out, "collimator", "NXguide")
-                _write_dataset(guide_el, "state", "in", as_string=True)
-                if col_len is not None:
-                    _write_dataset(guide_el, "length", _mm_or_m_to_m(col_len))
-                if col_dist is not None:
-                    _write_dataset(guide_el, "distance", _mm_or_m_to_m(col_dist))
-
-                guide_tr = _ensure_group(guide_el, "transformations", "NXtransformations")
-                L = _mm_or_m_to_m(col_len) if col_len is not None else 1.0
-                _write_dataset(guide_tr, "translation", np.array([0.0, 0.0, -max(L, 0.1)], dtype=float))
-                element_order.append(b"collimator")
-
-            _write_dataset(coll_out, "element_order", np.array(element_order, dtype="S"))
+            _write_collimation(
+                fin,
+                inst_in,
+                inst_out,
+                ap_shape=ap_shape,
+                ap_xgap_m=ap_xgap_m,
+                ap_ygap_m=ap_ygap_m,
+                col_dist_m=col_dist_m,
+                col_len_m=col_len_m,
+                warnings=warnings,
+            )
 
             # detectors + NXdata views
             for i, det_name in enumerate(det_names):
@@ -415,10 +549,10 @@ def convert_sansllb_to_scarlet_nxsas_raw(
                 data = det_in["data"][()]
                 _write_dataset(det_out, "data", data)
 
-                xpix = det_in["x_pixel_size"][()] if "x_pixel_size" in det_in else float("nan")
-                ypix = det_in["y_pixel_size"][()] if "y_pixel_size" in det_in else float("nan")
-                _write_dataset(det_out, "x_pixel_size", _mm_or_m_to_m(xpix))
-                _write_dataset(det_out, "y_pixel_size", _mm_or_m_to_m(ypix))
+                xpix_m = _length_dataset_to_m(_safe_get_dataset(fin, f"{inst_in}/{det_name}/x_pixel_size"))
+                ypix_m = _length_dataset_to_m(_safe_get_dataset(fin, f"{inst_in}/{det_name}/y_pixel_size"))
+                _write_dataset(det_out, "x_pixel_size", xpix_m if xpix_m is not None else float("nan"), units="m")
+                _write_dataset(det_out, "y_pixel_size", ypix_m if ypix_m is not None else float("nan"), units="m")
 
                 if "beam_center_x" in det_in:
                     _write_dataset(det_out, "beam_center_x", det_in["beam_center_x"][()])
@@ -461,7 +595,9 @@ def convert_sansllb_to_scarlet_nxsas_raw(
                         val = det_in[opt][()]
                         # convert distance to meters
                         if opt == "distance":
-                            val = _mm_or_m_to_m(val)
+                            val_m = _length_dataset_to_m(_safe_get_dataset(fin, f"{inst_in}/{det_name}/{opt}"))
+                            _write_dataset(det_out, opt, val_m if val_m is not None else float("nan"), units="m")
+                            continue
                         _write_dataset(det_out, opt, val)
 
                 # local_name (optional SCARLET)
@@ -470,28 +606,28 @@ def convert_sansllb_to_scarlet_nxsas_raw(
                 # transformations (required by SCARLET)
                 tr_out = _ensure_group(det_out, "transformations", "NXtransformations")
                 if "x_position" in det_in:
-                    dx = det_in["x_position"][()]
+                    dx_m = _length_dataset_to_m(_safe_get_dataset(fin, f"{inst_in}/{det_name}/x_position"))
                 elif "x_offset" in det_in:
-                    dx = det_in["x_offset"][()]
+                    dx_m = _length_dataset_to_m(_safe_get_dataset(fin, f"{inst_in}/{det_name}/x_offset"))
                 else:
-                    dx = 0.0
+                    dx_m = 0.0
 
                 if "y_position" in det_in:
-                    dy = det_in["y_position"][()]
+                    dy_m = _length_dataset_to_m(_safe_get_dataset(fin, f"{inst_in}/{det_name}/y_position"))
                 elif "y_offset" in det_in:
-                    dy = det_in["y_offset"][()]
+                    dy_m = _length_dataset_to_m(_safe_get_dataset(fin, f"{inst_in}/{det_name}/y_offset"))
                 else:
-                    dy = 0.0
+                    dy_m = 0.0
 
                 if "distance" in det_in:
-                    dz = det_in["distance"][()]
+                    dz_m = _length_dataset_to_m(_safe_get_dataset(fin, f"{inst_in}/{det_name}/distance"))
                 elif "z_offset" in det_in:
-                    dz = det_in["z_offset"][()]
+                    dz_m = _length_dataset_to_m(_safe_get_dataset(fin, f"{inst_in}/{det_name}/z_offset"))
                 else:
-                    dz = 0.0
+                    dz_m = 0.0
 
-                translation = np.array([_mm_or_m_to_m(dx), _mm_or_m_to_m(dy), _mm_or_m_to_m(dz)], dtype=float)
-                _write_dataset(tr_out, "translation", translation)
+                translation = np.array([float(dx_m), float(dy_m), float(dz_m)], dtype=float)
+                _write_dataset(tr_out, "translation", translation, units="m")
 
                 # NXdata view (SCARLET expects /entry/dataN with counts -> link to detector/data)
                 data_out = _ensure_group(entry_out, f"data{i}", "NXdata")
@@ -504,26 +640,7 @@ def convert_sansllb_to_scarlet_nxsas_raw(
                 if "data_errors" in det_out:
                     data_out["counts_errors"] = h5py.SoftLink(f"/entry/instrument/detector{i}/data_errors")
 
-            # monitors (optional)
-            if monitor_in and monitor_in in fin:
-                mon_in = fin[monitor_in]
-                mon_out = _ensure_group(inst_out, "monitor0", "NXmonitor")
-
-                # NXmonitor recommended fields; your schema requires mode+preset+integral|data
-                mode = _as_str(mon_in["mode"][0]) if "mode" in mon_in else "monitor"
-                _write_dataset(mon_out, "mode", mode, as_string=True)
-
-                # preset not present in SANS_LLB => write NaN but keep schema satisfied
-                _write_dataset(mon_out, "preset", float("nan"))
-
-                if "integral" in mon_in:
-                    _write_dataset(mon_out, "integral", _as_float_scalar(mon_in["integral"][()]))
-
-                if "count_time" in mon_in:
-                    _write_dataset(mon_out, "count_time", float(mon_in["count_time"][()]))
-
-            else:
-                notes.append("No /monitor group found in input; monitors omitted.")
+            _write_instrument_monitors(fin, entry, monitor_sources, inst_out, warnings, notes)
 
     return ConvertReport(
         input_file=input_path,

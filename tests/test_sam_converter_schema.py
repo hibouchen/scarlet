@@ -18,19 +18,31 @@ from scarlet.validation.schema_validator import validate_nexus_file
 @unittest.skipIf(h5py is None, "h5py not available")
 class TestSamConverterSchema(unittest.TestCase):
     def test_sam_sample_validates_with_schema(self) -> None:
-        raw_data = Path(__file__).resolve().parent / "data" / "sam" / "raw_data"
-        sample = raw_data / "011814.nxs"
+        root = Path(__file__).resolve().parent.parent
+        raw_data = root / "data" / "SAM" / "raw"
+        sample = raw_data / "011826.nxs"
         if not sample.exists():
             self.skipTest(f"Missing test input file: {sample}")
 
-        root = Path(__file__).resolve().parent.parent
         processed = Path(os.environ.get("SCARLET_TEST_OUTPUT_DIR", root / "data" / "SAM" / "processed"))
         processed.mkdir(parents=True, exist_ok=True)
-        out = processed / "011814_scarlet_nxsas_raw.h5"
+        out = processed / "011826_scarlet_nxsas_raw.h5"
 
         convert_sam_to_scarlet_nxsas_raw(sample, out, overwrite=True)
 
-        schema = load_schema("scarlet_nxsas_raw_v1.0.yaml")
+        schema = load_schema("scarlet_nxsas_raw_v1.3_mono.yaml")
         report = validate_nexus_file(out, schema)
         self.assertTrue(report.ok, "\n".join(report.format_lines()))
 
+        with h5py.File(out, "r") as fout:
+            self.assertEqual(fout["/entry/control/mode"][()].decode(), "timer")
+            self.assertEqual(float(fout["/entry/control/preset"][()]), 30.0)
+            self.assertEqual(float(fout["/entry/control/integral"][()]), 296271.0)
+            self.assertEqual(float(fout["/entry/control/count_time"][()]), 30.0)
+            self.assertIn("/entry/instrument/collimation/aperture1", fout)
+            self.assertIn("/entry/instrument/collimation/aperture2", fout)
+            got = [x.decode() if isinstance(x, (bytes, bytearray)) else str(x) for x in fout["/entry/instrument/collimation/element_order"][()]]
+            self.assertEqual(got, ["slit1", "guide1", "slit2", "guide2", "slit3", "guide3", "slit4"])
+            self.assertEqual(fout["/entry/instrument/collimation/elements/guide1/state"][()].decode(), "in")
+            self.assertEqual(fout["/entry/instrument/collimation/elements/guide2/state"][()].decode(), "in")
+            self.assertEqual(fout["/entry/instrument/collimation/elements/guide3/state"][()].decode(), "in")

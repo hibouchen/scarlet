@@ -33,9 +33,36 @@ class TestSansLlbConverterSchema(unittest.TestCase):
 
         convert_sansllb_to_scarlet_nxsas_raw(sample, out, overwrite=True)
 
-        schema = load_schema("scarlet_nxsas_raw_v1.0.yaml")
+        schema = load_schema("scarlet_nxsas_raw_v1.3_mono.yaml")
         report = validate_nexus_file(out, schema)
         self.assertTrue(report.ok, "\n".join(report.format_lines()))
+
+        with h5py.File(sample, "r") as fin, h5py.File(out, "r") as fout:
+            entry = "/entry0" if "/entry0" in fin else ("/entry" if "/entry" in fin else "/entry1")
+            preset_expected = float(fin[f"{entry}/monitor2/integral"][()].reshape(()))
+            self.assertEqual(fout["/entry/control/mode"][()].decode(), "monitor")
+            self.assertEqual(float(fout["/entry/control/preset"][()]), preset_expected)
+            self.assertEqual(float(fout["/entry/control/integral"][()]), preset_expected)
+            self.assertIn("/entry/instrument/collimation/aperture1", fout)
+            self.assertIn("/entry/instrument/collimation/aperture2", fout)
+            self.assertEqual(float(fout["/entry/instrument/detector0/x_pixel_size"][()]), 0.005)
+            self.assertEqual(fout["/entry/instrument/detector0/x_pixel_size"].attrs["units"], b"m")
+            self.assertEqual(fout["/entry/instrument/collimation/collimation_distance"].attrs["units"], b"m")
+            self.assertEqual(fout["/entry/instrument/collimation/aperture2"].attrs["NX_class"], b"NXslit")
+            self.assertEqual(float(fout["/entry/instrument/collimation/aperture2/x_gap"][()]), 0.01)
+            self.assertEqual(fout["/entry/instrument/collimation/aperture2/x_gap"].attrs["units"], b"m")
+            self.assertEqual(float(fout["/entry/instrument/collimation/aperture2/y_gap"][()]), 0.01)
+
+            expected_monitors = sorted(
+                key for key in fin[entry].keys() if key.startswith("monitor") and isinstance(fin[f"{entry}/{key}"], h5py.Group)
+            )
+            got_monitors = sorted(key for key in fout["/entry/instrument"].keys() if key.startswith("monitor"))
+            self.assertEqual(got_monitors, expected_monitors)
+
+            for name in expected_monitors:
+                if "integral" in fin[f"{entry}/{name}"]:
+                    integral_expected = float(fin[f"{entry}/{name}/integral"][()].reshape(()))
+                    self.assertEqual(float(fout[f"/entry/instrument/{name}/integral"][()]), integral_expected)
 
         # Collimation order: slit0, guide0, slit1, guide1, ...
         with h5py.File(sample, "r") as fin:
@@ -113,6 +140,11 @@ class TestSansLlbConverterSchema(unittest.TestCase):
                     state_s = state.decode(errors="replace")
                 else:
                     state_s = str(state)
+
+                self.assertNotIn(
+                    "selection",
+                    fout[f"/entry/instrument/collimation/elements/{name}"],
+                )
 
                 if sel_s == "ft":
                     self.assertEqual(state_s, "out")

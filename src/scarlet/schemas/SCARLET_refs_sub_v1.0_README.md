@@ -104,7 +104,6 @@ This group stores detector masks.
 
 Possible datasets:
 - `mask_detector0`, `mask_detector1`, ...
-- `beamstop_mask_detector0`, `beamstop_mask_detector1`, ...
 
 ### Convention
 - `1 = masked`
@@ -124,7 +123,6 @@ This group defines the detector ROI used to calculate transmission.
 - `x0`, `x1`, `y0`, `y1`
 
 ### Optional fields
-- `method` (string, e.g. `"sum"`)
 - `notes` (string)
 
 ### Convention

@@ -62,7 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("file", help="Path to .nxs/.h5 NeXus file")
     v.add_argument(
         "--schema",
-        default="scarlet_nxsas_raw_v1.0.yaml",
+        default="scarlet_nxsas_raw_v1.3_mono.yaml",
         help="Schema YAML filename (packaged) or path on disk",
     )
     v.add_argument(

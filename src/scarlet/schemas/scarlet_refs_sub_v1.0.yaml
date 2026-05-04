@@ -134,10 +134,6 @@ nodes:
     kind: dataset
     required: false
 
-  - path_pattern: ^/entry/mask/beamstop_mask_detector\d+$
-    kind: dataset
-    required: false
-
   # ---------------- Transmission ROI ----------------
   - path: /entry/transmission_roi
     kind: group
@@ -153,7 +149,6 @@ nodes:
       enums:
         roi_type: ["rectangle"]
       optional_datasets:
-        - method
         - notes
 
   # ---------------- Transmission attenuator (OPTIONAL, attenuation_factor only) ----------------

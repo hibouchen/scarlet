@@ -1,77 +1,21 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
 import h5py
 import numpy as np
 
-
-MM_TO_M = 1e-3
-
-
-@dataclass
-class ConvertReport:
-    input_file: Path
-    output_file: Path
-    entry_in: str
-    notes: List[str]
-    warnings: List[str]
-
-
-def _as_str(x) -> str:
-    if isinstance(x, (bytes, bytearray)):
-        return x.decode(errors="replace")
-    if isinstance(x, np.ndarray) and x.size == 1:
-        return _as_str(x.reshape(()).item())
-    return str(x)
-
-
-def _as_float_scalar(x) -> float:
-    if x is None:
-        return float("nan")
-    if isinstance(x, np.ndarray) and x.size == 1:
-        return float(x.reshape(()))
-    return float(x)
-
-
-def _safe_get(fin: h5py.File, path: str):
-    return fin[path][()] if path in fin else None
-
-
-def _ensure_group(g: h5py.Group, name: str, nx_class: Optional[str] = None) -> h5py.Group:
-    gg = g.create_group(name)
-    if nx_class:
-        gg.attrs["NX_class"] = np.bytes_(nx_class)
-    return gg
-
-
-def _write_dataset(g: h5py.Group, name: str, data, *, as_string: bool = False) -> h5py.Dataset:
-    if as_string:
-        data = np.bytes_(str(data))
-    return g.create_dataset(name, data=data)
-
-
-def _mm_to_m(value) -> float:
-    return _as_float_scalar(value) * MM_TO_M
-
-
-def _pick_entry(fin: h5py.File, preferred: Optional[str] = None) -> str:
-    if preferred and preferred in fin:
-        return preferred
-    for cand in ("/entry0", "/entry", "/entry1"):
-        if cand in fin:
-            return cand
-    # fallback
-    for k in fin.keys():
-        p = f"/{k}"
-        if isinstance(fin[p], h5py.Group):
-            nx = fin[p].attrs.get("NX_class", None)
-            if nx is not None and _as_str(nx) == "NXentry":
-                return p
-    raise ValueError("No NXentry found in file.")
-
+from ._report import ConvertReport
+from ._hdf import (
+    as_float_scalar as _as_float_scalar,
+    as_str as _as_str,
+    ensure_group as _ensure_group,
+    pick_entry as _pick_entry,
+    safe_get as _safe_get,
+    write_dataset as _write_dataset,
+)
+from ._units import MM_TO_M, mm_to_m as _mm_to_m
 
 def _sam_instrument_path(fin: h5py.File, entry: str) -> str:
     eg = fin[entry]
@@ -126,6 +70,100 @@ def _sam_read_detector_counts(fin: h5py.File, entry: str, warnings: List[str]) -
     raise ValueError("Could not locate SAM detector data.")
 
 
+def _sam_monitor_mode(value) -> str:
+    mode = _as_str(value).strip().lower()
+    if mode == "time":
+        return "timer"
+    if mode in {"monitor", "timer"}:
+        return mode
+    return "timer"
+
+
+def _sam_monitor_integral(fin: h5py.File, entry: str) -> float:
+    integral = _safe_get(fin, f"{entry}/monitor/integral")
+    if integral is not None:
+        return _as_float_scalar(integral)
+
+    data = _safe_get(fin, f"{entry}/monitor/data")
+    if data is not None:
+        a = np.asarray(data, dtype=float)
+        if a.size == 1:
+            return float(a.reshape(()))
+        return float(np.sum(a))
+
+    monsum = _safe_get(fin, f"{entry}/monitor/monsum")
+    if monsum is not None:
+        return _as_float_scalar(monsum)
+
+    return float("nan")
+
+
+def _sam_guide_state(value) -> str:
+    state = _as_str(value).strip().lower()
+    if state == "in":
+        return "in"
+    if state == "out":
+        return "out"
+    return "in"
+
+
+def _copy_aperture_snapshot(coll_out: h5py.Group, name: str, src: h5py.Group) -> None:
+    dst = _ensure_group(coll_out, name, _as_str(src.attrs.get("NX_class")))
+    for field in ("x_gap", "y_gap", "diameter"):
+        if field in src:
+            _write_dataset(dst, field, src[field][()])
+    if "transformations" in src and isinstance(src["transformations"], h5py.Group):
+        src_tr = src["transformations"]
+        dst_tr = _ensure_group(dst, "transformations", _as_str(src_tr.attrs.get("NX_class")))
+        if "translation" in src_tr:
+            _write_dataset(dst_tr, "translation", src_tr["translation"][()])
+
+
+def _derive_aperture_snapshots(coll_out: h5py.Group, element_names: List[str], warnings: List[str]) -> None:
+    elements = coll_out["elements"]
+    aperture_classes = {"NXslit", "NXpinhole", "NXaperture"}
+    aperture_names = [name for name in element_names if _as_str(elements[name].attrs.get("NX_class")) in aperture_classes]
+
+    if not aperture_names:
+        warnings.append("No aperture-like elements available to derive aperture1/aperture2.")
+        return
+
+    aperture2_name = aperture_names[-1]
+    aperture1_name: Optional[str] = None
+
+    first_in_guide_idx: Optional[int] = None
+    for idx, name in enumerate(element_names):
+        element = elements[name]
+        if _as_str(element.attrs.get("NX_class")) != "NXguide":
+            continue
+        if "state" in element and _as_str(element["state"][()]) == "in":
+            first_in_guide_idx = idx
+            break
+
+    if first_in_guide_idx is not None:
+        for idx in range(first_in_guide_idx - 1, -1, -1):
+            candidate = element_names[idx]
+            if candidate in aperture_names:
+                aperture1_name = candidate
+                break
+        if aperture1_name is None:
+            for idx in range(first_in_guide_idx + 1, len(element_names)):
+                candidate = element_names[idx]
+                if candidate in aperture_names:
+                    aperture1_name = candidate
+                    warnings.append(
+                        "Could not find an upstream aperture before the first in-guide; using the nearest downstream aperture."
+                    )
+                    break
+
+    if aperture1_name is None:
+        aperture1_name = aperture_names[0]
+        warnings.append("Could not derive aperture1 from guide states; using the first aperture in element_order.")
+
+    _copy_aperture_snapshot(coll_out, "aperture1", elements[aperture1_name])
+    _copy_aperture_snapshot(coll_out, "aperture2", elements[aperture2_name])
+
+
 def convert_sam_to_scarlet_nxsas_raw(
     input_path: str | Path,
     output_path: str | Path,
@@ -173,10 +211,11 @@ def convert_sam_to_scarlet_nxsas_raw(
         # counts
         counts = _sam_read_detector_counts(fin, entry, warnings)
 
-        # collimation length (assumed meters; often equals 2.5/6/...)
-        col_L = _safe_get(fin, f"{inst_in}/collimation/sourceDistance")
+        # Collimation distance in SAM is provided by /collimation/position.
+        # Keep sourceDistance only as a fallback for older variants.
+        col_L = _safe_get(fin, f"{inst_in}/collimation/position")
         if col_L is None:
-            col_L = _safe_get(fin, f"{inst_in}/collimation/position")
+            col_L = _safe_get(fin, f"{inst_in}/collimation/sourceDistance")
         col_L_m = _as_float_scalar(col_L) if col_L is not None else 1.0
 
         # virtual slits (widths in mm)
@@ -186,20 +225,22 @@ def convert_sam_to_scarlet_nxsas_raw(
             v = _safe_get(fin, f"{vslit}/{name}")
             return None if v is None else float(_as_float_scalar(v))
 
-        # S1/S2/S3: use actual widths if available, else wanted widths.
-        slit_specs = []
-        for i in (1, 2, 3):
-            xw = vslit_mm(f"s{i}w_actual_width") or vslit_mm(f"s{i}w_wanted_width")
-            yw = vslit_mm(f"s{i}h_actual_width") or vslit_mm(f"s{i}h_wanted_width")
-            if xw is None and yw is None:
-                continue
-            slit_specs.append((f"slit{i}", xw, yw))
+        def slit_widths_mm(i: int) -> tuple[Optional[float], Optional[float]]:
+            xw = vslit_mm(f"s{i}w_actual_width")
+            if xw is None:
+                xw = vslit_mm(f"s{i}w_wanted_width")
+            yw = vslit_mm(f"s{i}h_actual_width")
+            if yw is None:
+                yw = vslit_mm(f"s{i}h_wanted_width")
+            return xw, yw
+
+        collimation_in = f"{inst_in}/collimation"
 
         # --- Write output ---
         with h5py.File(output_path, "w") as fout:
             entry_out = _ensure_group(fout, "entry", "NXentry")
             _write_dataset(entry_out, "definition", "NXsas_raw", as_string=True)
-            _write_dataset(entry_out, "schema_version", "1.0", as_string=True)
+            _write_dataset(entry_out, "schema_version", "1.3", as_string=True)
 
             # sample
             sample_out = _ensure_group(entry_out, "sample", "NXsample")
@@ -208,6 +249,35 @@ def convert_sam_to_scarlet_nxsas_raw(
                 _write_dataset(sample_out, "name", _as_str(title), as_string=True)
             else:
                 _write_dataset(sample_out, "name", "unknown", as_string=True)
+
+            # control monitor required by the v1.3 schema
+            control_out = _ensure_group(entry_out, "control", "NXmonitor")
+            control_mode_src = _safe_get(fin, f"{entry}/monitor/mode")
+            if control_mode_src is None:
+                control_mode_src = _safe_get(fin, f"{entry}/modestring")
+            _write_dataset(control_out, "mode", _sam_monitor_mode(control_mode_src), as_string=True)
+
+            control_preset = _safe_get(fin, f"{entry}/monitor/preset")
+            if control_preset is None:
+                control_preset = _safe_get(fin, f"{entry}/preset")
+            if control_preset is None:
+                warnings.append(f"{entry}: missing preset information; writing NaN in /entry/control/preset.")
+                _write_dataset(control_out, "preset", float("nan"))
+            else:
+                _write_dataset(control_out, "preset", _as_float_scalar(control_preset))
+
+            control_integral = _sam_monitor_integral(fin, entry)
+            if np.isnan(control_integral):
+                warnings.append(
+                    f"{entry}/monitor: missing integral, data, and monsum; writing NaN in /entry/control/integral."
+                )
+            _write_dataset(control_out, "integral", control_integral)
+
+            control_count_time = _safe_get(fin, f"{entry}/time")
+            if control_count_time is None:
+                control_count_time = _safe_get(fin, f"{entry}/duration")
+            if control_count_time is not None:
+                _write_dataset(control_out, "count_time", _as_float_scalar(control_count_time))
 
             # instrument
             inst_out = _ensure_group(entry_out, "instrument", "NXinstrument")
@@ -223,29 +293,54 @@ def convert_sam_to_scarlet_nxsas_raw(
             coll_out = _ensure_group(inst_out, "collimation", None)
             elements_out = _ensure_group(coll_out, "elements", None)
 
-            element_order: List[bytes] = []
-            if slit_specs:
-                end_d = 0.1
-                start_d = float(end_d + max(col_L_m, 0.0))
-                step = (float(col_L_m) / (len(slit_specs) - 1)) if len(slit_specs) > 1 else 0.0
-                for k, (name, xw_mm, yw_mm) in enumerate(slit_specs):
-                    el = _ensure_group(elements_out, name, "NXslit")
-                    if xw_mm is not None:
-                        _write_dataset(el, "x_gap", float(xw_mm) * MM_TO_M)
-                    if yw_mm is not None:
-                        _write_dataset(el, "y_gap", float(yw_mm) * MM_TO_M)
-                    tr = _ensure_group(el, "transformations", "NXtransformations")
-                    dist_m = start_d - k * step
-                    _write_dataset(tr, "translation", np.array([0.0, 0.0, -float(dist_m)], dtype=float))
-                    element_order.append(name.encode())
-            else:
-                # Minimal placeholder to satisfy schema
-                el = _ensure_group(elements_out, "slit1", "NXslit")
-                tr = _ensure_group(el, "transformations", "NXtransformations")
-                _write_dataset(tr, "translation", np.array([0.0, 0.0, -0.1], dtype=float))
-                element_order.append(b"slit1")
-                warnings.append("VirtualSlitAxis widths not found; writing placeholder collimation slit1.")
+            collimation_order: list[tuple[str, int]] = [
+                ("slit", 1),
+                ("guide", 1),
+                ("slit", 2),
+                ("guide", 2),
+                ("slit", 3),
+                ("guide", 3),
+                ("slit", 4),
+            ]
+            end_d = 0.1
+            start_d = float(end_d + max(col_L_m, 0.0))
+            step = (float(col_L_m) / (len(collimation_order) - 1)) if len(collimation_order) > 1 else 0.0
+            notes.append("SAM slit4 position is currently written with an ad hoc downstream distance.")
 
+            element_order: List[bytes] = []
+            for k, (kind, idx) in enumerate(collimation_order):
+                name = f"{kind}{idx}"
+                dist_m = start_d - k * step
+
+                if kind == "slit":
+                    el = _ensure_group(elements_out, name, "NXslit")
+                    xw_mm, yw_mm = slit_widths_mm(idx)
+                    if xw_mm is None:
+                        warnings.append(f"{vslit}: missing width for {name}/x_gap; writing NaN.")
+                        _write_dataset(el, "x_gap", float("nan"))
+                    else:
+                        _write_dataset(el, "x_gap", float(xw_mm) * MM_TO_M)
+                    if yw_mm is None:
+                        warnings.append(f"{vslit}: missing width for {name}/y_gap; writing NaN.")
+                        _write_dataset(el, "y_gap", float("nan"))
+                    else:
+                        _write_dataset(el, "y_gap", float(yw_mm) * MM_TO_M)
+                else:
+                    el = _ensure_group(elements_out, name, "NXguide")
+                    state_value = _safe_get(fin, f"{collimation_in}/col{idx}_state")
+                    _write_dataset(el, "state", _sam_guide_state(state_value), as_string=True)
+
+                tr = _ensure_group(el, "transformations", "NXtransformations")
+                _write_dataset(tr, "translation", np.array([0.0, 0.0, -float(dist_m)], dtype=float))
+                element_order.append(name.encode())
+
+            _derive_aperture_snapshots(
+                coll_out,
+                [name.decode() if isinstance(name, (bytes, bytearray)) else str(name) for name in element_order],
+                warnings,
+            )
+            _write_dataset(coll_out, "collimation_distance", float(max(col_L_m, 0.0)))
+            _write_dataset(coll_out, "last_aperture_to_sample_distance", float(end_d))
             _write_dataset(coll_out, "element_order", np.array(element_order, dtype="S"))
 
             # detector0
@@ -274,4 +369,3 @@ def convert_sam_to_scarlet_nxsas_raw(
         notes=notes,
         warnings=warnings,
     )
-
