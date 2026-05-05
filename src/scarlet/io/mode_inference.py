@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Tuple
 
 import h5py
 import numpy as np
@@ -12,75 +12,174 @@ MeasurementMode = Literal["transmission", "scattering", "unknown"]
 
 
 @dataclass(frozen=True)
-class MeasurementModeGuess:
+class ImageModeGuess:
     mode: MeasurementMode
     confidence: float
-    entry_path: str
     scores: Dict[str, float]
     reasons: List[str]
 
 
-def guess_measurement_mode(
-    file_path: str | Path,
+def guess_measurement_mode_from_image(
+    data: np.ndarray,
     *,
-    entry_path: str | None = "/entry",
-    detector_index: int = 0,
-    roi_half_size: int = 8,
-) -> MeasurementModeGuess:
+    center: Optional[Tuple[float, float]] = None,
+    center_half_size: int = 1,
+    ring_half_size: int = 4,
+    local_half_size: int = 10,
+) -> ImageModeGuess:
     """
-    Guess whether a NeXus file corresponds to a transmission or scattering measurement.
+    Guess measurement mode using only a 2D detector image.
 
-    Heuristics used:
-    1. explicit textual metadata if available
-    2. filename hints
-    3. attenuator hints
-    4. beamstop hints
-    5. image-based central ROI heuristic on detector0 (or chosen detector)
+    Strategy:
+    - use the geometrical image center unless an explicit center is provided
+    - compare a tiny center ROI to a surrounding ring
+    - measure the offset of the brightest local peak
 
-    Parameters
-    ----------
-    file_path:
-        Path to the NeXus/HDF5 file.
-    entry_path:
-        Preferred entry path (default: /entry). Falls back to /entry0 or /entry1.
-    detector_index:
-        Detector index used for image-based heuristic.
-    roi_half_size:
-        Half-size of the square ROI around the beam center for the image heuristic.
-
-    Returns
-    -------
-    MeasurementModeGuess
+    Interpretation:
+    - dark center + off-centered bright halo -> scattering
+    - bright center + peak near center -> transmission
     """
-    file_path = Path(file_path)
+    data = np.asarray(data, dtype=float)
+    if data.ndim != 2:
+        raise ValueError("guess_measurement_mode_from_image expects a 2D array")
+
+    ny, nx = data.shape
+
+    if center is None:
+        cx = (nx - 1) / 2.0
+        cy = (ny - 1) / 2.0
+    else:
+        cx, cy = center
+
+    cx = int(round(cx))
+    cy = int(round(cy))
+
+    if not (0 <= cx < nx and 0 <= cy < ny):
+        raise ValueError("Center is outside the image")
 
     scores = {"transmission": 0.0, "scattering": 0.0}
     reasons: List[str] = []
 
-    with h5py.File(file_path, "r") as h5:
-        resolved_entry = _resolve_entry_path(h5, entry_path)
+    # --- tiny center ROI
+    c0x = max(0, cx - center_half_size)
+    c1x = min(nx, cx + center_half_size + 1)
+    c0y = max(0, cy - center_half_size)
+    c1y = min(ny, cy + center_half_size + 1)
+    center_roi = data[c0y:c1y, c0x:c1x]
 
-        _apply_textual_metadata_heuristics(h5, resolved_entry, scores, reasons)
-        _apply_filename_heuristics(file_path, scores, reasons)
-        _apply_attenuator_heuristics(h5, resolved_entry, scores, reasons)
-        _apply_beamstop_heuristics(h5, resolved_entry, scores, reasons)
-        _apply_image_heuristics(
-            h5,
-            resolved_entry,
-            detector_index=detector_index,
-            roi_half_size=roi_half_size,
-            scores=scores,
-            reasons=reasons,
+    # --- ring box around the center
+    r0x = max(0, cx - ring_half_size)
+    r1x = min(nx, cx + ring_half_size + 1)
+    r0y = max(0, cy - ring_half_size)
+    r1y = min(ny, cy + ring_half_size + 1)
+    ring_box = data[r0y:r1y, r0x:r1x].copy()
+
+    inner_y0 = c0y - r0y
+    inner_y1 = inner_y0 + center_roi.shape[0]
+    inner_x0 = c0x - r0x
+    inner_x1 = inner_x0 + center_roi.shape[1]
+    ring_box[inner_y0:inner_y1, inner_x0:inner_x1] = np.nan
+
+    # --- local box for peak search
+    h = max(local_half_size, ring_half_size + 2)
+    b0x = max(0, cx - h)
+    b1x = min(nx, cx + h + 1)
+    b0y = max(0, cy - h)
+    b1y = min(ny, cy + h + 1)
+    local_box = data[b0y:b1y, b0x:b1x]
+
+    center_mean = float(np.nanmean(center_roi))
+    ring_mean = float(np.nanmean(ring_box))
+    peak_idx = np.unravel_index(np.nanargmax(local_box), local_box.shape)
+    peak_y = b0y + int(peak_idx[0])
+    peak_x = b0x + int(peak_idx[1])
+    peak_value = float(np.nanmax(local_box))
+    peak_dist = float(np.hypot(peak_x - cx, peak_y - cy))
+
+    eps = 1e-12
+    center_vs_ring = (center_mean + eps) / (ring_mean + eps)
+    center_vs_peak = (center_mean + eps) / (peak_value + eps)
+
+    # --------------------------------------------------
+    # Scattering:
+    # very dark center + peak shifted away from center
+    # --------------------------------------------------
+    if center_vs_ring < 0.45 and peak_dist >= 2.5:
+        scores["scattering"] += 4.0
+        reasons.append(
+            f"dark center with offset bright region "
+            f"(center/ring={center_vs_ring:.2f}, peak offset={peak_dist:.1f} px)"
         )
 
-    mode, confidence = _finalize_guess(scores)
+    if center_vs_peak < 0.20 and peak_dist >= 3.0:
+        scores["scattering"] += 2.0
+        reasons.append(
+            f"center strongly suppressed relative to local peak "
+            f"(center/peak={center_vs_peak:.2f}, peak offset={peak_dist:.1f} px)"
+        )
 
-    return MeasurementModeGuess(
+    # --------------------------------------------------
+    # Transmission:
+    # bright center + peak close to center
+    # --------------------------------------------------
+    if center_vs_ring > 1.15 and peak_dist <= 5.0:
+        scores["transmission"] += 4.0
+        reasons.append(
+            f"bright center compatible with direct beam "
+            f"(center/ring={center_vs_ring:.2f}, peak offset={peak_dist:.1f} px)"
+        )
+
+    if center_vs_peak > 0.45 and peak_dist <= 6.0:
+        scores["transmission"] += 1.5
+        reasons.append(
+            f"center remains bright compared to peak "
+            f"(center/peak={center_vs_peak:.2f}, peak offset={peak_dist:.1f} px)"
+        )
+
+    mode, confidence = _finalize_image_guess(scores)
+
+    return ImageModeGuess(
         mode=mode,
         confidence=confidence,
-        entry_path=resolved_entry,
-        scores=dict(scores),
+        scores=scores,
         reasons=reasons,
+    )
+
+
+def guess_measurement_mode_from_nexus_image(
+    file_path: str | Path,
+    *,
+    entry_path: str | None = "/entry",
+    detector_index: int = 0,
+    center_half_size: int = 1,
+    ring_half_size: int = 4,
+    local_half_size: int = 10,
+) -> ImageModeGuess:
+    """
+    Guess measurement mode using only the detector image stored in a NeXus file.
+
+    This function:
+    1. resolves the entry path (/entry, /entry0, /entry1),
+    2. reads /entry/instrument/detectorN/data,
+    3. calls guess_measurement_mode_from_image(data).
+    """
+    file_path = Path(file_path)
+
+    with h5py.File(file_path, "r") as h5:
+        resolved_entry = _resolve_entry_path(h5, entry_path)
+        data_path = f"{resolved_entry}/instrument/detector{detector_index}/data"
+
+        if data_path not in h5:
+            raise ValueError(f"Missing detector image dataset: {data_path}")
+
+        data = np.asarray(h5[data_path][()], dtype=float)
+
+    return guess_measurement_mode_from_image(
+        data,
+        center=None,
+        center_half_size=center_half_size,
+        ring_half_size=ring_half_size,
+        local_half_size=local_half_size,
     )
 
 
@@ -93,229 +192,7 @@ def _resolve_entry_path(h5: h5py.File, preferred: str | None) -> str:
     raise ValueError("No entry group found in file.")
 
 
-def _as_str(value) -> str:
-    if isinstance(value, (bytes, bytearray)):
-        return value.decode(errors="replace")
-    if isinstance(value, np.ndarray) and value.shape == ():
-        return _as_str(value.item())
-    return str(value)
-
-
-def _read_scalar(h5: h5py.File, path: str):
-    if path not in h5:
-        return None
-    try:
-        return h5[path][()]
-    except Exception:
-        return None
-
-
-def _text_contains_transmission(text: str) -> bool:
-    t = text.lower()
-    return any(k in t for k in ("trans", "transmission", "attenuat"))
-
-
-def _text_contains_scattering(text: str) -> bool:
-    t = text.lower()
-    return any(k in t for k in ("scatt", "scatter", "diffus", "diffraction"))
-
-
-def _apply_textual_metadata_heuristics(
-    h5: h5py.File,
-    entry: str,
-    scores: Dict[str, float],
-    reasons: List[str],
-) -> None:
-    candidate_paths = [
-        f"{entry}/measurement_mode",
-        f"{entry}/mode",
-        f"{entry}/instrument/mode",
-        f"{entry}/instrument/measurement_mode",
-        f"{entry}/title",
-        f"{entry}/sample/name",
-    ]
-
-    for path in candidate_paths:
-        value = _read_scalar(h5, path)
-        if value is None:
-            continue
-        text = _as_str(value)
-        if _text_contains_transmission(text):
-            scores["transmission"] += 6.0
-            reasons.append(f"text hint at {path}: {text!r} -> transmission")
-        elif _text_contains_scattering(text):
-            scores["scattering"] += 6.0
-            reasons.append(f"text hint at {path}: {text!r} -> scattering")
-
-
-def _apply_filename_heuristics(
-    file_path: Path,
-    scores: Dict[str, float],
-    reasons: List[str],
-) -> None:
-    name = file_path.name.lower()
-
-    if any(k in name for k in ("trans", "transmission", "_tr_", "_tr.", "_t.")):
-        scores["transmission"] += 2.0
-        reasons.append(f"filename hint: {file_path.name!r} -> transmission")
-
-    if any(k in name for k in ("scatt", "scatter", "diff", "sans")):
-        scores["scattering"] += 1.5
-        reasons.append(f"filename hint: {file_path.name!r} -> scattering")
-
-
-def _apply_attenuator_heuristics(
-    h5: h5py.File,
-    entry: str,
-    scores: Dict[str, float],
-    reasons: List[str],
-) -> None:
-    candidate_paths = [
-        f"{entry}/transmission_setup/attenuator/attenuation_factor",
-        f"{entry}/instrument/attenuator/attenuation_factor",
-        f"{entry}/instrument/attenuator/transmission",
-    ]
-
-    for path in candidate_paths:
-        value = _read_scalar(h5, path)
-        if value is None:
-            continue
-        try:
-            x = float(value)
-        except Exception:
-            continue
-
-        if path.endswith("attenuation_factor") and x > 1.0:
-            scores["transmission"] += 3.0
-            reasons.append(f"attenuator hint at {path}: factor={x:g} -> transmission")
-        elif path.endswith("/transmission") and 0.0 < x < 1.0:
-            scores["transmission"] += 3.0
-            reasons.append(f"attenuator hint at {path}: transmission={x:g} -> transmission")
-
-
-def _apply_beamstop_heuristics(
-    h5: h5py.File,
-    entry: str,
-    scores: Dict[str, float],
-    reasons: List[str],
-) -> None:
-    beamstop_group = f"{entry}/instrument/beamstop"
-    if beamstop_group not in h5:
-        return
-
-    state_paths = [
-        f"{beamstop_group}/state",
-        f"{beamstop_group}/in_use",
-        f"{beamstop_group}/inserted",
-    ]
-
-    found_state = False
-    for path in state_paths:
-        value = _read_scalar(h5, path)
-        if value is None:
-            continue
-        found_state = True
-        text = _as_str(value).strip().lower()
-
-        if text in {"in", "inserted", "true", "1", "yes"}:
-            scores["scattering"] += 2.5
-            reasons.append(f"beamstop hint at {path}: {text!r} -> scattering")
-        elif text in {"out", "removed", "false", "0", "no"}:
-            scores["transmission"] += 2.5
-            reasons.append(f"beamstop hint at {path}: {text!r} -> transmission")
-
-    if not found_state:
-        scores["scattering"] += 0.5
-        reasons.append("beamstop group present but no explicit state -> weak scattering hint")
-
-
-def _apply_image_heuristics(
-    h5: h5py.File,
-    entry: str,
-    *,
-    detector_index: int,
-    roi_half_size: int,
-    scores: Dict[str, float],
-    reasons: List[str],
-) -> None:
-    det = f"{entry}/instrument/detector{detector_index}"
-    data_path = f"{det}/data"
-    bcx_path = f"{det}/beam_center_x"
-    bcy_path = f"{det}/beam_center_y"
-
-    if data_path not in h5 or bcx_path not in h5 or bcy_path not in h5:
-        return
-
-    try:
-        data = np.asarray(h5[data_path][()], dtype=float)
-        if data.ndim != 2:
-            return
-
-        bcx = float(h5[bcx_path][()])
-        bcy = float(h5[bcy_path][()])
-    except Exception:
-        return
-
-    ny, nx = data.shape
-    cx = int(round(bcx))
-    cy = int(round(bcy))
-
-    if not (0 <= cx < nx and 0 <= cy < ny):
-        return
-
-    h = max(2, int(roi_half_size))
-    x0 = max(0, cx - h)
-    x1 = min(nx, cx + h + 1)
-    y0 = max(0, cy - h)
-    y1 = min(ny, cy + h + 1)
-
-    center = data[y0:y1, x0:x1]
-    if center.size == 0:
-        return
-
-    h2 = min(max(2 * h, h + 2), max(nx, ny))
-    xx0 = max(0, cx - h2)
-    xx1 = min(nx, cx + h2 + 1)
-    yy0 = max(0, cy - h2)
-    yy1 = min(ny, cy + h2 + 1)
-
-    outer = data[yy0:yy1, xx0:xx1].copy()
-    inner_y0 = y0 - yy0
-    inner_y1 = inner_y0 + center.shape[0]
-    inner_x0 = x0 - xx0
-    inner_x1 = inner_x0 + center.shape[1]
-    outer[inner_y0:inner_y1, inner_x0:inner_x1] = np.nan
-
-    center_mean = float(np.nanmean(center))
-    outer_mean = float(np.nanmean(outer))
-    center_sum = float(np.nansum(center))
-    total_sum = float(np.nansum(data))
-
-    eps = 1e-12
-    ratio = (center_mean + eps) / (outer_mean + eps)
-    fraction = (center_sum + eps) / (total_sum + eps)
-
-    if ratio > 5.0 and fraction > 0.02:
-        scores["transmission"] += 4.0
-        reasons.append(
-            f"image hint: strong central beam on detector{detector_index} "
-            f"(center/background ratio={ratio:.2f}, central fraction={fraction:.3f}) -> transmission"
-        )
-    elif ratio < 0.7:
-        scores["scattering"] += 2.5
-        reasons.append(
-            f"image hint: central ROI suppressed on detector{detector_index} "
-            f"(center/background ratio={ratio:.2f}) -> scattering"
-        )
-    elif ratio > 2.0:
-        scores["transmission"] += 1.5
-        reasons.append(
-            f"image hint: moderately enhanced central ROI on detector{detector_index} "
-            f"(center/background ratio={ratio:.2f}) -> weak transmission hint"
-        )
-
-
-def _finalize_guess(scores: Dict[str, float]) -> tuple[MeasurementMode, float]:
+def _finalize_image_guess(scores: Dict[str, float]) -> Tuple[MeasurementMode, float]:
     t = scores["transmission"]
     s = scores["scattering"]
 

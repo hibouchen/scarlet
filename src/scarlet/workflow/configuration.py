@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 from typing import Optional, Tuple, Union, List, Literal, Mapping
 from xml.sax.saxutils import escape
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -10,6 +11,8 @@ from zipfile import ZIP_DEFLATED, ZipFile
 import h5py
 import numpy as np
 import math
+
+from scarlet.io.mode_inference import guess_measurement_mode_from_nexus_image
 
 ApertureType = Literal["slit", "pinhole"]
 
@@ -151,11 +154,40 @@ def write_refs_sub_file(
         raise ValueError("Reference file must contain /entry, /entry0, or /entry1")
 
     def _copy_reference(parent: h5py.Group, name: str, source_path: Union[str, Path]) -> Path:
+        def _rewrite_internal_soft_links(
+            copied_group: h5py.Group,
+            *,
+            copied_entry_path: str,
+            source_entry_path: str,
+        ) -> None:
+            for key in list(copied_group.keys()):
+                child_path = f"{copied_group.name}/{key}"
+                link = copied_group.file.get(child_path, getlink=True)
+                if isinstance(link, h5py.SoftLink) and isinstance(link.path, str):
+                    if link.path == source_entry_path or link.path.startswith(f"{source_entry_path}/"):
+                        suffix = link.path[len(source_entry_path) :]
+                        del copied_group[key]
+                        copied_group[key] = h5py.SoftLink(f"{copied_entry_path}{suffix}")
+                        continue
+
+                child = copied_group[key]
+                if isinstance(child, h5py.Group):
+                    _rewrite_internal_soft_links(
+                        child,
+                        copied_entry_path=copied_entry_path,
+                        source_entry_path=source_entry_path,
+                    )
+
         source_path = Path(source_path).resolve()
         ref_group = parent.create_group(name)
         with h5py.File(source_path, "r") as source_file:
             entry_group = _select_entry(source_file)
             source_file.copy(entry_group, ref_group, name="entry")
+            _rewrite_internal_soft_links(
+                ref_group["entry"],
+                copied_entry_path=ref_group["entry"].name,
+                source_entry_path=entry_group.name,
+            )
         return source_path
 
     def _file_created_utc(path: Path) -> str:
@@ -587,6 +619,13 @@ def write_run_configuration_excel(
             return min(float(v) for v in value) if value else float("inf")
         return float(value)
 
+    def _run_number_sort_value(path: Union[str, Path]) -> tuple[int, str]:
+        name = Path(path).name
+        matches = re.findall(r"\d+", name)
+        if not matches:
+            return (float("inf"), name)
+        return (int(matches[-1]), name)
+
     def _aperture_text(aperture: Aperture) -> str:
         if aperture.type == "slit":
             x_gap = "" if aperture.x_gap is None else f"{float(aperture.x_gap):g}"
@@ -642,18 +681,16 @@ def write_run_configuration_excel(
             start=1,
         )
     }
+    measurement_guesses: dict[Path, tuple[str, float]] = {}
 
     rows = [
-        ("data_file", "config_id", "configuration", "sample_name", "measurement_type"),
+        ("data_file", "config_id", "configuration", "sample_name", "measurement_type", "measurement_confidence"),
     ]
     for run_key, run_path in sorted(
         workflow_context.runs.items(),
         key=lambda item: (
+            _run_number_sort_value(item[1]),
             config_aliases.get(item[0].config_id, item[0].config_id),
-            "" if item[0].sample_id is None else item[0].sample_id,
-            item[0].entity,
-            item[0].mode,
-            str(item[1]),
         ),
     ):
         canonical_config_id = config_aliases.get(run_key.config_id, run_key.config_id)
@@ -662,13 +699,24 @@ def write_run_configuration_excel(
             canonical_config_id,
             workflow_context.configurations.get(run_key.config_id),
         )
+        run_path = Path(run_path).resolve()
+        measurement_guess = measurement_guesses.get(run_path)
+        if measurement_guess is None:
+            try:
+                guess = guess_measurement_mode_from_nexus_image(run_path)
+                measurement_guess = (guess.mode, float(guess.confidence))
+            except Exception:
+                measurement_guess = ("unknown", 0.0)
+            measurement_guesses[run_path] = measurement_guess
+        measurement_type, measurement_confidence = measurement_guess
         rows.append(
             (
-                Path(run_path).name,
+                run_path.name,
                 config_id,
                 _configuration_text(configuration),
                 "" if run_key.sample_id is None else run_key.sample_id,
-                run_key.mode,
+                measurement_type,
+                f"{measurement_confidence:.6g}",
             )
         )
 
@@ -762,3 +810,235 @@ def write_run_configuration_excel(
         workflow_context.add_artifact(file_path.name, file_path, kind="xlsx")
 
     return file_path
+
+
+def write_refs_sub_files_from_excel(
+    excel_path: Union[str, Path],
+    data_dir: Union[str, Path],
+    output_dir: Union[str, Path],
+    *,
+    transmission_roi_detector: int = 0,
+    transmission_roi_half_size: int = 1,
+    overwrite: bool = False,
+) -> dict[str, Path]:
+    """
+    Generate one SCARLET refs_sub file per configuration listed in the Excel table.
+
+    The Excel file is expected to come from ``write_run_configuration_excel``.
+    Classification rules:
+    - dark/background: sample name equal to Cd, Cadmium, or B4C
+      If several candidates exist for one configuration, keep the one with the
+      longest counting time found in the reference file.
+    - empty cell: sample name equal to empty_cell
+    - direct beam: sample name containing empty_beam
+    """
+    excel_path = Path(excel_path)
+    data_dir = Path(data_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    def _sheet_rows(path: Path) -> list[dict[str, str]]:
+        ns = {"a": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+        with ZipFile(path, "r") as zf:
+            import xml.etree.ElementTree as ET
+
+            sheet = ET.fromstring(zf.read("xl/worksheets/sheet1.xml"))
+        rows = [
+            ["".join(cell.itertext()) for cell in row.findall("a:c", ns)]
+            for row in sheet.find("a:sheetData", ns).findall("a:row", ns)
+        ]
+        if not rows:
+            return []
+        header = rows[0]
+        return [
+            {header[i]: value for i, value in enumerate(row) if i < len(header)}
+            for row in rows[1:]
+            if row
+        ]
+
+    def _normalize_sample_name(name: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", name.strip().lower())
+
+    def _resolve_data_file(name: str) -> Path:
+        path = Path(name)
+        if path.exists():
+            return path.resolve()
+        resolved = (data_dir / name).resolve()
+        if resolved.exists():
+            return resolved
+        raise FileNotFoundError(f"Data file not found for Excel row: {name}")
+
+    def _count_time_from_file(path: Path) -> float:
+        with h5py.File(path, "r") as f:
+            entry_path = "/entry"
+            if entry_path not in f:
+                for candidate in ("/entry0", "/entry1"):
+                    if candidate in f:
+                        entry_path = candidate
+                        break
+                else:
+                    raise ValueError(f"No entry group found in {path}")
+
+            for dataset_path in (
+                f"{entry_path}/control/count_time",
+                f"{entry_path}/instrument/monitor0/count_time",
+                f"{entry_path}/instrument/monitor1/count_time",
+                f"{entry_path}/instrument/monitor2/count_time",
+            ):
+                if dataset_path not in f:
+                    continue
+                try:
+                    return float(f[dataset_path][()])
+                except Exception:
+                    continue
+        return float("-inf")
+
+    def _transmission_roi_from_file(path: Path) -> tuple[int, int, int, int]:
+        with h5py.File(path, "r") as f:
+            entry_path = "/entry"
+            if entry_path not in f:
+                for candidate in ("/entry0", "/entry1"):
+                    if candidate in f:
+                        entry_path = candidate
+                        break
+                else:
+                    raise ValueError(f"No entry group found in {path}")
+            dataset_path = f"{entry_path}/instrument/detector{transmission_roi_detector}/data"
+            if dataset_path not in f:
+                raise ValueError(f"Missing detector dataset for ROI estimation: {dataset_path}")
+            data = np.asarray(f[dataset_path][()], dtype=float)
+        if data.ndim != 2:
+            raise ValueError(f"Detector dataset must be 2D for ROI estimation: {path}")
+        ny, nx = data.shape
+        peak_y, peak_x = np.unravel_index(int(np.nanargmax(data)), data.shape)
+        peak_value = float(data[peak_y, peak_x])
+        background = float(np.nanmedian(data))
+
+        if not np.isfinite(peak_value):
+            peak_value = 0.0
+        if not np.isfinite(background):
+            background = 0.0
+
+        threshold = background + 0.1 * max(0.0, peak_value - background)
+        bright_mask = np.isfinite(data) & (data >= threshold)
+
+        if bright_mask[peak_y, peak_x]:
+            component_mask = np.zeros_like(bright_mask, dtype=bool)
+            stack = [(int(peak_y), int(peak_x))]
+            component_mask[peak_y, peak_x] = True
+            while stack:
+                y, x = stack.pop()
+                for yy in range(max(0, y - 1), min(ny, y + 2)):
+                    for xx in range(max(0, x - 1), min(nx, x + 2)):
+                        if component_mask[yy, xx] or not bright_mask[yy, xx]:
+                            continue
+                        component_mask[yy, xx] = True
+                        stack.append((yy, xx))
+            ys, xs = np.nonzero(component_mask)
+        else:
+            ys = np.array([peak_y])
+            xs = np.array([peak_x])
+
+        x0 = int(xs.min())
+        x1 = int(xs.max())
+        y0 = int(ys.min())
+        y1 = int(ys.max())
+        width = x1 - x0 + 1
+        height = y1 - y0 + 1
+        pad_x = max(int(transmission_roi_half_size), int(math.ceil(0.05 * width)))
+        pad_y = max(int(transmission_roi_half_size), int(math.ceil(0.05 * height)))
+        return (
+            max(0, x0 - pad_x),
+            min(nx - 1, x1 + pad_x),
+            max(0, y0 - pad_y),
+            min(ny - 1, y1 + pad_y),
+        )
+
+    rows = _sheet_rows(excel_path)
+    if not rows:
+        return {}
+
+    grouped_rows: dict[str, list[dict[str, str]]] = {}
+    for row in rows:
+        config_id = row.get("config_id", "").strip()
+        if not config_id:
+            continue
+        grouped_rows.setdefault(config_id, []).append(row)
+
+    outputs: dict[str, Path] = {}
+    dark_aliases = {"cd", "cadmium", "b4c"}
+
+    for config_id, config_rows in grouped_rows.items():
+        resolved_rows = []
+        for row in config_rows:
+            data_file = row.get("data_file", "").strip()
+            if not data_file:
+                continue
+            resolved_rows.append(
+                {
+                    **row,
+                    "_path": _resolve_data_file(data_file),
+                    "_sample_norm": _normalize_sample_name(row.get("sample_name", "")),
+                    "_measurement_type": row.get("measurement_type", "").strip().lower(),
+                }
+            )
+        if not resolved_rows:
+            continue
+
+        empty_beam_transmission = next(
+            (
+                row for row in resolved_rows
+                if "emptybeam" in row["_sample_norm"] and row["_measurement_type"] == "transmission"
+            ),
+            None,
+        )
+        if empty_beam_transmission is None:
+            empty_beam_transmission = next(
+                (row for row in resolved_rows if "emptybeam" in row["_sample_norm"]),
+                None,
+            )
+        if empty_beam_transmission is None:
+            raise ValueError(f"Missing empty_beam transmission file for {config_id}")
+
+        empty_beam_scattering = next(
+            (
+                row for row in resolved_rows
+                if "emptybeam" in row["_sample_norm"] and row["_measurement_type"] == "scattering"
+            ),
+            None,
+        )
+        empty_cell_transmission = next(
+            (
+                row for row in resolved_rows
+                if row["_sample_norm"] == "emptycell" and row["_measurement_type"] == "transmission"
+            ),
+            None,
+        )
+        empty_cell_scattering = next(
+            (
+                row for row in resolved_rows
+                if row["_sample_norm"] == "emptycell" and row["_measurement_type"] == "scattering"
+            ),
+            None,
+        )
+        dark_candidates = [row for row in resolved_rows if row["_sample_norm"] in dark_aliases]
+        dark = max(dark_candidates, key=lambda row: _count_time_from_file(row["_path"]), default=None)
+
+        configuration, _ = configuration_from_nexus(empty_beam_transmission["_path"])
+        configuration = replace(configuration, config_id=config_id)
+
+        output_path = output_dir / f"refs_sub_{config_id}.nxs"
+        outputs[config_id] = write_refs_sub_file(
+            output_path,
+            configuration,
+            empty_beam_transmission=empty_beam_transmission["_path"],
+            dark=None if dark is None else dark["_path"],
+            empty_beam_scattering=None if empty_beam_scattering is None else empty_beam_scattering["_path"],
+            empty_cell_transmission=None if empty_cell_transmission is None else empty_cell_transmission["_path"],
+            empty_cell_scattering=None if empty_cell_scattering is None else empty_cell_scattering["_path"],
+            transmission_roi_detector=transmission_roi_detector,
+            transmission_roi=_transmission_roi_from_file(empty_beam_transmission["_path"]),
+            overwrite=overwrite,
+        )
+
+    return outputs
