@@ -20,6 +20,8 @@ from scarlet.workflow.configuration import (
     Configuration,
     compare_configurations,
     configuration_from_nexus,
+    write_refs_norm_file,
+    write_refs_norm_files_from_excel,
     write_refs_sub_files_from_excel,
     write_refs_sub_file,
 )
@@ -272,6 +274,77 @@ def _write_minimal_raw_nexus_file(
 
 
 class TestConfigurationFromNexus(unittest.TestCase):
+    def test_write_refs_norm_file_matches_schema(self) -> None:
+        schema = load_schema("scarlet_refs_norm_v1.0.yaml")
+
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "refs_norm.nxs"
+            wtr = Path(td) / "water_transmission.nxs"
+            wsc = Path(td) / "water_scattering.nxs"
+            dark = Path(td) / "dark.nxs"
+            ebt = Path(td) / "empty_beam_transmission.nxs"
+            _write_reference_source_file(wtr, title="water-transmission")
+            _write_reference_source_file(wsc, title="water-scattering")
+            _write_reference_source_file(dark, title="dark")
+            _write_reference_source_file(ebt, title="ebt")
+
+            configuration = Configuration(
+                wavelength=6.0,
+                sample_detector_distance=4.2,
+                config_id="cfg-1",
+                notes="baseline",
+                collimation=Collimation(
+                    aperture1=Aperture(type="slit", x_gap=0.002, y_gap=0.003),
+                    aperture2=Aperture(type="pinhole", diameter=0.004),
+                    collimation_distance=1.5,
+                    last_aperture_to_sample_distance=0.5,
+                ),
+            )
+
+            write_refs_norm_file(
+                out,
+                configuration,
+                water_scattering=wsc,
+                water_transmission=wtr,
+                water_scattering_source_config_id="cfg-long",
+                water_transmission_source_config_id="cfg-long",
+                dark=dark,
+                empty_beam_transmission=ebt,
+                transmission_roi_detector=0,
+                transmission_roi=(1, 10, 2, 11),
+                transmission_roi_method="sum",
+                transmission_roi_notes="centered on direct beam",
+                masks={0: np.array([[0, 1], [1, 0]], dtype=np.uint8)},
+                beamstop_masks={0: np.array([[1, 0], [0, 1]], dtype=np.uint8)},
+                attenuation_factor=3.0,
+                created_utc="2026-03-30T00:00:00Z",
+                scarlet_version="test",
+            )
+
+            report = validate_nexus_file(out, schema)
+            self.assertTrue(report.ok, report.format_lines())
+
+            cfg, issues = configuration_from_nexus(out)
+            self.assertEqual(issues, [])
+            self.assertEqual(cfg, configuration)
+
+            with h5py.File(out, "r") as f:
+                self.assertEqual(f["/entry/references/water_transmission/entry/title"][()].decode(), "water-transmission")
+                self.assertEqual(f["/entry/references/water_scattering/source_config_id"][()].decode(), "cfg-long")
+                self.assertEqual(f["/entry/references/water_transmission/source_config_id"][()].decode(), "cfg-long")
+                self.assertEqual(
+                    f["/entry/meta/water_scattering_source_file"][()].decode(),
+                    str(wsc.resolve()),
+                )
+                self.assertEqual(
+                    f["/entry/meta/water_transmission_source_file"][()].decode(),
+                    str(wtr.resolve()),
+                )
+                np.testing.assert_array_equal(
+                    f["/entry/mask/beamstop_mask_detector0"][()],
+                    np.array([[1, 0], [0, 1]], dtype=np.uint8),
+                )
+
     def test_write_refs_sub_file_matches_schema(self) -> None:
         schema = load_schema("scarlet_refs_sub_v1.0.yaml")
 
@@ -448,6 +521,82 @@ class TestConfigurationFromNexus(unittest.TestCase):
                     f["/entry/meta/dark_source_file"][()].decode(),
                     str((data_dir / "dark_long.nxs").resolve()),
                 )
+
+    def test_write_refs_norm_files_from_excel_borrows_water_references_across_configs(self) -> None:
+        schema = load_schema("scarlet_refs_norm_v1.0.yaml")
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            data_dir = root / "data"
+            out_dir = root / "refs_norm"
+            data_dir.mkdir()
+
+            files = {
+                "empty_beam_tr_cfg1.nxs": ("empty_beam_open", 10.0),
+                "water_tr_cfg1.nxs": ("water", 12.0),
+                "water_sc_cfg1.nxs": ("water", 20.0),
+                "dark_cfg1.nxs": ("B4C", 8.0),
+                "empty_beam_tr_cfg2.nxs": ("empty_beam_open", 11.0),
+                "sample_cfg2.nxs": ("sample_b", 5.0),
+            }
+            for filename, (sample_name, count_time_s) in files.items():
+                _write_minimal_raw_nexus_file(
+                    data_dir / filename,
+                    sample_name=sample_name,
+                    count_time_s=count_time_s,
+                )
+
+            excel_path = root / "runs.xlsx"
+            _write_simple_excel(
+                excel_path,
+                [
+                    ("data_file", "config_id", "configuration", "sample_name", "measurement_type", "measurement_confidence"),
+                    ("empty_beam_tr_cfg1.nxs", "config_1", "", "empty_beam_open", "transmission", "1"),
+                    ("water_tr_cfg1.nxs", "config_1", "", "water", "transmission", "1"),
+                    ("water_sc_cfg1.nxs", "config_1", "", "water", "scattering", "1"),
+                    ("dark_cfg1.nxs", "config_1", "", "B4C", "scattering", "1"),
+                    ("empty_beam_tr_cfg2.nxs", "config_2", "", "empty_beam_open", "transmission", "1"),
+                    ("sample_cfg2.nxs", "config_2", "", "sample_b", "scattering", "1"),
+                ],
+            )
+
+            outputs = write_refs_norm_files_from_excel(excel_path, data_dir, out_dir, overwrite=True)
+            self.assertEqual(set(outputs), {"config_1", "config_2"})
+
+            out1 = outputs["config_1"]
+            out2 = outputs["config_2"]
+            self.assertEqual(out1.name, "refs_norm_config_1.nxs")
+            self.assertEqual(out2.name, "refs_norm_config_2.nxs")
+
+            report1 = validate_nexus_file(out1, schema)
+            self.assertTrue(report1.ok, report1.format_lines())
+            report2 = validate_nexus_file(out2, schema)
+            self.assertTrue(report2.ok, report2.format_lines())
+
+            with h5py.File(out1, "r") as f:
+                self.assertIn("/entry/references/water_scattering/entry", f)
+                self.assertIn("/entry/references/water_transmission/entry", f)
+                self.assertNotIn("/entry/references/water_scattering/source_config_id", f)
+                self.assertNotIn("/entry/references/water_transmission/source_config_id", f)
+
+            with h5py.File(out2, "r") as f:
+                self.assertEqual(
+                    f["/entry/references/water_scattering/source_config_id"][()].decode(),
+                    "config_1",
+                )
+                self.assertEqual(
+                    f["/entry/references/water_transmission/source_config_id"][()].decode(),
+                    "config_1",
+                )
+                self.assertEqual(
+                    f["/entry/meta/water_scattering_source_file"][()].decode(),
+                    str((data_dir / "water_sc_cfg1.nxs").resolve()),
+                )
+                self.assertEqual(
+                    f["/entry/meta/water_transmission_source_file"][()].decode(),
+                    str((data_dir / "water_tr_cfg1.nxs").resolve()),
+                )
+                self.assertEqual(f["/entry/transmission_roi/notes"][()].decode(), "estimated from empty_beam transmission image")
 
     def test_refs_sub_style_round_trip_with_collimation(self) -> None:
         with tempfile.TemporaryDirectory() as td:

@@ -85,6 +85,207 @@ class Configuration:
     notes: Optional[str] = None
 
 
+def _write_dataset(parent: h5py.Group, name: str, value) -> None:
+    if isinstance(value, str):
+        parent.create_dataset(name, data=np.bytes_(value))
+    else:
+        parent.create_dataset(name, data=value)
+
+
+def _require_number(name: str, value: Optional[float]) -> float:
+    if value is None:
+        raise ValueError(f"{name} is required")
+    out = float(value)
+    if math.isnan(out):
+        raise ValueError(f"{name} must not be NaN")
+    return out
+
+
+def _scalar_distance(value: Union[float, List[float]], *, output_kind: str) -> float:
+    if isinstance(value, list):
+        if len(value) != 1:
+            raise ValueError(f"sample_detector_distance must be a scalar for {output_kind} output")
+        value = value[0]
+    return _require_number("sample_detector_distance", float(value))
+
+
+def _write_aperture(parent: h5py.Group, name: str, aperture: "Aperture") -> None:
+    ap = parent.create_group(name)
+    if aperture.type == "slit":
+        ap.attrs["NX_class"] = np.bytes_("NXslit")
+        _write_dataset(ap, "x_gap", _require_number(f"{name}.x_gap", aperture.x_gap))
+        _write_dataset(ap, "y_gap", _require_number(f"{name}.y_gap", aperture.y_gap))
+        return
+    if aperture.type == "pinhole":
+        ap.attrs["NX_class"] = np.bytes_("NXpinhole")
+        _write_dataset(ap, "diameter", _require_number(f"{name}.diameter", aperture.diameter))
+        return
+    raise ValueError(f"Unsupported aperture type: {aperture.type!r}")
+
+
+def _select_entry(source: h5py.File) -> h5py.Group:
+    for path in ("/entry", "/entry0", "/entry1"):
+        if path in source and isinstance(source[path], h5py.Group):
+            return source[path]
+    raise ValueError("Reference file must contain /entry, /entry0, or /entry1")
+
+
+def _copy_reference(parent: h5py.Group, name: str, source_path: Union[str, Path]) -> Path:
+    def _rewrite_internal_soft_links(
+        copied_group: h5py.Group,
+        *,
+        copied_entry_path: str,
+        source_entry_path: str,
+    ) -> None:
+        for key in list(copied_group.keys()):
+            child_path = f"{copied_group.name}/{key}"
+            link = copied_group.file.get(child_path, getlink=True)
+            if isinstance(link, h5py.SoftLink) and isinstance(link.path, str):
+                if link.path == source_entry_path or link.path.startswith(f"{source_entry_path}/"):
+                    suffix = link.path[len(source_entry_path) :]
+                    del copied_group[key]
+                    copied_group[key] = h5py.SoftLink(f"{copied_entry_path}{suffix}")
+                    continue
+
+            child = copied_group[key]
+            if isinstance(child, h5py.Group):
+                _rewrite_internal_soft_links(
+                    child,
+                    copied_entry_path=copied_entry_path,
+                    source_entry_path=source_entry_path,
+                )
+
+    source_path = Path(source_path).resolve()
+    ref_group = parent.create_group(name)
+    with h5py.File(source_path, "r") as source_file:
+        entry_group = _select_entry(source_file)
+        source_file.copy(entry_group, ref_group, name="entry")
+        _rewrite_internal_soft_links(
+            ref_group["entry"],
+            copied_entry_path=ref_group["entry"].name,
+            source_entry_path=entry_group.name,
+        )
+    return source_path
+
+
+def _file_created_utc(path: Path) -> str:
+    stat = path.stat()
+    timestamp = getattr(stat, "st_birthtime", stat.st_ctime)
+    return datetime.fromtimestamp(timestamp, timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _write_configuration_group(entry: h5py.Group, configuration: "Configuration", *, output_kind: str) -> None:
+    if configuration.config_id is None:
+        raise ValueError(f"configuration.config_id is required for {output_kind} output")
+    if configuration.collimation is None:
+        raise ValueError(f"configuration.collimation is required for {output_kind} output")
+
+    _write_dataset(entry, "config_id", configuration.config_id)
+
+    cfg = entry.create_group("configuration")
+    cfg.attrs["NX_class"] = np.bytes_("NXcollection")
+    _write_dataset(cfg, "wavelength", _require_number("wavelength", configuration.wavelength))
+    _write_dataset(
+        cfg,
+        "sample_detector_distance",
+        _scalar_distance(configuration.sample_detector_distance, output_kind=output_kind),
+    )
+    if configuration.notes is not None:
+        _write_dataset(cfg, "notes", configuration.notes)
+
+    col = cfg.create_group("collimation")
+    col.attrs["NX_class"] = np.bytes_("NXcollection")
+    _write_dataset(
+        col,
+        "collimation_distance",
+        _require_number("collimation_distance", configuration.collimation.collimation_distance),
+    )
+    _write_dataset(
+        col,
+        "last_aperture_to_sample_distance",
+        _require_number(
+            "last_aperture_to_sample_distance",
+            configuration.collimation.last_aperture_to_sample_distance,
+        ),
+    )
+    _write_aperture(col, "aperture1", configuration.collimation.aperture1)
+    _write_aperture(col, "aperture2", configuration.collimation.aperture2)
+
+
+def _write_mask_group(
+    entry: h5py.Group,
+    *,
+    masks: Optional[Mapping[int, np.ndarray]] = None,
+    beamstop_masks: Optional[Mapping[int, np.ndarray]] = None,
+) -> None:
+    mask_items = sorted((masks or {}).items())
+    beamstop_items = sorted((beamstop_masks or {}).items())
+    if not mask_items and not beamstop_items:
+        return
+
+    mask_group = entry.create_group("mask")
+    mask_group.attrs["NX_class"] = np.bytes_("NXcollection")
+    for detector, mask in mask_items:
+        _write_dataset(mask_group, f"mask_detector{int(detector)}", np.asarray(mask))
+    for detector, mask in beamstop_items:
+        _write_dataset(mask_group, f"beamstop_mask_detector{int(detector)}", np.asarray(mask))
+
+
+def _write_transmission_roi_group(
+    entry: h5py.Group,
+    *,
+    transmission_roi_detector: Union[int, str],
+    transmission_roi: tuple[int, int, int, int],
+    transmission_roi_method: Optional[str] = None,
+    transmission_roi_notes: Optional[str] = None,
+) -> None:
+    x0, x1, y0, y1 = transmission_roi
+    transmission_roi_group = entry.create_group("transmission_roi")
+    transmission_roi_group.attrs["NX_class"] = np.bytes_("NXcollection")
+    _write_dataset(transmission_roi_group, "detector", transmission_roi_detector)
+    _write_dataset(transmission_roi_group, "roi_type", "rectangle")
+    _write_dataset(transmission_roi_group, "x0", int(x0))
+    _write_dataset(transmission_roi_group, "x1", int(x1))
+    _write_dataset(transmission_roi_group, "y0", int(y0))
+    _write_dataset(transmission_roi_group, "y1", int(y1))
+    if transmission_roi_method is not None:
+        _write_dataset(transmission_roi_group, "method", transmission_roi_method)
+    if transmission_roi_notes is not None:
+        _write_dataset(transmission_roi_group, "notes", transmission_roi_notes)
+
+
+def _write_transmission_setup_group(entry: h5py.Group, *, attenuation_factor: Optional[float]) -> None:
+    if attenuation_factor is None:
+        return
+    transmission_setup = entry.create_group("transmission_setup")
+    transmission_setup.attrs["NX_class"] = np.bytes_("NXcollection")
+    attenuator = transmission_setup.create_group("attenuator")
+    attenuator.attrs["NX_class"] = np.bytes_("NXattenuator")
+    _write_dataset(
+        attenuator,
+        "attenuation_factor",
+        _require_number("attenuation_factor", attenuation_factor),
+    )
+
+
+def _write_meta_group(
+    entry: h5py.Group,
+    *,
+    source_paths: Mapping[str, Path],
+    created_utc: str,
+    mask_convention: str,
+    scarlet_version: Optional[str] = None,
+) -> None:
+    meta = entry.create_group("meta")
+    meta.attrs["NX_class"] = np.bytes_("NXcollection")
+    _write_dataset(meta, "created_utc", created_utc)
+    _write_dataset(meta, "mask_convention", mask_convention)
+    for name, source_path in source_paths.items():
+        _write_dataset(meta, f"{name}_source_file", str(source_path))
+    if scarlet_version is not None:
+        _write_dataset(meta, "scarlet_version", scarlet_version)
+
+
 def write_refs_sub_file(
     file_path: Union[str, Path],
     configuration: "Configuration",
@@ -111,99 +312,10 @@ def write_refs_sub_file(
     ``/entry/references/<name>/entry``.
     """
     file_path = Path(file_path)
-    x0, x1, y0, y1 = transmission_roi
-
-    def _write_dataset(parent: h5py.Group, name: str, value) -> None:
-        if isinstance(value, str):
-            parent.create_dataset(name, data=np.bytes_(value))
-        else:
-            parent.create_dataset(name, data=value)
-
-    def _require_number(name: str, value: Optional[float]) -> float:
-        if value is None:
-            raise ValueError(f"{name} is required")
-        out = float(value)
-        if math.isnan(out):
-            raise ValueError(f"{name} must not be NaN")
-        return out
-
-    def _scalar_distance(value: Union[float, List[float]]) -> float:
-        if isinstance(value, list):
-            if len(value) != 1:
-                raise ValueError("sample_detector_distance must be a scalar for refs_sub output")
-            value = value[0]
-        return _require_number("sample_detector_distance", float(value))
-
-    def _write_aperture(parent: h5py.Group, name: str, aperture: "Aperture") -> None:
-        ap = parent.create_group(name)
-        if aperture.type == "slit":
-            ap.attrs["NX_class"] = np.bytes_("NXslit")
-            _write_dataset(ap, "x_gap", _require_number(f"{name}.x_gap", aperture.x_gap))
-            _write_dataset(ap, "y_gap", _require_number(f"{name}.y_gap", aperture.y_gap))
-            return
-        if aperture.type == "pinhole":
-            ap.attrs["NX_class"] = np.bytes_("NXpinhole")
-            _write_dataset(ap, "diameter", _require_number(f"{name}.diameter", aperture.diameter))
-            return
-        raise ValueError(f"Unsupported aperture type: {aperture.type!r}")
-
-    def _select_entry(source: h5py.File) -> h5py.Group:
-        for path in ("/entry", "/entry0", "/entry1"):
-            if path in source and isinstance(source[path], h5py.Group):
-                return source[path]
-        raise ValueError("Reference file must contain /entry, /entry0, or /entry1")
-
-    def _copy_reference(parent: h5py.Group, name: str, source_path: Union[str, Path]) -> Path:
-        def _rewrite_internal_soft_links(
-            copied_group: h5py.Group,
-            *,
-            copied_entry_path: str,
-            source_entry_path: str,
-        ) -> None:
-            for key in list(copied_group.keys()):
-                child_path = f"{copied_group.name}/{key}"
-                link = copied_group.file.get(child_path, getlink=True)
-                if isinstance(link, h5py.SoftLink) and isinstance(link.path, str):
-                    if link.path == source_entry_path or link.path.startswith(f"{source_entry_path}/"):
-                        suffix = link.path[len(source_entry_path) :]
-                        del copied_group[key]
-                        copied_group[key] = h5py.SoftLink(f"{copied_entry_path}{suffix}")
-                        continue
-
-                child = copied_group[key]
-                if isinstance(child, h5py.Group):
-                    _rewrite_internal_soft_links(
-                        child,
-                        copied_entry_path=copied_entry_path,
-                        source_entry_path=source_entry_path,
-                    )
-
-        source_path = Path(source_path).resolve()
-        ref_group = parent.create_group(name)
-        with h5py.File(source_path, "r") as source_file:
-            entry_group = _select_entry(source_file)
-            source_file.copy(entry_group, ref_group, name="entry")
-            _rewrite_internal_soft_links(
-                ref_group["entry"],
-                copied_entry_path=ref_group["entry"].name,
-                source_entry_path=entry_group.name,
-            )
-        return source_path
-
-    def _file_created_utc(path: Path) -> str:
-        stat = path.stat()
-        timestamp = getattr(stat, "st_birthtime", stat.st_ctime)
-        return datetime.fromtimestamp(timestamp, timezone.utc).isoformat().replace("+00:00", "Z")
-
     if file_path.exists():
         if not overwrite:
             raise FileExistsError(f"Output file exists: {file_path}")
         file_path.unlink()
-
-    if configuration.config_id is None:
-        raise ValueError("configuration.config_id is required for refs_sub output")
-    if configuration.collimation is None:
-        raise ValueError("configuration.collimation is required for refs_sub output")
 
     references = {
         "dark": dark,
@@ -212,7 +324,6 @@ def write_refs_sub_file(
         "empty_cell_transmission": empty_cell_transmission,
         "empty_cell_scattering": empty_cell_scattering,
     }
-    masks = masks or {}
 
     with h5py.File(file_path, "w") as f:
         if created_utc is None:
@@ -222,32 +333,7 @@ def write_refs_sub_file(
         entry.attrs["NX_class"] = np.bytes_("NXentry")
         _write_dataset(entry, "definition", "SCARLET_refs_sub")
         _write_dataset(entry, "schema_version", "1.0")
-        _write_dataset(entry, "config_id", configuration.config_id)
-
-        cfg = entry.create_group("configuration")
-        cfg.attrs["NX_class"] = np.bytes_("NXcollection")
-        _write_dataset(cfg, "wavelength", _require_number("wavelength", configuration.wavelength))
-        _write_dataset(cfg, "sample_detector_distance", _scalar_distance(configuration.sample_detector_distance))
-        if configuration.notes is not None:
-            _write_dataset(cfg, "notes", configuration.notes)
-
-        col = cfg.create_group("collimation")
-        col.attrs["NX_class"] = np.bytes_("NXcollection")
-        _write_dataset(
-            col,
-            "collimation_distance",
-            _require_number("collimation_distance", configuration.collimation.collimation_distance),
-        )
-        _write_dataset(
-            col,
-            "last_aperture_to_sample_distance",
-            _require_number(
-                "last_aperture_to_sample_distance",
-                configuration.collimation.last_aperture_to_sample_distance,
-            ),
-        )
-        _write_aperture(col, "aperture1", configuration.collimation.aperture1)
-        _write_aperture(col, "aperture2", configuration.collimation.aperture2)
+        _write_configuration_group(entry, configuration, output_kind="refs_sub")
 
         refs = entry.create_group("references")
         refs.attrs["NX_class"] = np.bytes_("NXcollection")
@@ -257,42 +343,111 @@ def write_refs_sub_file(
                 continue
             source_paths[name] = _copy_reference(refs, name, source_path)
 
-        if masks:
-            mask_group = entry.create_group("mask")
-            mask_group.attrs["NX_class"] = np.bytes_("NXcollection")
-            for detector, mask in sorted(masks.items()):
-                _write_dataset(mask_group, f"mask_detector{int(detector)}", np.asarray(mask))
+        _write_mask_group(entry, masks=masks)
+        _write_transmission_roi_group(
+            entry,
+            transmission_roi_detector=transmission_roi_detector,
+            transmission_roi=transmission_roi,
+            transmission_roi_notes=transmission_roi_notes,
+        )
+        _write_transmission_setup_group(entry, attenuation_factor=attenuation_factor)
+        _write_meta_group(
+            entry,
+            source_paths=source_paths,
+            created_utc=created_utc,
+            mask_convention=mask_convention,
+            scarlet_version=scarlet_version,
+        )
 
-        transmission_roi = entry.create_group("transmission_roi")
-        transmission_roi.attrs["NX_class"] = np.bytes_("NXcollection")
-        _write_dataset(transmission_roi, "detector", transmission_roi_detector)
-        _write_dataset(transmission_roi, "roi_type", "rectangle")
-        _write_dataset(transmission_roi, "x0", int(x0))
-        _write_dataset(transmission_roi, "x1", int(x1))
-        _write_dataset(transmission_roi, "y0", int(y0))
-        _write_dataset(transmission_roi, "y1", int(y1))
-        if transmission_roi_notes is not None:
-            _write_dataset(transmission_roi, "notes", transmission_roi_notes)
+    return file_path
 
-        if attenuation_factor is not None:
-            transmission_setup = entry.create_group("transmission_setup")
-            transmission_setup.attrs["NX_class"] = np.bytes_("NXcollection")
-            attenuator = transmission_setup.create_group("attenuator")
-            attenuator.attrs["NX_class"] = np.bytes_("NXattenuator")
-            _write_dataset(
-                attenuator,
-                "attenuation_factor",
-                _require_number("attenuation_factor", attenuation_factor),
-            )
 
-        meta = entry.create_group("meta")
-        meta.attrs["NX_class"] = np.bytes_("NXcollection")
-        _write_dataset(meta, "created_utc", created_utc)
-        _write_dataset(meta, "mask_convention", mask_convention)
-        for name, source_path in source_paths.items():
-            _write_dataset(meta, f"{name}_source_file", str(source_path))
-        if scarlet_version is not None:
-            _write_dataset(meta, "scarlet_version", scarlet_version)
+def write_refs_norm_file(
+    file_path: Union[str, Path],
+    configuration: "Configuration",
+    *,
+    water_scattering: Union[str, Path],
+    water_transmission: Union[str, Path],
+    dark: Optional[Union[str, Path]] = None,
+    empty_beam_transmission: Optional[Union[str, Path]] = None,
+    empty_beam_scattering: Optional[Union[str, Path]] = None,
+    empty_cell_transmission: Optional[Union[str, Path]] = None,
+    empty_cell_scattering: Optional[Union[str, Path]] = None,
+    water_scattering_source_config_id: Optional[str] = None,
+    water_transmission_source_config_id: Optional[str] = None,
+    transmission_roi_detector: Union[int, str] = 0,
+    transmission_roi: tuple[int, int, int, int],
+    transmission_roi_method: Optional[str] = None,
+    transmission_roi_notes: Optional[str] = None,
+    masks: Optional[Mapping[int, np.ndarray]] = None,
+    beamstop_masks: Optional[Mapping[int, np.ndarray]] = None,
+    attenuation_factor: Optional[float] = None,
+    created_utc: Optional[str] = None,
+    mask_convention: str = "1=masked, 0=valid",
+    scarlet_version: Optional[str] = None,
+    overwrite: bool = False,
+) -> Path:
+    """
+    Write a SCARLET_refs_norm file matching the packaged YAML schema.
+
+    Reference source files are passed as keyword arguments and copied into
+    ``/entry/references/<name>/entry``.
+    """
+    file_path = Path(file_path)
+    if file_path.exists():
+        if not overwrite:
+            raise FileExistsError(f"Output file exists: {file_path}")
+        file_path.unlink()
+
+    references = {
+        "dark": dark,
+        "empty_beam_transmission": empty_beam_transmission,
+        "empty_beam_scattering": empty_beam_scattering,
+        "empty_cell_transmission": empty_cell_transmission,
+        "empty_cell_scattering": empty_cell_scattering,
+        "water_scattering": water_scattering,
+        "water_transmission": water_transmission,
+    }
+
+    with h5py.File(file_path, "w") as f:
+        if created_utc is None:
+            created_utc = _file_created_utc(file_path)
+
+        entry = f.create_group("entry")
+        entry.attrs["NX_class"] = np.bytes_("NXentry")
+        _write_dataset(entry, "definition", "SCARLET_refs_norm")
+        _write_dataset(entry, "schema_version", "1.0")
+        _write_configuration_group(entry, configuration, output_kind="refs_norm")
+
+        refs = entry.create_group("references")
+        refs.attrs["NX_class"] = np.bytes_("NXcollection")
+        source_paths: dict[str, Path] = {}
+        for name, source_path in references.items():
+            if source_path is None:
+                continue
+            source_paths[name] = _copy_reference(refs, name, source_path)
+
+        if water_scattering_source_config_id is not None:
+            _write_dataset(refs["water_scattering"], "source_config_id", water_scattering_source_config_id)
+        if water_transmission_source_config_id is not None:
+            _write_dataset(refs["water_transmission"], "source_config_id", water_transmission_source_config_id)
+
+        _write_mask_group(entry, masks=masks, beamstop_masks=beamstop_masks)
+        _write_transmission_roi_group(
+            entry,
+            transmission_roi_detector=transmission_roi_detector,
+            transmission_roi=transmission_roi,
+            transmission_roi_method=transmission_roi_method,
+            transmission_roi_notes=transmission_roi_notes,
+        )
+        _write_transmission_setup_group(entry, attenuation_factor=attenuation_factor)
+        _write_meta_group(
+            entry,
+            source_paths=source_paths,
+            created_utc=created_utc,
+            mask_convention=mask_convention,
+            scarlet_version=scarlet_version,
+        )
 
     return file_path
 
@@ -812,6 +967,179 @@ def write_run_configuration_excel(
     return file_path
 
 
+def _sheet_rows_from_excel(path: Path) -> list[dict[str, str]]:
+    ns = {"a": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    with ZipFile(path, "r") as zf:
+        import xml.etree.ElementTree as ET
+
+        sheet = ET.fromstring(zf.read("xl/worksheets/sheet1.xml"))
+    rows = [
+        ["".join(cell.itertext()) for cell in row.findall("a:c", ns)]
+        for row in sheet.find("a:sheetData", ns).findall("a:row", ns)
+    ]
+    if not rows:
+        return []
+    header = rows[0]
+    return [
+        {header[i]: value for i, value in enumerate(row) if i < len(header)}
+        for row in rows[1:]
+        if row
+    ]
+
+
+def _normalize_sample_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", name.strip().lower())
+
+
+def _resolve_data_file(name: str, *, data_dir: Path) -> Path:
+    path = Path(name)
+    if path.exists():
+        return path.resolve()
+    resolved = (data_dir / name).resolve()
+    if resolved.exists():
+        return resolved
+    raise FileNotFoundError(f"Data file not found for Excel row: {name}")
+
+
+def _entry_path_from_file(f: h5py.File, path: Path) -> str:
+    entry_path = "/entry"
+    if entry_path in f:
+        return entry_path
+    for candidate in ("/entry0", "/entry1"):
+        if candidate in f:
+            return candidate
+    raise ValueError(f"No entry group found in {path}")
+
+
+def _count_time_from_file(path: Path) -> float:
+    with h5py.File(path, "r") as f:
+        entry_path = _entry_path_from_file(f, path)
+
+        for dataset_path in (
+            f"{entry_path}/control/count_time",
+            f"{entry_path}/instrument/monitor0/count_time",
+            f"{entry_path}/instrument/monitor1/count_time",
+            f"{entry_path}/instrument/monitor2/count_time",
+        ):
+            if dataset_path not in f:
+                continue
+            try:
+                return float(f[dataset_path][()])
+            except Exception:
+                continue
+    return float("-inf")
+
+
+def _transmission_roi_from_file(
+    path: Path,
+    *,
+    transmission_roi_detector: int,
+    transmission_roi_half_size: int,
+) -> tuple[int, int, int, int]:
+    with h5py.File(path, "r") as f:
+        entry_path = _entry_path_from_file(f, path)
+        dataset_path = f"{entry_path}/instrument/detector{transmission_roi_detector}/data"
+        if dataset_path not in f:
+            raise ValueError(f"Missing detector dataset for ROI estimation: {dataset_path}")
+        data = np.asarray(f[dataset_path][()], dtype=float)
+    if data.ndim != 2:
+        raise ValueError(f"Detector dataset must be 2D for ROI estimation: {path}")
+    ny, nx = data.shape
+    peak_y, peak_x = np.unravel_index(int(np.nanargmax(data)), data.shape)
+    peak_value = float(data[peak_y, peak_x])
+    background = float(np.nanmedian(data))
+
+    if not np.isfinite(peak_value):
+        peak_value = 0.0
+    if not np.isfinite(background):
+        background = 0.0
+
+    threshold = background + 0.1 * max(0.0, peak_value - background)
+    bright_mask = np.isfinite(data) & (data >= threshold)
+
+    if bright_mask[peak_y, peak_x]:
+        component_mask = np.zeros_like(bright_mask, dtype=bool)
+        stack = [(int(peak_y), int(peak_x))]
+        component_mask[peak_y, peak_x] = True
+        while stack:
+            y, x = stack.pop()
+            for yy in range(max(0, y - 1), min(ny, y + 2)):
+                for xx in range(max(0, x - 1), min(nx, x + 2)):
+                    if component_mask[yy, xx] or not bright_mask[yy, xx]:
+                        continue
+                    component_mask[yy, xx] = True
+                    stack.append((yy, xx))
+        ys, xs = np.nonzero(component_mask)
+    else:
+        ys = np.array([peak_y])
+        xs = np.array([peak_x])
+
+    x0 = int(xs.min())
+    x1 = int(xs.max())
+    y0 = int(ys.min())
+    y1 = int(ys.max())
+    width = x1 - x0 + 1
+    height = y1 - y0 + 1
+    pad_x = max(int(transmission_roi_half_size), int(math.ceil(0.05 * width)))
+    pad_y = max(int(transmission_roi_half_size), int(math.ceil(0.05 * height)))
+    return (
+        max(0, x0 - pad_x),
+        min(nx - 1, x1 + pad_x),
+        max(0, y0 - pad_y),
+        min(ny - 1, y1 + pad_y),
+    )
+
+
+def _group_excel_rows_by_config(rows: list[dict[str, str]]) -> dict[str, list[dict[str, str]]]:
+    grouped_rows: dict[str, list[dict[str, str]]] = {}
+    for row in rows:
+        config_id = row.get("config_id", "").strip()
+        if not config_id:
+            continue
+        grouped_rows.setdefault(config_id, []).append(row)
+    return grouped_rows
+
+
+def _resolve_excel_rows(
+    rows: list[dict[str, str]],
+    *,
+    data_dir: Path,
+) -> list[dict[str, object]]:
+    resolved_rows: list[dict[str, object]] = []
+    for row in rows:
+        data_file = row.get("data_file", "").strip()
+        if not data_file:
+            continue
+        resolved_rows.append(
+            {
+                **row,
+                "_path": _resolve_data_file(data_file, data_dir=data_dir),
+                "_sample_norm": _normalize_sample_name(row.get("sample_name", "")),
+                "_measurement_type": row.get("measurement_type", "").strip().lower(),
+            }
+        )
+    return resolved_rows
+
+
+def _select_best_row(
+    rows: list[dict[str, object]],
+    *,
+    predicate,
+    measurement_type: Optional[str] = None,
+) -> Optional[dict[str, object]]:
+    candidates = [
+        row
+        for row in rows
+        if predicate(row)
+        and (measurement_type is None or row["_measurement_type"] == measurement_type)
+    ]
+    return max(candidates, key=lambda row: _count_time_from_file(row["_path"]), default=None)
+
+
+def _is_water_sample(sample_norm: str) -> bool:
+    return sample_norm in {"h2o", "d2o"} or "water" in sample_norm
+
+
 def write_refs_sub_files_from_excel(
     excel_path: Union[str, Path],
     data_dir: Union[str, Path],
@@ -837,189 +1165,47 @@ def write_refs_sub_files_from_excel(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    def _sheet_rows(path: Path) -> list[dict[str, str]]:
-        ns = {"a": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
-        with ZipFile(path, "r") as zf:
-            import xml.etree.ElementTree as ET
-
-            sheet = ET.fromstring(zf.read("xl/worksheets/sheet1.xml"))
-        rows = [
-            ["".join(cell.itertext()) for cell in row.findall("a:c", ns)]
-            for row in sheet.find("a:sheetData", ns).findall("a:row", ns)
-        ]
-        if not rows:
-            return []
-        header = rows[0]
-        return [
-            {header[i]: value for i, value in enumerate(row) if i < len(header)}
-            for row in rows[1:]
-            if row
-        ]
-
-    def _normalize_sample_name(name: str) -> str:
-        return re.sub(r"[^a-z0-9]+", "", name.strip().lower())
-
-    def _resolve_data_file(name: str) -> Path:
-        path = Path(name)
-        if path.exists():
-            return path.resolve()
-        resolved = (data_dir / name).resolve()
-        if resolved.exists():
-            return resolved
-        raise FileNotFoundError(f"Data file not found for Excel row: {name}")
-
-    def _count_time_from_file(path: Path) -> float:
-        with h5py.File(path, "r") as f:
-            entry_path = "/entry"
-            if entry_path not in f:
-                for candidate in ("/entry0", "/entry1"):
-                    if candidate in f:
-                        entry_path = candidate
-                        break
-                else:
-                    raise ValueError(f"No entry group found in {path}")
-
-            for dataset_path in (
-                f"{entry_path}/control/count_time",
-                f"{entry_path}/instrument/monitor0/count_time",
-                f"{entry_path}/instrument/monitor1/count_time",
-                f"{entry_path}/instrument/monitor2/count_time",
-            ):
-                if dataset_path not in f:
-                    continue
-                try:
-                    return float(f[dataset_path][()])
-                except Exception:
-                    continue
-        return float("-inf")
-
-    def _transmission_roi_from_file(path: Path) -> tuple[int, int, int, int]:
-        with h5py.File(path, "r") as f:
-            entry_path = "/entry"
-            if entry_path not in f:
-                for candidate in ("/entry0", "/entry1"):
-                    if candidate in f:
-                        entry_path = candidate
-                        break
-                else:
-                    raise ValueError(f"No entry group found in {path}")
-            dataset_path = f"{entry_path}/instrument/detector{transmission_roi_detector}/data"
-            if dataset_path not in f:
-                raise ValueError(f"Missing detector dataset for ROI estimation: {dataset_path}")
-            data = np.asarray(f[dataset_path][()], dtype=float)
-        if data.ndim != 2:
-            raise ValueError(f"Detector dataset must be 2D for ROI estimation: {path}")
-        ny, nx = data.shape
-        peak_y, peak_x = np.unravel_index(int(np.nanargmax(data)), data.shape)
-        peak_value = float(data[peak_y, peak_x])
-        background = float(np.nanmedian(data))
-
-        if not np.isfinite(peak_value):
-            peak_value = 0.0
-        if not np.isfinite(background):
-            background = 0.0
-
-        threshold = background + 0.1 * max(0.0, peak_value - background)
-        bright_mask = np.isfinite(data) & (data >= threshold)
-
-        if bright_mask[peak_y, peak_x]:
-            component_mask = np.zeros_like(bright_mask, dtype=bool)
-            stack = [(int(peak_y), int(peak_x))]
-            component_mask[peak_y, peak_x] = True
-            while stack:
-                y, x = stack.pop()
-                for yy in range(max(0, y - 1), min(ny, y + 2)):
-                    for xx in range(max(0, x - 1), min(nx, x + 2)):
-                        if component_mask[yy, xx] or not bright_mask[yy, xx]:
-                            continue
-                        component_mask[yy, xx] = True
-                        stack.append((yy, xx))
-            ys, xs = np.nonzero(component_mask)
-        else:
-            ys = np.array([peak_y])
-            xs = np.array([peak_x])
-
-        x0 = int(xs.min())
-        x1 = int(xs.max())
-        y0 = int(ys.min())
-        y1 = int(ys.max())
-        width = x1 - x0 + 1
-        height = y1 - y0 + 1
-        pad_x = max(int(transmission_roi_half_size), int(math.ceil(0.05 * width)))
-        pad_y = max(int(transmission_roi_half_size), int(math.ceil(0.05 * height)))
-        return (
-            max(0, x0 - pad_x),
-            min(nx - 1, x1 + pad_x),
-            max(0, y0 - pad_y),
-            min(ny - 1, y1 + pad_y),
-        )
-
-    rows = _sheet_rows(excel_path)
+    rows = _sheet_rows_from_excel(excel_path)
     if not rows:
         return {}
 
-    grouped_rows: dict[str, list[dict[str, str]]] = {}
-    for row in rows:
-        config_id = row.get("config_id", "").strip()
-        if not config_id:
-            continue
-        grouped_rows.setdefault(config_id, []).append(row)
+    grouped_rows = _group_excel_rows_by_config(rows)
 
     outputs: dict[str, Path] = {}
     dark_aliases = {"cd", "cadmium", "b4c"}
 
     for config_id, config_rows in grouped_rows.items():
-        resolved_rows = []
-        for row in config_rows:
-            data_file = row.get("data_file", "").strip()
-            if not data_file:
-                continue
-            resolved_rows.append(
-                {
-                    **row,
-                    "_path": _resolve_data_file(data_file),
-                    "_sample_norm": _normalize_sample_name(row.get("sample_name", "")),
-                    "_measurement_type": row.get("measurement_type", "").strip().lower(),
-                }
-            )
+        resolved_rows = _resolve_excel_rows(config_rows, data_dir=data_dir)
         if not resolved_rows:
             continue
 
-        empty_beam_transmission = next(
-            (
-                row for row in resolved_rows
-                if "emptybeam" in row["_sample_norm"] and row["_measurement_type"] == "transmission"
-            ),
-            None,
+        empty_beam_transmission = _select_best_row(
+            resolved_rows,
+            predicate=lambda row: "emptybeam" in row["_sample_norm"],
+            measurement_type="transmission",
         )
         if empty_beam_transmission is None:
-            empty_beam_transmission = next(
-                (row for row in resolved_rows if "emptybeam" in row["_sample_norm"]),
-                None,
+            empty_beam_transmission = _select_best_row(
+                resolved_rows,
+                predicate=lambda row: "emptybeam" in row["_sample_norm"],
             )
         if empty_beam_transmission is None:
             raise ValueError(f"Missing empty_beam transmission file for {config_id}")
 
-        empty_beam_scattering = next(
-            (
-                row for row in resolved_rows
-                if "emptybeam" in row["_sample_norm"] and row["_measurement_type"] == "scattering"
-            ),
-            None,
+        empty_beam_scattering = _select_best_row(
+            resolved_rows,
+            predicate=lambda row: "emptybeam" in row["_sample_norm"],
+            measurement_type="scattering",
         )
-        empty_cell_transmission = next(
-            (
-                row for row in resolved_rows
-                if row["_sample_norm"] == "emptycell" and row["_measurement_type"] == "transmission"
-            ),
-            None,
+        empty_cell_transmission = _select_best_row(
+            resolved_rows,
+            predicate=lambda row: row["_sample_norm"] == "emptycell",
+            measurement_type="transmission",
         )
-        empty_cell_scattering = next(
-            (
-                row for row in resolved_rows
-                if row["_sample_norm"] == "emptycell" and row["_measurement_type"] == "scattering"
-            ),
-            None,
+        empty_cell_scattering = _select_best_row(
+            resolved_rows,
+            predicate=lambda row: row["_sample_norm"] == "emptycell",
+            measurement_type="scattering",
         )
         dark_candidates = [row for row in resolved_rows if row["_sample_norm"] in dark_aliases]
         dark = max(dark_candidates, key=lambda row: _count_time_from_file(row["_path"]), default=None)
@@ -1037,7 +1223,166 @@ def write_refs_sub_files_from_excel(
             empty_cell_transmission=None if empty_cell_transmission is None else empty_cell_transmission["_path"],
             empty_cell_scattering=None if empty_cell_scattering is None else empty_cell_scattering["_path"],
             transmission_roi_detector=transmission_roi_detector,
-            transmission_roi=_transmission_roi_from_file(empty_beam_transmission["_path"]),
+            transmission_roi=_transmission_roi_from_file(
+                empty_beam_transmission["_path"],
+                transmission_roi_detector=transmission_roi_detector,
+                transmission_roi_half_size=transmission_roi_half_size,
+            ),
+            transmission_roi_notes="estimated from empty_beam transmission image",
+            overwrite=overwrite,
+        )
+
+    return outputs
+
+
+def write_refs_norm_files_from_excel(
+    excel_path: Union[str, Path],
+    data_dir: Union[str, Path],
+    output_dir: Union[str, Path],
+    *,
+    transmission_roi_detector: int = 0,
+    transmission_roi_half_size: int = 1,
+    overwrite: bool = False,
+) -> dict[str, Path]:
+    """
+    Generate one SCARLET refs_norm file per configuration listed in the Excel table.
+
+    The Excel file is expected to come from ``write_run_configuration_excel``.
+    Classification rules:
+    - water references: sample name containing water, or equal to H2O/D2O.
+      Prefer same-config references; otherwise borrow from another configuration
+      and record ``source_config_id`` in the output file.
+    - dark/background: sample name equal to Cd, Cadmium, or B4C.
+      If several candidates exist for one configuration, keep the one with the
+      longest counting time found in the reference file.
+    - empty cell: sample name equal to empty_cell
+    - direct beam: sample name containing empty_beam
+    """
+    excel_path = Path(excel_path)
+    data_dir = Path(data_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    rows = _sheet_rows_from_excel(excel_path)
+    if not rows:
+        return {}
+
+    grouped_rows = _group_excel_rows_by_config(rows)
+    resolved_by_config = {
+        config_id: _resolve_excel_rows(config_rows, data_dir=data_dir)
+        for config_id, config_rows in grouped_rows.items()
+    }
+
+    outputs: dict[str, Path] = {}
+    dark_aliases = {"cd", "cadmium", "b4c"}
+
+    def _best_water_reference(
+        config_id: str,
+        *,
+        measurement_type: str,
+    ) -> tuple[dict[str, object], Optional[str]]:
+        local_rows = resolved_by_config.get(config_id, [])
+        local = _select_best_row(
+            local_rows,
+            predicate=lambda row: _is_water_sample(row["_sample_norm"]),
+            measurement_type=measurement_type,
+        )
+        if local is not None:
+            return local, None
+
+        cross_config_candidates = [
+            (source_config_id, row)
+            for source_config_id, rows_for_config in resolved_by_config.items()
+            if source_config_id != config_id
+            for row in rows_for_config
+            if _is_water_sample(row["_sample_norm"]) and row["_measurement_type"] == measurement_type
+        ]
+        if not cross_config_candidates:
+            raise ValueError(f"Missing water {measurement_type} file for {config_id}")
+        source_config_id, row = max(
+            cross_config_candidates,
+            key=lambda item: _count_time_from_file(item[1]["_path"]),
+        )
+        return row, source_config_id
+
+    for config_id, resolved_rows in resolved_by_config.items():
+        if not resolved_rows:
+            continue
+
+        empty_beam_transmission = _select_best_row(
+            resolved_rows,
+            predicate=lambda row: "emptybeam" in row["_sample_norm"],
+            measurement_type="transmission",
+        )
+        if empty_beam_transmission is None:
+            empty_beam_transmission = _select_best_row(
+                resolved_rows,
+                predicate=lambda row: "emptybeam" in row["_sample_norm"],
+            )
+        empty_beam_scattering = _select_best_row(
+            resolved_rows,
+            predicate=lambda row: "emptybeam" in row["_sample_norm"],
+            measurement_type="scattering",
+        )
+        empty_cell_transmission = _select_best_row(
+            resolved_rows,
+            predicate=lambda row: row["_sample_norm"] == "emptycell",
+            measurement_type="transmission",
+        )
+        empty_cell_scattering = _select_best_row(
+            resolved_rows,
+            predicate=lambda row: row["_sample_norm"] == "emptycell",
+            measurement_type="scattering",
+        )
+        dark_candidates = [row for row in resolved_rows if row["_sample_norm"] in dark_aliases]
+        dark = max(dark_candidates, key=lambda row: _count_time_from_file(row["_path"]), default=None)
+
+        water_scattering, water_scattering_source_config_id = _best_water_reference(
+            config_id,
+            measurement_type="scattering",
+        )
+        water_transmission, water_transmission_source_config_id = _best_water_reference(
+            config_id,
+            measurement_type="transmission",
+        )
+
+        configuration_source = (
+            empty_beam_transmission
+            or water_transmission
+            or water_scattering
+            or resolved_rows[0]
+        )
+        configuration, _ = configuration_from_nexus(configuration_source["_path"])
+        configuration = replace(configuration, config_id=config_id)
+
+        roi_source = empty_beam_transmission or water_transmission
+        if roi_source is None:
+            raise ValueError(f"Missing transmission-like source file for ROI estimation: {config_id}")
+
+        output_path = output_dir / f"refs_norm_{config_id}.nxs"
+        outputs[config_id] = write_refs_norm_file(
+            output_path,
+            configuration,
+            water_scattering=water_scattering["_path"],
+            water_transmission=water_transmission["_path"],
+            water_scattering_source_config_id=water_scattering_source_config_id,
+            water_transmission_source_config_id=water_transmission_source_config_id,
+            dark=None if dark is None else dark["_path"],
+            empty_beam_transmission=None if empty_beam_transmission is None else empty_beam_transmission["_path"],
+            empty_beam_scattering=None if empty_beam_scattering is None else empty_beam_scattering["_path"],
+            empty_cell_transmission=None if empty_cell_transmission is None else empty_cell_transmission["_path"],
+            empty_cell_scattering=None if empty_cell_scattering is None else empty_cell_scattering["_path"],
+            transmission_roi_detector=transmission_roi_detector,
+            transmission_roi=_transmission_roi_from_file(
+                roi_source["_path"],
+                transmission_roi_detector=transmission_roi_detector,
+                transmission_roi_half_size=transmission_roi_half_size,
+            ),
+            transmission_roi_notes=(
+                "estimated from empty_beam transmission image"
+                if empty_beam_transmission is not None
+                else "estimated from water transmission image"
+            ),
             overwrite=overwrite,
         )
 

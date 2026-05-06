@@ -1,0 +1,208 @@
+schema:
+  name: SCARLET_refs_norm
+  version: "1.0"
+  profile: "mono"
+  entry_path: /entry
+
+conventions:
+  units_length: m
+  units_wavelength: angstrom
+  mask_convention: "1=masked, 0=valid"
+  transmission_roi_convention: "x1 and y1 are exclusive"
+  normalization_note: >
+    This file is defined for a target configuration (config_id), but water references
+    may optionally come from another configuration if needed for better statistics.
+
+nodes:
+
+  - path: /entry
+    kind: group
+    nx_class: NXentry
+    required: true
+
+  - path: /entry/definition
+    kind: dataset
+    required: true
+    const: "SCARLET_refs_norm"
+
+  - path: /entry/schema_version
+    kind: dataset
+    required: true
+    const: "1.0"
+
+  - path: /entry/config_id
+    kind: dataset
+    required: true
+
+  - path: /entry/configuration
+    kind: group
+    required: true
+    rules:
+      required_datasets:
+        - wavelength
+        - sample_detector_distance
+      optional_datasets:
+        - notes
+      required_groups:
+        - collimation
+
+  - path: /entry/configuration/collimation
+    kind: group
+    required: true
+    rules:
+      required_datasets:
+        - collimation_distance
+        - last_aperture_to_sample_distance
+      required_groups:
+        - aperture1
+        - aperture2
+
+  - path: /entry/configuration/collimation/aperture1
+    kind: group
+    required: true
+    rules:
+      allowed_nx_classes:
+        - NXslit
+        - NXpinhole
+      conditional_rules:
+        - apply_if_nx_class: NXslit
+          required_datasets:
+            - x_gap
+            - y_gap
+        - apply_if_nx_class: NXpinhole
+          required_datasets:
+            - diameter
+
+  - path: /entry/configuration/collimation/aperture2
+    kind: group
+    required: true
+    rules:
+      allowed_nx_classes:
+        - NXslit
+        - NXpinhole
+      conditional_rules:
+        - apply_if_nx_class: NXslit
+          required_datasets:
+            - x_gap
+            - y_gap
+        - apply_if_nx_class: NXpinhole
+          required_datasets:
+            - diameter
+
+  - path: /entry/references
+    kind: group
+    required: true
+
+  - path: /entry/references/dark
+    kind: group
+    required: false
+    rules:
+      required_groups:
+        - entry
+
+  - path: /entry/references/empty_beam_transmission
+    kind: group
+    required: false
+    rules:
+      required_groups:
+        - entry
+
+  - path: /entry/references/empty_beam_scattering
+    kind: group
+    required: false
+    rules:
+      required_groups:
+        - entry
+
+  - path: /entry/references/empty_cell_transmission
+    kind: group
+    required: false
+    rules:
+      required_groups:
+        - entry
+
+  - path: /entry/references/empty_cell_scattering
+    kind: group
+    required: false
+    rules:
+      required_groups:
+        - entry
+
+  - path: /entry/references/water_scattering
+    kind: group
+    required: true
+    rules:
+      required_groups:
+        - entry
+      optional_datasets:
+        - source_config_id
+
+  - path: /entry/references/water_transmission
+    kind: group
+    required: true
+    rules:
+      required_groups:
+        - entry
+      optional_datasets:
+        - source_config_id
+
+  - path: /entry/mask
+    kind: group
+    required: false
+
+  - path_pattern: ^/entry/mask/mask_detector\d+$
+    kind: dataset
+    required: false
+
+  - path_pattern: ^/entry/mask/beamstop_mask_detector\d+$
+    kind: dataset
+    required: false
+
+  - path: /entry/transmission_roi
+    kind: group
+    required: true
+    rules:
+      required_datasets:
+        - detector
+        - roi_type
+        - x0
+        - x1
+        - y0
+        - y1
+      enums:
+        roi_type: ["rectangle"]
+      optional_datasets:
+        - method
+        - notes
+
+  - path: /entry/transmission_setup
+    kind: group
+    required: false
+    rules:
+      required_groups:
+        - attenuator
+
+  - path: /entry/transmission_setup/attenuator
+    kind: group
+    required: false
+    nx_class: NXattenuator
+    rules:
+      required_datasets:
+        - attenuation_factor
+
+  - path: /entry/meta
+    kind: group
+    required: true
+    rules:
+      required_datasets:
+        - created_utc
+        - mask_convention
+      optional_datasets:
+        - dark_source_file
+        - empty_beam_transmission_source_file
+        - empty_beam_scattering_source_file
+        - empty_cell_transmission_source_file
+        - empty_cell_scattering_source_file
+        - water_scattering_source_file
+        - water_transmission_source_file
+        - scarlet_version
