@@ -20,33 +20,206 @@ def _cmd_schema_list(_: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_validate(args: argparse.Namespace) -> int:
-    try:
-        schema = load_schema(args.schema)
-    except FileNotFoundError:
-        print(f"Schema not found: {args.schema!r}", file=sys.stderr)
-        return 2
-
-    try:
-        report: ValidationReport = validate_nexus_file(
-            file_path=Path(args.file),
-            schema=schema,
-            entry_path=args.entry,
-            strict=args.strict,
-        )
-    except OSError as e:
-        print(f"Cannot open file {args.file!r}: {e}", file=sys.stderr)
-        return 2
-
+def _print_validation_report(report: ValidationReport) -> None:
     for msg in report.format_lines():
         print(msg)
-
     if report.ok:
         print("OK")
+    else:
+        print(f"FAILED: {len(report.errors)} error(s), {len(report.warnings)} warning(s)")
+
+
+def _validate_file_for_cli(
+    file_path: Path,
+    *,
+    schema_name: str,
+    entry_path: str | None = None,
+    strict: bool = False,
+) -> int:
+    try:
+        schema = load_schema(schema_name)
+    except FileNotFoundError:
+        print(f"Schema not found: {schema_name!r}", file=sys.stderr)
+        return 2
+
+    try:
+        report = validate_nexus_file(
+            file_path=file_path,
+            schema=schema,
+            entry_path=entry_path,
+            strict=strict,
+        )
+    except OSError as e:
+        print(f"Cannot open file {str(file_path)!r}: {e}", file=sys.stderr)
+        return 2
+
+    _print_validation_report(report)
+    return 0 if report.ok else 1
+
+
+def _cmd_validate(args: argparse.Namespace) -> int:
+    return _validate_file_for_cli(
+        Path(args.file),
+        schema_name=args.schema,
+        entry_path=args.entry,
+        strict=args.strict,
+    )
+
+
+def _cmd_convert(args: argparse.Namespace) -> int:
+    from scarlet.io.converters import convert_to_scarlet_nxsas_raw, list_apparatus
+
+    apparatus = args.apparatus
+    if apparatus == "list":
+        for name in list_apparatus():
+            print(name)
         return 0
 
-    print(f"FAILED: {len(report.errors)} error(s), {len(report.warnings)} warning(s)")
-    return 1
+    try:
+        report = convert_to_scarlet_nxsas_raw(
+            apparatus,
+            Path(args.input),
+            Path(args.output),
+            entry_in=args.entry_in,
+            overwrite=args.overwrite,
+        )
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    except FileExistsError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    except OSError as e:
+        print(f"Cannot convert file: {e}", file=sys.stderr)
+        return 2
+
+    print(f"Converted: {report.input_file} -> {report.output_file}")
+    print(f"Input entry: {report.entry_in}")
+    for note in report.notes:
+        print(f"NOTE: {note}")
+    for warning in report.warnings:
+        print(f"WARNING: {warning}")
+
+    if args.validate:
+        return _validate_file_for_cli(
+            Path(args.output),
+            schema_name=args.schema,
+            strict=args.strict,
+        )
+    return 0
+
+
+def _print_generated_files(outputs: dict[str, Path]) -> None:
+    if not outputs:
+        print("No files generated.")
+        return
+    for config_id, path in sorted(outputs.items()):
+        print(f"{config_id}: {path}")
+
+
+def _validate_generated_files(
+    outputs: dict[str, Path],
+    *,
+    schema_name: str,
+    strict: bool,
+) -> int:
+    status = 0
+    for config_id, path in sorted(outputs.items()):
+        print(f"\nValidating {config_id}: {path}")
+        status = max(
+            status,
+            _validate_file_for_cli(
+                path,
+                schema_name=schema_name,
+                strict=strict,
+            ),
+        )
+    return status
+
+
+def _cmd_refs_sub_from_excel(args: argparse.Namespace) -> int:
+    from scarlet.workflow.configuration import write_refs_sub_files_from_excel
+
+    try:
+        outputs = write_refs_sub_files_from_excel(
+            Path(args.excel),
+            Path(args.data_dir),
+            Path(args.output_dir),
+            transmission_roi_detector=args.transmission_roi_detector,
+            transmission_roi_half_size=args.transmission_roi_half_size,
+            overwrite=args.overwrite,
+        )
+    except (FileExistsError, FileNotFoundError, ValueError, OSError) as e:
+        print(str(e), file=sys.stderr)
+        return 2
+
+    _print_generated_files(outputs)
+    if args.validate:
+        return _validate_generated_files(
+            outputs,
+            schema_name=args.schema,
+            strict=args.strict,
+        )
+    return 0
+
+
+def _cmd_refs_norm_from_excel(args: argparse.Namespace) -> int:
+    from scarlet.workflow.configuration import write_refs_norm_files_from_excel
+
+    try:
+        outputs = write_refs_norm_files_from_excel(
+            Path(args.excel),
+            Path(args.data_dir),
+            Path(args.output_dir),
+            transmission_roi_detector=args.transmission_roi_detector,
+            transmission_roi_half_size=args.transmission_roi_half_size,
+            overwrite=args.overwrite,
+        )
+    except (FileExistsError, FileNotFoundError, ValueError, OSError) as e:
+        print(str(e), file=sys.stderr)
+        return 2
+
+    _print_generated_files(outputs)
+    if args.validate:
+        return _validate_generated_files(
+            outputs,
+            schema_name=args.schema,
+            strict=args.strict,
+        )
+    return 0
+
+
+def _add_refs_from_excel_parser(
+    parent: argparse.ArgumentParser,
+    *,
+    default_schema: str,
+    command_help: str,
+) -> argparse.ArgumentParser:
+    p = parent.add_parser("from-excel", help=command_help)
+    p.add_argument("excel", help="Run-configuration Excel file generated by SCARLET")
+    p.add_argument("data_dir", help="Directory containing the converted NXsas_raw data files")
+    p.add_argument("output_dir", help="Output directory for generated reference bundles")
+    p.add_argument(
+        "--transmission-roi-detector",
+        type=int,
+        default=0,
+        help="Detector index used to estimate the transmission ROI (default: 0)",
+    )
+    p.add_argument(
+        "--transmission-roi-half-size",
+        type=int,
+        default=1,
+        help="Minimum half-size, in pixels, added around the detected direct-beam ROI (default: 1)",
+    )
+    p.add_argument("--overwrite", action="store_true", help="Overwrite existing output files")
+    p.add_argument("--validate", action="store_true", help="Validate generated files after writing")
+    p.add_argument(
+        "--schema",
+        default=default_schema,
+        help="Schema YAML filename or path used when --validate is enabled",
+    )
+    p.add_argument("--strict", action="store_true", help="Treat validation warnings as errors")
+    return p
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -77,12 +250,50 @@ def build_parser() -> argparse.ArgumentParser:
     )
     v.set_defaults(func=_cmd_validate)
 
+    c = sub.add_parser("convert", help="Convert raw instrument files to SCARLET NXsas_raw")
+    c.add_argument(
+        "apparatus",
+        help="Instrument/apparatus name, e.g. 'sam' or 'sansllb'. Use 'list' to list known converters.",
+    )
+    c.add_argument("input", nargs="?", help="Input NeXus/HDF5 file")
+    c.add_argument("output", nargs="?", help="Output SCARLET NXsas_raw file")
+    c.add_argument("--entry-in", default=None, help="Input entry path/name to convert")
+    c.add_argument("--overwrite", action="store_true", help="Overwrite existing output file")
+    c.add_argument("--validate", action="store_true", help="Validate the converted file after writing")
+    c.add_argument(
+        "--schema",
+        default="scarlet_nxsas_raw_v1.3_mono.yaml",
+        help="Schema YAML filename or path used when --validate is enabled",
+    )
+    c.add_argument("--strict", action="store_true", help="Treat validation warnings as errors")
+    c.set_defaults(func=_cmd_convert)
+
+    refs_sub = sub.add_parser("refs-sub", help="Generate SCARLET subtraction-reference bundles")
+    refs_sub_sub = refs_sub.add_subparsers(dest="refs_sub_cmd", required=True)
+    refs_sub_from_excel = _add_refs_from_excel_parser(
+        refs_sub_sub,
+        default_schema="scarlet_refs_sub_v1.0.yaml",
+        command_help="Generate refs_sub files from a run-configuration Excel file",
+    )
+    refs_sub_from_excel.set_defaults(func=_cmd_refs_sub_from_excel)
+
+    refs_norm = sub.add_parser("refs-norm", help="Generate SCARLET normalization-reference bundles")
+    refs_norm_sub = refs_norm.add_subparsers(dest="refs_norm_cmd", required=True)
+    refs_norm_from_excel = _add_refs_from_excel_parser(
+        refs_norm_sub,
+        default_schema="scarlet_refs_norm_v1.0.yaml",
+        command_help="Generate refs_norm files from a run-configuration Excel file",
+    )
+    refs_norm_from_excel.set_defaults(func=_cmd_refs_norm_from_excel)
+
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.cmd == "convert" and args.apparatus != "list" and (args.input is None or args.output is None):
+        parser.error("convert requires INPUT and OUTPUT, except for: scarlet convert list")
     try:
         return int(args.func(args))
     except KeyboardInterrupt:

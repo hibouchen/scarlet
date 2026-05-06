@@ -25,6 +25,7 @@ htmlcov/
 
 # IDE
 .vscode/
+.codex
 .codex/
 
 # Local data (keep placeholders/docs if needed)

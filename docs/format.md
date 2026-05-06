@@ -27,7 +27,7 @@ Chemins (vue simplifiée) :
     /data0/data              # image 2D brute (SCARLET v0.1)
 ```
 
-Remarque : l’implémentation actuelle SCARLET (v0.1) utilise encore `entry/data/detector_###/counts` comme conteneur brut pour valider le “plumbing”. L’objectif est de converger progressivement vers une structuration encore plus NXsas (via `NXdetector`, liens NXdata, etc.).
+Remarque : l’implémentation actuelle converge vers le profil `scarlet_nxsas_raw_v1.3_mono.yaml` : les données brutes sont stockées dans les groupes `NXdetector` (`/entry/instrument/detector0`, `/entry/instrument/detector1`, ...) et exposées via des groupes `NXdata` (`/entry/data0`, `/entry/data1`, ...) contenant des liens vers les détecteurs.
 
 ## Collimation (extension SCARLET)
 
@@ -142,8 +142,6 @@ with h5py.File("mon_fichier.nxs", "a") as f:
 
 ## Produits de réduction dans le même fichier
 
-SCARLET permet d’écrire des résultats sous forme d’une **nouvelle entry** `NXsas` dans le même fichier (multi-entry), afin de relancer la réduction sans multiplier les fichiers :
+Objectif prévu : écrire les résultats réduits sous forme d’une **nouvelle entry** `NXsas` dans le même fichier (multi-entry), afin de relancer la réduction sans multiplier les fichiers.
 
-```
-scarlet reduce <fichier_nxsas_raw> --inplace --entry reduced --overwrite-entry
-```
+La commande de réduction haut niveau, par exemple `scarlet reduce`, n’est pas encore implémentée dans l’état actuel du dépôt. Les commandes disponibles couvrent aujourd’hui la conversion, la validation et la génération des lots de références `refs_sub` / `refs_norm`.

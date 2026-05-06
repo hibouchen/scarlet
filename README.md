@@ -1,134 +1,265 @@
 # SCARLET
-### SCA ttering R eduction and ana L ysis E nvironmen T
 
-**SCARLET** is a NeXus-native, instrument-agnostic framework for small-angle neutron scattering (SANS) data reduction.
+**SCA**ttering **R**eduction and ana**L**ysis **E**nvironmen**T**
 
-It provides a unified pipeline from raw instrument files to absolute I(Q), with strict geometry conventions and reproducible metadata handling.
+SCARLET is a NeXus-native framework for SANS data workflows.
 
----
+At the current stage, SCARLET provides the **infrastructure layer** needed before a full deterministic reduction pipeline:
 
-## 🔬 Vision
+- conversion of selected instrument files to a common SCARLET `NXsas_raw` profile;
+- YAML-driven validation of SCARLET NeXus/HDF5 files;
+- extraction and comparison of instrument configurations;
+- generation of subtraction-reference bundles, `SCARLET_refs_sub`;
+- generation of normalization-reference bundles, `SCARLET_refs_norm`, including water references that may come from another configuration.
 
-Modern SANS experiments are performed across multiple facilities and instrument geometries (reactor, TOF, multi-detector, VSANS).
-However, data reduction pipelines remain instrument-specific and heterogeneous.
-
-SCARLET aims to:
-
-- Define a common NeXus raw container (NXsas_raw)
-- Provide a geometry-consistent reduction framework
-- Ensure reproducibility and validation
-- Enable future AI-assisted reduction
-- Harmonize multi-instrument workflows
+The high-level physical reduction API, for example `sc.load(...)`, `sc.Reduction(...)`, and `scarlet reduce`, is **planned but not implemented yet**.
 
 ---
 
-## 📐 Geometry Convention
+## Installation for development
 
-- Origin at sample center
-- +z downstream
-- +x horizontal (beam-right)
-- +y vertical up
+From the project root:
 
-All collimation and detector elements are defined using NXtransformations.
+```bash
+pip install -e .
+```
+
+For tests:
+
+```bash
+pip install -e .[dev]
+pytest -q
+```
+
+If the package is not installed in editable mode, tests can also be run with:
+
+```bash
+PYTHONPATH=src pytest -q
+```
 
 ---
 
-## 🧱 Architecture
+## Geometry convention
 
-SCARLET is structured around:
+SCARLET uses a sample-centred coordinate system:
 
-- A unified raw container (NXsas_raw)
-- A core dataset abstraction (ScarletDataset)
-- Modular reduction steps
-- Validation and provenance tracking
+- origin at the sample centre;
+- `+z` downstream, along the direct beam;
+- `+x` horizontal, beam-right;
+- `+y` vertical up;
+- distances in metres unless stated otherwise.
 
-See `docs/format.md` for the proposed generic data format (NXsas-like) and the extended collimation model.
+Instrument components are described with NeXus groups and, where possible, `NXtransformations`.
 
 ---
 
-## 🔁 Minimal Pipeline
+## Current architecture
+
+```text
+src/scarlet/
+  cli.py                         # command-line utilities
+  io/
+    converters/                  # instrument -> SCARLET NXsas_raw converters
+      sam.py
+      sansllb.py
+  schemas/                       # packaged YAML schemas and schema notes
+  validation/                    # YAML schema loading and HDF5 validation
+  workflow/
+    configuration.py             # configuration extraction/comparison + refs files
+    context.py                   # early workflow state container
+```
+
+The main schema currently used for converted monochromatic SANS files is:
+
+```text
+scarlet_nxsas_raw_v1.3_mono.yaml
+```
+
+Additional packaged schemas include:
+
+```text
+scarlet_refs_sub_v1.0.yaml
+scarlet_refs_norm_v1.0.yaml
+```
+
+---
+
+## Command-line interface
+
+List available schemas:
+
+```bash
+scarlet schema list
+```
+
+Validate a converted SCARLET raw file:
+
+```bash
+scarlet validate data/SANSLLB/processed/run_001.nxs \
+  --schema scarlet_nxsas_raw_v1.3_mono.yaml
+```
+
+Validate a reference bundle:
+
+```bash
+scarlet validate data/SANSLLB/processed/refs_sub_config_1.nxs \
+  --schema scarlet_refs_sub_v1.0.yaml
+```
+
+List known converters:
+
+```bash
+scarlet convert list
+```
+
+Convert an instrument file to SCARLET `NXsas_raw`:
+
+```bash
+scarlet convert sansllb data/SANSLLB/raw/run_001.nxs \
+  data/SANSLLB/processed/run_001_scarlet.nxs \
+  --overwrite \
+  --validate
+```
+
+The currently registered converters are:
+
+- `sansllb` with aliases `SANSLLB`, `sans-llb`, `sans_llb`;
+- `sam`.
+
+Generate subtraction-reference bundles from the run-configuration Excel file:
+
+```bash
+scarlet refs-sub from-excel \
+  data/SANSLLB/processed/run_configuration.xlsx \
+  data/SANSLLB/processed \
+  data/SANSLLB/processed \
+  --overwrite \
+  --validate
+```
+
+Generate normalization-reference bundles, including water references:
+
+```bash
+scarlet refs-norm from-excel \
+  data/SANSLLB/processed/run_configuration.xlsx \
+  data/SANSLLB/processed \
+  data/SANSLLB/processed \
+  --overwrite \
+  --validate
+```
+
+The normalization generator prefers water files measured in the same configuration. If no local water reference is available, it can borrow a water file from another configuration and records the corresponding `source_config_id` in the output file.
+
+---
+
+## Python API currently available
+
+### Convert files
 
 ```python
-import scarlet as sc
+from scarlet.io.converters import convert_to_scarlet_nxsas_raw
 
-dataset = sc.load("raw_file.nxs")
-
-iq = (
-    sc.Reduction(dataset)
-      .normalize()
-      .transmission()
-      .background()
-      .azimuthal()
-      .absolute_scale()
-      .run()
+report = convert_to_scarlet_nxsas_raw(
+    "sansllb",
+    "data/SANSLLB/raw/run_001.nxs",
+    "data/SANSLLB/processed/run_001_scarlet.nxs",
+    overwrite=True,
 )
 
-iq.save("result.nxs")
+print(report.warnings)
 ```
 
----
-
-## 🗂️ Données locales (pour tests)
-
-Il n’y a pas de dossier imposé : vous passez simplement le chemin du fichier à `scarlet`.
-
-Par convention :
-
-- `data/<instrument>/raw/` : **données brutes instrument**
-- `data/<instrument>/processed/` : **données converties** (ex. `NXsas_raw`) + **sorties générées**
-
-Le contenu de `data/` est ignoré par git via `.gitignore` (seuls les `README.md`/`.gitkeep` restent suivis).
-
-Exemples :
-
-```bash
-scarlet info data/D11/raw/mon_fichier.nxs
-scarlet reduce data/D11/processed/nxsas_raw.nxs -o data/D11/processed/result.nxs
-```
-
-Note : la réduction (`scarlet reduce`) attend un fichier au format `NXsas_raw`. Si vos fichiers “bruts instrument” ne sont pas déjà en `NXsas_raw`, il faut les convertir via un adaptateur (voir `src/scarlet/io/adapters/`).
-
----
-
-## 🧾 Résultats dans le même fichier (multi-entry)
-
-Pour éviter de multiplier les fichiers et pouvoir relancer une réduction, vous pouvez écrire les résultats dans **une nouvelle entry** du même fichier NeXus/HDF5 :
-
-```bash
-scarlet reduce data/D11/processed/nxsas_raw.nxs --inplace --entry reduced --overwrite-entry
-```
-
-Cela ajoute (ou remplace) une entry `reduced` contenant un `definition=NXsas` et un `NXdata` minimal (`Q`, `I`, `I_errors`).
-
----
-
-## 🔄 Conversion SANSLLB → NXsas_raw
-
-Si vos fichiers bruts SANSLLB ne sont pas déjà au format `NXsas_raw`, utilisez l’adaptateur :
+### Validate files
 
 ```python
-from scarlet.io.adapters.sansllb import convert
-convert("data/SANSLLB/raw/mon_fichier.nxs", "data/SANSLLB/processed/nxsas_raw.nxs")
+from pathlib import Path
+
+from scarlet.validation.schema_loader import load_schema
+from scarlet.validation.schema_validator import validate_nexus_file
+
+schema = load_schema("scarlet_nxsas_raw_v1.3_mono.yaml")
+report = validate_nexus_file(Path("data/SANSLLB/processed/run_001_scarlet.nxs"), schema)
+
+for line in report.format_lines():
+    print(line)
 ```
 
-Note : l’adaptateur utilise `nexusformat` si installé, sinon il retombe sur un backend `h5py`. Pour forcer un backend : `convert_sansllb(..., backend="nexusformat")`. Certaines correspondances restent marquées `TODO` dans `src/scarlet/io/adapters/sansllb.py`.
-Dans les fichiers SANSLLB présents ici, la collimation est récupérée depuis `/.../collimator` (slits/guides) quand disponible (conversion mm→m) ; les distances manquantes restent à `NaN` avec un `TODO`.
+### Extract and compare configurations
+
+```python
+from scarlet.workflow.configuration import (
+    configuration_from_nexus,
+    compare_configurations,
+)
+
+cfg_a, issues_a = configuration_from_nexus("run_a_scarlet.nxs")
+cfg_b, issues_b = configuration_from_nexus("run_b_scarlet.nxs")
+
+same, diffs = compare_configurations(cfg_a, cfg_b)
+```
+
+### Generate reference bundles from Excel
+
+```python
+from scarlet.workflow.configuration import (
+    write_refs_sub_files_from_excel,
+    write_refs_norm_files_from_excel,
+)
+
+write_refs_sub_files_from_excel(
+    "run_configuration.xlsx",
+    data_dir="data/SANSLLB/processed",
+    output_dir="data/SANSLLB/processed",
+    overwrite=True,
+)
+
+write_refs_norm_files_from_excel(
+    "run_configuration.xlsx",
+    data_dir="data/SANSLLB/processed",
+    output_dir="data/SANSLLB/processed",
+    overwrite=True,
+)
+```
 
 ---
 
-## 🚀 Roadmap
+## Local data convention
 
-- v0.1 — Core deterministic reduction  
-- v0.2 — Multi-distance stitching  
-- v0.3 — Resolution function handling  
-- v0.4 — AI-assisted masking & QA  
-- v1.0 — Instrument-agnostic validated release  
+There is no mandatory data folder layout, but the examples use:
+
+```text
+data/<instrument>/raw/        # original instrument files
+data/<instrument>/processed/  # converted SCARLET files and generated outputs
+```
+
+The `data/` directory is ignored by git so that raw and processed experimental files are not committed accidentally.
 
 ---
 
-## 🔴 Why SCARLET?
+## Roadmap
 
-- NeXus-native  
-- Physically rigorous  
-- Instrument-agnostic  
-- Designed for future neutron sources  
+Near-term priorities:
+
+1. keep the documentation and CLI aligned with the implemented code;
+2. stabilize the ROI convention used for transmission bundles;
+3. add an end-to-end test: convert -> refs_sub -> refs_norm -> validate;
+4. implement the first deterministic 2D correction pipeline;
+5. implement azimuthal integration and export of reduced `I(Q)`.
+
+Longer-term goals:
+
+- multi-distance stitching;
+- Q-resolution handling;
+- TOF-aware workflows;
+- AI-assisted masking and quality checks;
+- instrument-agnostic validated release.
+
+---
+
+## Why SCARLET?
+
+- NeXus-native;
+- explicit geometry conventions;
+- reproducible metadata and validation;
+- designed for multi-configuration SANS workflows;
+- prepared for modern reactor, TOF and compact-source instruments.
