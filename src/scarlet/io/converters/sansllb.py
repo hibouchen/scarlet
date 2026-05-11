@@ -18,16 +18,39 @@ from ._hdf import (
 )
 from ._units import MM_TO_M, length_dataset_to_m as _length_dataset_to_m, mm_or_m_to_m as _mm_or_m_to_m
 
+
+NM_TO_ANGSTROM = 10.0
+
+
+def _wavelength_dataset_to_angstrom(ds: Optional[h5py.Dataset]) -> Optional[float]:
+    """Convert a raw SANS-LLB wavelength dataset to angstrom when units are known."""
+    if ds is None:
+        return None
+    units = ds.attrs.get("units")
+    units_s = _as_str(units).strip().lower() if units is not None else ""
+    value = _as_float_scalar(ds[()])
+    if units_s in {"nm", "nanometer", "nanometers", "nanometre", "nanometres"}:
+        return value * NM_TO_ANGSTROM
+    if units_s in {"a", "å", "angstrom", "angstroms"}:
+        return value
+    # Fallback: historical SANS-LLB exports store the selector wavelength in nm.
+    if value <= 1.0:
+        return value * NM_TO_ANGSTROM
+    return value
+
+
 def _wavelength_error_from_spread(wavelength: float, spread: float) -> float:
     """
     SANS_LLB provides incident_wavelength_spread which is often delta_lambda/lambda (~0.1).
-    If spread < 1, interpret as relative; else absolute.
+    Some exports store it as a percentage (e.g. 11.6 for 11.6%).
     """
     if spread is None or np.isnan(spread):
         return float("nan")
     s = float(spread)
     if s < 1.0:
         return float(wavelength) * s
+    if s <= 100.0:
+        return float(wavelength) * (s / 100.0)
     return s
 
 
@@ -432,16 +455,16 @@ def convert_sansllb_to_scarlet_nxsas_raw(
         monitor_sources = _collect_monitor_sources(fin, entry)
 
         # --- Read key values ---
-        wavelength = _safe_get(fin, f"{inst_in}/source/incident_wavelength")
+        wavelength_ds = _safe_get_dataset(fin, f"{inst_in}/source/incident_wavelength")
         spread = _safe_get(fin, f"{inst_in}/source/incident_wavelength_spread")
-        if wavelength is None:
-            wavelength = _safe_get(fin, f"{inst_in}/velocity_selector/wavelength")
+        if wavelength_ds is None:
+            wavelength_ds = _safe_get_dataset(fin, f"{inst_in}/velocity_selector/wavelength")
             spread = _safe_get(fin, f"{inst_in}/velocity_selector/wavelength_spread")
-        if wavelength is None:
+        if wavelength_ds is None:
             warnings.append("Missing incident_wavelength; monochromator/wavelength will be NaN.")
             wavelength = float("nan")
         else:
-            wavelength = _as_float_scalar(wavelength)
+            wavelength = _wavelength_dataset_to_angstrom(wavelength_ds)
 
         wavelength_error = _wavelength_error_from_spread(wavelength, _as_float_scalar(spread))
 
@@ -481,8 +504,8 @@ def convert_sansllb_to_scarlet_nxsas_raw(
 
         # --- Write output ---
         with h5py.File(output_path, "w") as fout:
-            # /entry
-            entry_out = _ensure_group(fout, "entry", "NXentry")
+            # /raw_data
+            entry_out = _ensure_group(fout, "raw_data", "NXentry")
             _write_dataset(entry_out, "definition", "NXsas_raw", as_string=True)
             _write_dataset(entry_out, "schema_version", "1.3", as_string=True)
 
@@ -629,16 +652,16 @@ def convert_sansllb_to_scarlet_nxsas_raw(
                 translation = np.array([float(dx_m), float(dy_m), float(dz_m)], dtype=float)
                 _write_dataset(tr_out, "translation", translation, units="m")
 
-                # NXdata view (SCARLET expects /entry/dataN with counts -> link to detector/data)
+                # NXdata view
                 data_out = _ensure_group(entry_out, f"data{i}", "NXdata")
                 data_out.attrs["signal"] = np.bytes_("counts")
 
                 # softlink counts
-                data_out["counts"] = h5py.SoftLink(f"/entry/instrument/detector{i}/data")
+                data_out["counts"] = h5py.SoftLink(f"/raw_data/instrument/detector{i}/data")
 
                 # optional errors link
                 if "data_errors" in det_out:
-                    data_out["counts_errors"] = h5py.SoftLink(f"/entry/instrument/detector{i}/data_errors")
+                    data_out["counts_errors"] = h5py.SoftLink(f"/raw_data/instrument/detector{i}/data_errors")
 
             _write_instrument_monitors(fin, entry, monitor_sources, inst_out, warnings, notes)
 

@@ -35,14 +35,14 @@ class TestSamConverterSchema(unittest.TestCase):
         self.assertTrue(report.ok, "\n".join(report.format_lines()))
 
         with h5py.File(out, "r") as fout:
-            self.assertEqual(fout["/entry/control/mode"][()].decode(), "timer")
-            self.assertEqual(float(fout["/entry/control/preset"][()]), 30.0)
-            self.assertEqual(float(fout["/entry/control/integral"][()]), 296271.0)
-            self.assertEqual(float(fout["/entry/control/count_time"][()]), 30.0)
-            self.assertIn("/entry/instrument/collimation/aperture1", fout)
-            self.assertIn("/entry/instrument/collimation/aperture2", fout)
-            got = [x.decode() if isinstance(x, (bytes, bytearray)) else str(x) for x in fout["/entry/instrument/collimation/element_order"][()]]
+            self.assertEqual(fout["/raw_data/control/mode"][()].decode(), "timer")
+            self.assertEqual(float(fout["/raw_data/control/preset"][()]), 30.0)
+            self.assertEqual(float(fout["/raw_data/control/integral"][()]), 296271.0)
+            self.assertEqual(float(fout["/raw_data/control/count_time"][()]), 30.0)
+            self.assertIn("/raw_data/instrument/collimation/aperture1", fout)
+            self.assertIn("/raw_data/instrument/collimation/aperture2", fout)
+            got = [x.decode() if isinstance(x, (bytes, bytearray)) else str(x) for x in fout["/raw_data/instrument/collimation/element_order"][()]]
             self.assertEqual(got, ["slit1", "guide1", "slit2", "guide2", "slit3", "guide3", "slit4"])
-            self.assertEqual(fout["/entry/instrument/collimation/elements/guide1/state"][()].decode(), "in")
-            self.assertEqual(fout["/entry/instrument/collimation/elements/guide2/state"][()].decode(), "in")
-            self.assertEqual(fout["/entry/instrument/collimation/elements/guide3/state"][()].decode(), "in")
+            self.assertEqual(fout["/raw_data/instrument/collimation/elements/guide1/state"][()].decode(), "in")
+            self.assertEqual(fout["/raw_data/instrument/collimation/elements/guide2/state"][()].decode(), "in")
+            self.assertEqual(fout["/raw_data/instrument/collimation/elements/guide3/state"][()].decode(), "in")

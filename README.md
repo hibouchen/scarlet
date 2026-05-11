@@ -4,15 +4,16 @@
 
 SCARLET is a NeXus-native framework for SANS data workflows.
 
-At the current stage, SCARLET provides the **infrastructure layer** needed before a full deterministic reduction pipeline:
+At the current stage, SCARLET provides the **infrastructure layer** needed before a full SANS reduction pipeline, plus a first deterministic 2D correction pass:
 
 - conversion of selected instrument files to a common SCARLET `NXsas_raw` profile;
 - YAML-driven validation of SCARLET NeXus/HDF5 files;
 - extraction and comparison of instrument configurations;
 - generation of subtraction-reference bundles, `SCARLET_refs_sub`;
-- generation of normalization-reference bundles, `SCARLET_refs_norm`, including water references that may come from another configuration.
+- generation of normalization-reference bundles, `SCARLET_refs_norm`, including water references that may come from another configuration;
+- first deterministic 2D correction with dark subtraction, transmission, empty-cell subtraction and optional water normalization.
 
-The high-level physical reduction API, for example `sc.load(...)`, `sc.Reduction(...)`, and `scarlet reduce`, is **planned but not implemented yet**.
+The higher-level reduction API, for example `sc.load(...)`, `sc.Reduction(...)`, and full `scarlet reduce` workflows are still evolving. A first deterministic azimuthal integration to `I(Q)` is now available through the low-level reduction API and CLI.
 
 ---
 
@@ -64,6 +65,7 @@ src/scarlet/
       sansllb.py
   schemas/                       # packaged YAML schemas and schema notes
   validation/                    # YAML schema loading and HDF5 validation
+  reduction/                     # first deterministic 2D correction pass
   workflow/
     configuration.py             # configuration extraction/comparison + refs files
     context.py                   # early workflow state container
@@ -150,6 +152,32 @@ scarlet refs-norm from-excel \
 
 The normalization generator prefers water files measured in the same configuration. If no local water reference is available, it can borrow a water file from another configuration and records the corresponding `source_config_id` in the output file.
 
+Run the first deterministic 2D correction pass:
+
+```bash
+scarlet reduce-2d \
+  data/SANSLLB/processed/sample_scattering.nxs \
+  data/SANSLLB/processed/refs_sub_config_1.nxs \
+  data/SANSLLB/processed/sample_reduced_2d.nxs \
+  --sample-transmission data/SANSLLB/processed/sample_transmission.nxs \
+  --refs-norm data/SANSLLB/processed/refs_norm_config_1.nxs \
+  --overwrite
+```
+
+This first pass writes a `SCARLET_reduced_2d` entry under `/processed_data`. It does not yet compute `Q`, propagate uncertainties or perform azimuthal integration.
+By default it reduces every detector found in the raw file. The main `/processed_data/data` group aliases the first reduced detector, and `/processed_data/data0`, `/processed_data/data1`, ... store each detector explicitly.
+Each reduced `NXdata` now also carries `Qx` and `Qy` axes in `1/angstrom`, derived from the detector geometry stored in the raw entry.
+
+Compute an azimuthal average from a reduced 2D file:
+
+```bash
+scarlet azimuthal-average \
+  data/SANSLLB/processed/reduced_2d/sample_reduced_2d.nxs \
+  data/SANSLLB/processed/azimuthal_average/sample_iq.csv \
+  --bins 200 \
+  --overwrite
+```
+
 ---
 
 ## Python API currently available
@@ -221,6 +249,41 @@ write_refs_norm_files_from_excel(
 )
 ```
 
+### Run the first 2D correction pass
+
+```python
+from scarlet.reduction import reduce_2d
+
+result = reduce_2d(
+    "sample_scattering.nxs",
+    "refs_sub_config_1.nxs",
+    sample_transmission="sample_transmission.nxs",
+    refs_norm="refs_norm_config_1.nxs",
+    output_path="sample_reduced_2d.nxs",
+    overwrite=True,
+)
+
+print(result.sample_transmission.value)
+print(result.detector_indices)
+print(result.intensity.shape)
+```
+
+### Compute an azimuthal average
+
+```python
+from scarlet.reduction import azimuthal_average
+
+iq = azimuthal_average(
+    "sample_reduced_2d.nxs",
+    n_bins=200,
+)
+
+print(iq.q.shape)
+print(iq.intensity.shape)
+```
+
+Implemented operations currently cover deterministic 2D correction plus a first azimuthal average: monitor/time normalization, dark subtraction, optional empty-beam scattering subtraction, transmission from the stored ROI, empty-cell subtraction, optional water normalization, and radial regrouping to `I(Q)`.
+
 ---
 
 ## Local data convention
@@ -240,11 +303,10 @@ The `data/` directory is ignored by git so that raw and processed experimental f
 
 Near-term priorities:
 
-1. keep the documentation and CLI aligned with the implemented code;
-2. stabilize the ROI convention used for transmission bundles;
-3. add an end-to-end test: convert -> refs_sub -> refs_norm -> validate;
-4. implement the first deterministic 2D correction pipeline;
-5. implement azimuthal integration and export of reduced `I(Q)`.
+1. stabilize the ROI convention used for transmission bundles;
+2. add formal uncertainty propagation to the 2D correction;
+3. compute detector geometry and `Q` maps;
+4. add multi-distance stitching and Q-resolution handling.
 
 Longer-term goals:
 

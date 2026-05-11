@@ -124,10 +124,10 @@ def _write_aperture(parent: h5py.Group, name: str, aperture: "Aperture") -> None
 
 
 def _select_entry(source: h5py.File) -> h5py.Group:
-    for path in ("/entry", "/entry0", "/entry1"):
+    for path in ("/raw_data", "/entry", "/entry0", "/entry1"):
         if path in source and isinstance(source[path], h5py.Group):
             return source[path]
-    raise ValueError("Reference file must contain /entry, /entry0, or /entry1")
+    raise ValueError("Reference file must contain /raw_data, /entry, /entry0, or /entry1")
 
 
 def _copy_reference(parent: h5py.Group, name: str, source_path: Union[str, Path]) -> Path:
@@ -455,7 +455,7 @@ def write_refs_norm_file(
 def configuration_from_nexus(
     file_path: Union[str, Path],
     *,
-    entry_path: str = "/entry",
+    entry_path: str = "/raw_data",
     detector_index: int = 0,
 ) -> Tuple[Configuration, List[str]]:
     """
@@ -498,11 +498,10 @@ def configuration_from_nexus(
 
     with h5py.File(file_path, "r") as f:
         if entry_path not in f:
-            # common fallback if the user passes a raw file with entry0
-            for cand in ("/entry0", "/entry1"):
+            # common fallback for older files using /entry, /entry0 or /entry1
+            for cand in ("/entry", "/entry0", "/entry1"):
                 if cand in f:
                     entry_path = cand
-                    issues.append(f"entry_path not found, using {cand}")
                     break
             else:
                 raise ValueError(f"No entry group found at {entry_path}")
@@ -1002,10 +1001,10 @@ def _resolve_data_file(name: str, *, data_dir: Path) -> Path:
 
 
 def _entry_path_from_file(f: h5py.File, path: Path) -> str:
-    entry_path = "/entry"
+    entry_path = "/raw_data"
     if entry_path in f:
         return entry_path
-    for candidate in ("/entry0", "/entry1"):
+    for candidate in ("/entry", "/entry0", "/entry1"):
         if candidate in f:
             return candidate
     raise ValueError(f"No entry group found in {path}")

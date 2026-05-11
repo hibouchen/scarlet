@@ -40,29 +40,31 @@ class TestSansLlbConverterSchema(unittest.TestCase):
         with h5py.File(sample, "r") as fin, h5py.File(out, "r") as fout:
             entry = "/entry0" if "/entry0" in fin else ("/entry" if "/entry" in fin else "/entry1")
             preset_expected = float(fin[f"{entry}/monitor2/integral"][()].reshape(()))
-            self.assertEqual(fout["/entry/control/mode"][()].decode(), "monitor")
-            self.assertEqual(float(fout["/entry/control/preset"][()]), preset_expected)
-            self.assertEqual(float(fout["/entry/control/integral"][()]), preset_expected)
-            self.assertIn("/entry/instrument/collimation/aperture1", fout)
-            self.assertIn("/entry/instrument/collimation/aperture2", fout)
-            self.assertEqual(float(fout["/entry/instrument/detector0/x_pixel_size"][()]), 0.005)
-            self.assertEqual(fout["/entry/instrument/detector0/x_pixel_size"].attrs["units"], b"m")
-            self.assertEqual(fout["/entry/instrument/collimation/collimation_distance"].attrs["units"], b"m")
-            self.assertEqual(fout["/entry/instrument/collimation/aperture2"].attrs["NX_class"], b"NXslit")
-            self.assertEqual(float(fout["/entry/instrument/collimation/aperture2/x_gap"][()]), 0.01)
-            self.assertEqual(fout["/entry/instrument/collimation/aperture2/x_gap"].attrs["units"], b"m")
-            self.assertEqual(float(fout["/entry/instrument/collimation/aperture2/y_gap"][()]), 0.01)
+            wavelength_expected = float(fin[f"{entry}/SANS-LLB/velocity_selector/wavelength"][()].reshape(())) * 10.0
+            self.assertEqual(fout["/raw_data/control/mode"][()].decode(), "monitor")
+            self.assertEqual(float(fout["/raw_data/control/preset"][()]), preset_expected)
+            self.assertEqual(float(fout["/raw_data/control/integral"][()]), preset_expected)
+            self.assertAlmostEqual(float(fout["/raw_data/instrument/monochromator/wavelength"][()]), wavelength_expected)
+            self.assertIn("/raw_data/instrument/collimation/aperture1", fout)
+            self.assertIn("/raw_data/instrument/collimation/aperture2", fout)
+            self.assertEqual(float(fout["/raw_data/instrument/detector0/x_pixel_size"][()]), 0.005)
+            self.assertEqual(fout["/raw_data/instrument/detector0/x_pixel_size"].attrs["units"], b"m")
+            self.assertEqual(fout["/raw_data/instrument/collimation/collimation_distance"].attrs["units"], b"m")
+            self.assertEqual(fout["/raw_data/instrument/collimation/aperture2"].attrs["NX_class"], b"NXslit")
+            self.assertEqual(float(fout["/raw_data/instrument/collimation/aperture2/x_gap"][()]), 0.01)
+            self.assertEqual(fout["/raw_data/instrument/collimation/aperture2/x_gap"].attrs["units"], b"m")
+            self.assertEqual(float(fout["/raw_data/instrument/collimation/aperture2/y_gap"][()]), 0.01)
 
             expected_monitors = sorted(
                 key for key in fin[entry].keys() if key.startswith("monitor") and isinstance(fin[f"{entry}/{key}"], h5py.Group)
             )
-            got_monitors = sorted(key for key in fout["/entry/instrument"].keys() if key.startswith("monitor"))
+            got_monitors = sorted(key for key in fout["/raw_data/instrument"].keys() if key.startswith("monitor"))
             self.assertEqual(got_monitors, expected_monitors)
 
             for name in expected_monitors:
                 if "integral" in fin[f"{entry}/{name}"]:
                     integral_expected = float(fin[f"{entry}/{name}/integral"][()].reshape(()))
-                    self.assertEqual(float(fout[f"/entry/instrument/{name}/integral"][()]), integral_expected)
+                    self.assertEqual(float(fout[f"/raw_data/instrument/{name}/integral"][()]), integral_expected)
 
         # Collimation order: slit0, guide0, slit1, guide1, ...
         with h5py.File(sample, "r") as fin:
@@ -107,7 +109,7 @@ class TestSansLlbConverterSchema(unittest.TestCase):
                         expected.append(f"guide{i}")
 
         with h5py.File(out, "r") as fout:
-            got = [x.decode() if isinstance(x, (bytes, bytearray)) else str(x) for x in fout["/entry/instrument/collimation/element_order"][()]]
+            got = [x.decode() if isinstance(x, (bytes, bytearray)) else str(x) for x in fout["/raw_data/instrument/collimation/element_order"][()]]
 
         self.assertEqual(got, expected)
 
@@ -135,7 +137,7 @@ class TestSansLlbConverterSchema(unittest.TestCase):
                 else:
                     sel_s = str(sel)
 
-                state = fout[f"/entry/instrument/collimation/elements/{name}/state"][()]
+                state = fout[f"/raw_data/instrument/collimation/elements/{name}/state"][()]
                 if isinstance(state, (bytes, bytearray)):
                     state_s = state.decode(errors="replace")
                 else:
@@ -143,7 +145,7 @@ class TestSansLlbConverterSchema(unittest.TestCase):
 
                 self.assertNotIn(
                     "selection",
-                    fout[f"/entry/instrument/collimation/elements/{name}"],
+                    fout[f"/raw_data/instrument/collimation/elements/{name}"],
                 )
 
                 if sel_s == "ft":

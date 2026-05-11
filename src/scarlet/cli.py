@@ -189,6 +189,69 @@ def _cmd_refs_norm_from_excel(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_reduce_2d(args: argparse.Namespace) -> int:
+    from scarlet.reduction import reduce_2d
+
+    try:
+        result = reduce_2d(
+            Path(args.sample_scattering),
+            Path(args.refs_sub),
+            sample_transmission=None if args.sample_transmission is None else Path(args.sample_transmission),
+            refs_norm=None if args.refs_norm is None else Path(args.refs_norm),
+            output_path=Path(args.output),
+            detector_index=args.detector,
+            normalize_by=args.normalize_by,
+            apply_mask=not args.no_mask,
+            overwrite=args.overwrite,
+            raw_entry=args.raw_entry,
+            processed_entry=args.processed_entry,
+            refs_entry=args.refs_entry,
+        )
+    except (FileExistsError, FileNotFoundError, ValueError, OSError) as e:
+        print(str(e), file=sys.stderr)
+        return 2
+
+    print(f"Reduced 2D image: {args.output}")
+    print(f"Sample transmission: {result.sample_transmission.value:.6g}")
+    if result.water_transmission is not None:
+        print(f"Water transmission: {result.water_transmission.value:.6g}")
+    if len(result.detector_indices) == 1:
+        print(f"Detector: detector{result.detector_index}")
+    else:
+        print("Detectors: " + ", ".join(f"detector{i}" for i in result.detector_indices))
+    print(f"Normalization: {result.normalize_by}")
+    return 0
+
+
+def _cmd_azimuthal_average(args: argparse.Namespace) -> int:
+    from scarlet.reduction import azimuthal_average, write_azimuthal_average_csv
+
+    detector_indices = None if args.detector is None else list(args.detector)
+    try:
+        result = azimuthal_average(
+            Path(args.input),
+            detector_indices=detector_indices,
+            processed_entry=args.processed_entry,
+            n_bins=args.bins,
+            q_min=args.q_min,
+            q_max=args.q_max,
+        )
+        write_azimuthal_average_csv(
+            Path(args.output),
+            result,
+            overwrite=args.overwrite,
+        )
+    except (FileExistsError, FileNotFoundError, ValueError, OSError) as e:
+        print(str(e), file=sys.stderr)
+        return 2
+
+    print(f"Azimuthal average: {args.output}")
+    print(f"Detectors: " + ", ".join(f"detector{i}" for i in result.detector_indices))
+    print(f"Bins: {len(result.q)}")
+    print(f"Q range: {result.q_edges[0]:.6g} .. {result.q_edges[-1]:.6g} A^-1")
+    return 0
+
+
 def _add_refs_from_excel_parser(
     parent: argparse.ArgumentParser,
     *,
@@ -285,6 +348,73 @@ def build_parser() -> argparse.ArgumentParser:
         command_help="Generate refs_norm files from a run-configuration Excel file",
     )
     refs_norm_from_excel.set_defaults(func=_cmd_refs_norm_from_excel)
+
+    r2d = sub.add_parser(
+        "reduce-2d",
+        help="Run the first deterministic 2D reduction pass",
+    )
+    r2d.add_argument("sample_scattering", help="Converted SCARLET NXsas_raw sample scattering file")
+    r2d.add_argument("refs_sub", help="SCARLET refs_sub bundle for the sample configuration")
+    r2d.add_argument("output", help="Output NeXus/HDF5 file. The raw file is copied and /processed_data is added.")
+    r2d.add_argument(
+        "--sample-transmission",
+        default=None,
+        help="Converted SCARLET NXsas_raw sample transmission file. If omitted, T_sample=1 is assumed.",
+    )
+    r2d.add_argument(
+        "--refs-norm",
+        default=None,
+        help="Optional SCARLET refs_norm bundle used for water normalization",
+    )
+    r2d.add_argument("--detector", type=int, default=None, help="Detector index to reduce (default: all detectors)")
+    r2d.add_argument(
+        "--normalize-by",
+        choices=("monitor", "count_time", "none"),
+        default="monitor",
+        help="How detector images are normalized before subtraction (default: monitor)",
+    )
+    r2d.add_argument(
+        "--raw-entry",
+        default="/raw_data",
+        help="Raw-data NXentry in sample files (default: /raw_data; falls back to /entry if absent)",
+    )
+    r2d.add_argument(
+        "--processed-entry",
+        default="/processed_data",
+        help="NXentry used to store reduced data in the output file (default: /processed_data)",
+    )
+    r2d.add_argument(
+        "--refs-entry",
+        default="/entry",
+        help="NXentry used by refs_sub/refs_norm bundles (default: /entry)",
+    )
+    r2d.add_argument("--no-mask", action="store_true", help="Do not apply masks stored in the reference bundles")
+    r2d.add_argument("--overwrite", action="store_true", help="Overwrite existing output file or processed entry")
+    r2d.set_defaults(func=_cmd_reduce_2d)
+
+    avg = sub.add_parser(
+        "azimuthal-average",
+        help="Compute an azimuthal I(Q) average from a reduced 2D SCARLET file",
+    )
+    avg.add_argument("input", help="Reduced SCARLET NeXus/HDF5 file containing /processed_data")
+    avg.add_argument("output", help="Output CSV file")
+    avg.add_argument(
+        "--processed-entry",
+        default="/processed_data",
+        help="NXentry containing reduced detector images (default: /processed_data)",
+    )
+    avg.add_argument(
+        "--detector",
+        action="append",
+        type=int,
+        default=None,
+        help="Detector index to include. Repeat to average multiple detectors; default is all reduced detectors.",
+    )
+    avg.add_argument("--bins", type=int, default=200, help="Number of radial Q bins (default: 200)")
+    avg.add_argument("--q-min", type=float, default=None, help="Minimum Q in A^-1 (default: auto)")
+    avg.add_argument("--q-max", type=float, default=None, help="Maximum Q in A^-1 (default: auto)")
+    avg.add_argument("--overwrite", action="store_true", help="Overwrite existing output CSV")
+    avg.set_defaults(func=_cmd_azimuthal_average)
 
     return p
 

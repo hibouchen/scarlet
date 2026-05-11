@@ -74,6 +74,47 @@ def _expand_node_matches(node: Dict[str, Any], all_paths: List[str]) -> List[str
     return []
 
 
+def _discover_entry_path(
+    h5: h5py.File,
+    *,
+    schema_entry_path: str,
+    requested_entry_path: Optional[str],
+) -> str:
+    if requested_entry_path and requested_entry_path in h5:
+        return requested_entry_path
+    if schema_entry_path in h5:
+        return schema_entry_path
+    for cand in ("/raw_data", "/entry", "/entry0", "/entry1"):
+        if cand in h5:
+            return cand
+    for key in h5.keys():
+        path = f"/{key}"
+        obj = h5[path]
+        if isinstance(obj, h5py.Group) and _nx_class(obj) == "NXentry":
+            return path
+    return schema_entry_path
+
+
+def _remap_schema_path(path: str, *, schema_entry_path: str, actual_entry_path: str) -> str:
+    if schema_entry_path == actual_entry_path:
+        return path
+    if path == schema_entry_path:
+        return actual_entry_path
+    if path.startswith(f"{schema_entry_path}/"):
+        return f"{actual_entry_path}{path[len(schema_entry_path):]}"
+    return path
+
+
+def _remap_schema_pattern(pattern: str, *, schema_entry_path: str, actual_entry_path: str) -> str:
+    if schema_entry_path == actual_entry_path:
+        return pattern
+    if pattern.startswith(f"^{schema_entry_path}"):
+        return f"^{actual_entry_path}{pattern[len(schema_entry_path) + 1:]}"
+    if pattern.startswith(schema_entry_path):
+        return f"{actual_entry_path}{pattern[len(schema_entry_path):]}"
+    return pattern
+
+
 def _get_link_target(group: h5py.Group, name: str) -> Optional[str]:
     """
     If `group/name` is a SoftLink or ExternalLink, return its target path (or filename:path).
@@ -114,7 +155,7 @@ def validate_nexus_file(
     strict_links:
         If True, enforce that link_targets fields are SoftLinks matching the target regex.
     """
-    _ = entry_path or schema.get("schema", {}).get("entry_path", "/entry")
+    schema_entry_path = schema.get("schema", {}).get("entry_path", "/entry")
 
     nodes = schema.get("nodes", [])
     errors: List[ValidationMessage] = []
@@ -132,9 +173,27 @@ def validate_nexus_file(
 
     try:
         with h5py.File(file_path, "r") as h5:
+            actual_entry_path = _discover_entry_path(
+                h5,
+                schema_entry_path=schema_entry_path,
+                requested_entry_path=entry_path,
+            )
             all_paths = _collect_all_paths(h5)
 
             for node in nodes:
+                node = dict(node)
+                if "path" in node:
+                    node["path"] = _remap_schema_path(
+                        node["path"],
+                        schema_entry_path=schema_entry_path,
+                        actual_entry_path=actual_entry_path,
+                    )
+                if "path_pattern" in node:
+                    node["path_pattern"] = _remap_schema_pattern(
+                        node["path_pattern"],
+                        schema_entry_path=schema_entry_path,
+                        actual_entry_path=actual_entry_path,
+                    )
                 required = bool(node.get("required", False))
                 kind = node.get("kind")  # "group" | "dataset"
                 nxcls = node.get("nx_class")
@@ -304,6 +363,11 @@ def validate_nexus_file(
                             for field, rx_s in (r.get("link_targets", {}) or {}).items():
                                 if field not in obj:
                                     continue
+                                rx_s = _remap_schema_pattern(
+                                    rx_s,
+                                    schema_entry_path=schema_entry_path,
+                                    actual_entry_path=actual_entry_path,
+                                )
                                 rx = re.compile(rx_s)
                                 target = _get_link_target(obj, field)
 

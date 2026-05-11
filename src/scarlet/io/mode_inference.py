@@ -149,7 +149,7 @@ def guess_measurement_mode_from_image(
 def guess_measurement_mode_from_nexus_image(
     file_path: str | Path,
     *,
-    entry_path: str | None = "/entry",
+    entry_path: str | None = "/raw_data",
     detector_index: int = 0,
     center_half_size: int = 1,
     ring_half_size: int = 4,
@@ -159,8 +159,8 @@ def guess_measurement_mode_from_nexus_image(
     Guess measurement mode using only the detector image stored in a NeXus file.
 
     This function:
-    1. resolves the entry path (/entry, /entry0, /entry1),
-    2. reads /entry/instrument/detectorN/data,
+    1. resolves the entry path (/raw_data, with /entry, /entry0, /entry1 fallbacks),
+    2. reads <entry>/instrument/detectorN/data,
     3. calls guess_measurement_mode_from_image(data).
     """
     file_path = Path(file_path)
@@ -186,7 +186,7 @@ def guess_measurement_mode_from_nexus_image(
 def _resolve_entry_path(h5: h5py.File, preferred: str | None) -> str:
     if preferred and preferred in h5:
         return preferred
-    for cand in ("/entry", "/entry0", "/entry1"):
+    for cand in ("/raw_data", "/entry", "/entry0", "/entry1"):
         if cand in h5:
             return cand
     raise ValueError("No entry group found in file.")

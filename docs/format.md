@@ -2,7 +2,7 @@
 
 Objectif : définir un conteneur NeXus/HDF5 **proche de NXsas**, mais avec une description de **collimation** plus exploitable pour la réduction (multi-éléments, positions, ouvertures).
 
-Ce document décrit une *convention SCARLET* (profil) : on conserve l’esprit de NXsas (groupes `entry/`, `instrument/`, `sample/`, `data/`) tout en ajoutant une modélisation de collimation plus riche.
+Ce document décrit une *convention SCARLET* (profil) : on conserve l’esprit de NXsas (`NXentry`, `instrument/`, `sample/`, `data/`) tout en ajoutant une modélisation de collimation plus riche.
 
 ## Conventions générales
 
@@ -15,7 +15,7 @@ Ce document décrit une *convention SCARLET* (profil) : on conserve l’esprit d
 Chemins (vue simplifiée) :
 
 ```
-/entry (NXentry)
+/raw_data (NXentry)
   definition = "NXsas_raw"            # convention SCARLET pour les données brutes
   /sample (NXsample)
   /instrument (NXinstrument)
@@ -27,7 +27,7 @@ Chemins (vue simplifiée) :
     /data0/data              # image 2D brute (SCARLET v0.1)
 ```
 
-Remarque : l’implémentation actuelle converge vers le profil `scarlet_nxsas_raw_v1.3_mono.yaml` : les données brutes sont stockées dans les groupes `NXdetector` (`/entry/instrument/detector0`, `/entry/instrument/detector1`, ...) et exposées via des groupes `NXdata` (`/entry/data0`, `/entry/data1`, ...) contenant des liens vers les détecteurs.
+Remarque : l’implémentation actuelle converge vers le profil `scarlet_nxsas_raw_v1.3_mono.yaml` : les données brutes sont stockées dans les groupes `NXdetector` (`/raw_data/instrument/detector0`, `/raw_data/instrument/detector1`, ...) et exposées via des groupes `NXdata` (`/raw_data/data0`, `/raw_data/data1`, ...) contenant des liens vers les détecteurs.
 
 ## Collimation (extension SCARLET)
 
@@ -38,7 +38,7 @@ Dans NXsas, la collimation est souvent résumée par un seul objet “collimator
 Créer un groupe :
 
 ```
-/entry/instrument/collimation (NXcollection)
+/raw_data/instrument/collimation (NXcollection)
 ```
 
 Il contient une suite d’éléments de collimation, chacun étant un groupe NeXus avec un `NX_class` parlant (par ex. `NXslit`, `NXpinhole`, `NXguide`, `NXcollimator`).
@@ -48,7 +48,7 @@ Il contient une suite d’éléments de collimation, chacun étant un groupe NeX
 Exemple typique SANS “2 slits + pinhole + guide” (noms libres) :
 
 ```
-/entry/instrument/collimation (NXcollection)
+/raw_data/instrument/collimation (NXcollection)
   order = ["slit_1", "guide_1", "slit_2", "pinhole_1"]
 
   /slit_1 (NXslit)
@@ -110,7 +110,7 @@ Extrait Python (création uniquement de la collimation) :
 import h5py
 
 with h5py.File("mon_fichier.nxs", "a") as f:
-    inst = f["entry/instrument"]
+    inst = f["raw_data/instrument"]
     coll = inst.require_group("collimation")
     coll.attrs["NX_class"] = "NXcollection"
 
@@ -142,6 +142,41 @@ with h5py.File("mon_fichier.nxs", "a") as f:
 
 ## Produits de réduction dans le même fichier
 
-Objectif prévu : écrire les résultats réduits sous forme d’une **nouvelle entry** `NXsas` dans le même fichier (multi-entry), afin de relancer la réduction sans multiplier les fichiers.
+Objectif : écrire les résultats réduits sous forme d’une **nouvelle `NXentry`** dans le même fichier NeXus logique, afin de conserver ensemble les données brutes et les données traitées.
 
-La commande de réduction haut niveau, par exemple `scarlet reduce`, n’est pas encore implémentée dans l’état actuel du dépôt. Les commandes disponibles couvrent aujourd’hui la conversion, la validation et la génération des lots de références `refs_sub` / `refs_norm`.
+La commande de réduction haut niveau, par exemple `scarlet reduce`, n’est pas encore implémentée dans l’état actuel du dépôt. Les commandes disponibles couvrent aujourd’hui la conversion, la validation, la génération des lots de références `refs_sub` / `refs_norm`, et une première correction déterministe 2D via `scarlet reduce-2d`.
+
+La sortie de `scarlet reduce-2d` copie le fichier brut si nécessaire puis ajoute :
+
+```
+/raw_data (NXentry)   # présent pour les fichiers convertis récents
+  definition = "NXsas_raw"
+  ...
+
+/processed_data (NXentry)
+  definition = "SCARLET_reduced_2d"
+  schema_version = "0.1"
+  /data (NXdata)
+    # alias vers le premier détecteur réduit
+  /data0 (NXdata)
+    I                 # image 2D corrigée pour detector0
+    Qx                # axe horizontal en 1/angstrom
+    Qy                # axe vertical en 1/angstrom
+    sample_corrected
+    water_corrected   # optionnel
+    mask              # optionnel, 1 = masqué
+  /data1 (NXdata)     # optionnel si detector1 existe
+    I                 # image 2D corrigée, éventuellement normalisée par l'eau
+    Qx
+    Qy
+    sample_corrected
+    water_corrected   # optionnel, si refs_norm est fourni
+    mask              # optionnel, 1 = masqué
+  /reduction (NXprocess)
+    /detector_indices
+    /sample_transmission/value
+    /water_transmission/value   # optionnel
+    /inputs/...
+```
+
+Ce produit `SCARLET_reduced_2d` est volontairement préliminaire : il ne contient pas encore de carte de `Q`, de propagation d’incertitudes, ni d’intégration azimutale.

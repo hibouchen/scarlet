@@ -238,7 +238,7 @@ def convert_sam_to_scarlet_nxsas_raw(
 
         # --- Write output ---
         with h5py.File(output_path, "w") as fout:
-            entry_out = _ensure_group(fout, "entry", "NXentry")
+            entry_out = _ensure_group(fout, "raw_data", "NXentry")
             _write_dataset(entry_out, "definition", "NXsas_raw", as_string=True)
             _write_dataset(entry_out, "schema_version", "1.3", as_string=True)
 
@@ -360,7 +360,7 @@ def convert_sam_to_scarlet_nxsas_raw(
             # NXdata view
             data_out = _ensure_group(entry_out, "data0", "NXdata")
             data_out.attrs["signal"] = np.bytes_("counts")
-            data_out["counts"] = h5py.SoftLink("/entry/instrument/detector0/data")
+            data_out["counts"] = h5py.SoftLink("/raw_data/instrument/detector0/data")
 
     return ConvertReport(
         input_file=input_path,

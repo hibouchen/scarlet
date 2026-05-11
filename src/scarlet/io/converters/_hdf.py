@@ -66,7 +66,7 @@ def pick_entry(fin: h5py.File, preferred: Optional[str] = None) -> str:
     """Pick the most appropriate NXentry path for a raw NeXus input file."""
     if preferred and preferred in fin:
         return preferred
-    for cand in ("/entry0", "/entry", "/entry1"):
+    for cand in ("/raw_data", "/entry0", "/entry", "/entry1"):
         if cand in fin:
             return cand
     for k in fin.keys():
