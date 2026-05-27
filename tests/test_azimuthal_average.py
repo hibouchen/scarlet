@@ -36,6 +36,28 @@ def _write_reduced_file(path: Path) -> None:
         entry["data"] = entry["data0"]
 
 
+def _write_azimuthal_file(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with h5py.File(path, "w") as f:
+        entry = f.create_group("processed_data")
+        entry.attrs["NX_class"] = np.bytes_("NXentry")
+        entry.create_dataset("definition", data=np.bytes_("SCARLET_azimuthal_iq"))
+
+        for index, base in enumerate((10.0, 50.0)):
+            data = entry.create_group(f"data{index}")
+            data.attrs["NX_class"] = np.bytes_("NXdata")
+            data.attrs["signal"] = np.bytes_("I")
+            data.attrs["axes"] = np.asarray([np.bytes_("Q")])
+            data.create_dataset("I", data=np.array([base, base + 20.0], dtype=np.float64))
+            q = data.create_dataset("Q", data=np.array([0.375, 1.125], dtype=np.float64))
+            q.attrs["units"] = np.bytes_("1/angstrom")
+            q_edges = data.create_dataset("Q_edges", data=np.array([0.0, 0.75, 1.5], dtype=np.float64))
+            q_edges.attrs["units"] = np.bytes_("1/angstrom")
+            data.create_dataset("n_pixels", data=np.array([2, 6], dtype=np.int64))
+
+        entry["data"] = entry["data0"]
+
+
 class TestAzimuthalAverage(unittest.TestCase):
     def test_azimuthal_average_merges_selected_detectors(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -55,22 +77,28 @@ class TestAzimuthalAverage(unittest.TestCase):
             np.testing.assert_array_equal(result.n_pixels, np.array([2, 6]))
             self.assertEqual(result.detector_indices, [0, 1])
 
+    def test_azimuthal_average_merges_stored_detector_curves(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            reduced = Path(tmp) / "reduced_1d.nxs"
+            _write_azimuthal_file(reduced)
+
+            result = azimuthal_average(reduced, detector_indices=[0, 1])
+
+            np.testing.assert_allclose(result.q, np.array([0.375, 1.125]))
+            np.testing.assert_allclose(result.intensity, np.array([30.0, 50.0]))
+            np.testing.assert_array_equal(result.n_pixels, np.array([4, 12]))
+            self.assertEqual(result.detector_indices, [0, 1])
+
     def test_azimuthal_average_cli_writes_csv(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             reduced = Path(tmp) / "reduced.nxs"
             output = Path(tmp) / "iq.csv"
-            _write_reduced_file(reduced)
+            _write_azimuthal_file(reduced)
 
             status = main([
                 "azimuthal-average",
                 str(reduced),
                 str(output),
-                "--bins",
-                "2",
-                "--q-min",
-                "0.0",
-                "--q-max",
-                "1.5",
                 "--overwrite",
             ])
             self.assertEqual(status, 0)
@@ -80,8 +108,9 @@ class TestAzimuthalAverage(unittest.TestCase):
                 rows = list(csv.reader(fh))
 
             self.assertEqual(rows[0], ["q_A^-1", "I", "n_pixels"])
-            self.assertEqual(rows[1][2], "2")
-            self.assertEqual(rows[2][2], "6")
+            self.assertEqual(rows[1][1], "30")
+            self.assertEqual(rows[1][2], "4")
+            self.assertEqual(rows[2][2], "12")
 
 
 if __name__ == "__main__":

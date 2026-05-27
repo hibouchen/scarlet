@@ -5,6 +5,7 @@ This file describes the **SCARLET subtraction reference file**, stored as one Ne
 It is designed to keep, in a **portable and self-contained way**, all information needed to apply subtraction corrections for a given SANS configuration:
 
 - copied reference measurements
+- beam center coordinates per detector
 - detector masks
 - transmission ROI definition
 - optional attenuation factor used during transmission measurements
@@ -27,6 +28,7 @@ This file may contain:
 
   /configuration (NXcollection)
   /references (NXcollection)
+  /beam_center (NXcollection)        # OPTIONAL
   /mask (NXcollection)
   /transmission_roi (NXcollection)
   /transmission_setup (NXcollection)   # OPTIONAL
@@ -95,6 +97,23 @@ Possible references are:
 All of them are optional.
 
 This design ensures that the file stays portable across computers without broken external links.
+
+---
+
+## `/entry/beam_center`
+
+This optional group stores beam center coordinates for each detector.
+
+Suggested layout:
+- `/entry/beam_center/detector0/beam_center_x`
+- `/entry/beam_center/detector0/beam_center_y`
+- `/entry/beam_center/detector1/beam_center_x`
+- `/entry/beam_center/detector1/beam_center_y`
+
+### Convention
+- coordinates are stored in detector pixel units
+- `beam_center_x` is the horizontal pixel coordinate
+- `beam_center_y` is the vertical pixel coordinate
 
 ---
 

@@ -141,6 +141,7 @@ class TestReduction2D(unittest.TestCase):
                 sample_transmission=sample_t,
                 refs_norm=refs_norm,
                 output_path=output,
+                azimuthal_bins=1,
             )
 
             t_sample = (5.0 - 1.0) / (10.0 - 1.0)
@@ -171,22 +172,26 @@ class TestReduction2D(unittest.TestCase):
             )
 
             with h5py.File(output, "r") as f:
-                self.assertEqual(f["/processed_data/definition"][()].decode(), "SCARLET_reduced_2d")
-                np.testing.assert_allclose(f["/processed_data/data/I"][()], np.full((2, 2), expected))
-                np.testing.assert_allclose(f["/processed_data/data1/I"][()], np.full((2, 2), expected_1))
-                self.assertEqual(list(f["/processed_data/data"].attrs["axes"]), [b"Qy", b"Qx"])
+                self.assertEqual(f["/processed_data/definition"][()].decode(), "SCARLET_azimuthal_iq")
+                np.testing.assert_allclose(f["/processed_data/data/I"][()], np.array([expected]))
+                np.testing.assert_allclose(f["/processed_data/data1/I"][()], np.array([expected_1]))
+                np.testing.assert_array_equal(f["/processed_data/data/n_pixels"][()], np.array([4]))
+                np.testing.assert_array_equal(f["/processed_data/data1/n_pixels"][()], np.array([4]))
+                self.assertEqual(list(f["/processed_data/data"].attrs["axes"]), [b"Q"])
                 np.testing.assert_allclose(
-                    f["/processed_data/data/Qx"][()],
+                    f["/processed_data/detector0/Qx"][()],
                     np.array([-0.00523592, 0.00523592]),
                     atol=1e-6,
                 )
                 np.testing.assert_allclose(
-                    f["/processed_data/data/Qy"][()],
+                    f["/processed_data/detector0/Qy"][()],
                     np.array([-0.01047089, 0.01047089]),
                     atol=1e-6,
                 )
-                self.assertEqual(f["/processed_data/data/Qx"].attrs["units"], b"1/angstrom")
-                self.assertEqual(f["/processed_data/data/Qy"].attrs["units"], b"1/angstrom")
+                self.assertEqual(f["/processed_data/data/Q"].attrs["units"], b"1/angstrom")
+                self.assertEqual(f["/processed_data/detector0/Qx"].attrs["units"], b"1/angstrom")
+                self.assertEqual(f["/processed_data/detector0/Qy"].attrs["units"], b"1/angstrom")
+                np.testing.assert_allclose(f["/processed_data/detector0/I_2d"][()], np.full((2, 2), expected))
                 self.assertAlmostEqual(float(f["/processed_data/reduction/sample_transmission/value"][()]), t_sample)
                 np.testing.assert_array_equal(f["/processed_data/reduction/detector_indices"][()], np.array([0, 1]))
 
@@ -264,14 +269,15 @@ class TestReduction2D(unittest.TestCase):
                 sample_s,
                 refs_sub,
                 output_path=output,
+                azimuthal_bins=2,
             )
 
             expected_qx = np.array([-0.00785376, 0.00261799])
             expected_qy = np.array([-0.01047145, 0.01047145])
 
             with h5py.File(output, "r") as f:
-                np.testing.assert_allclose(f["/processed_data/data0/Qx"][()], expected_qx, atol=1e-6)
-                np.testing.assert_allclose(f["/processed_data/data0/Qy"][()], expected_qy, atol=1e-6)
+                np.testing.assert_allclose(f["/processed_data/detector0/Qx"][()], expected_qx, atol=1e-6)
+                np.testing.assert_allclose(f["/processed_data/detector0/Qy"][()], expected_qy, atol=1e-6)
                 self.assertEqual(
                     f["/processed_data/beam_center_detector0/method"][()].decode(),
                     "center_of_mass_on_empty_beam_transmission_roi",

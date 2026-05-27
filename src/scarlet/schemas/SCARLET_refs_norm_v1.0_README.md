@@ -7,6 +7,7 @@ It is designed to keep, in a **portable and self-contained way**, everything nee
 This file contains:
 - the same configuration description as `SCARLET_refs_sub`
 - optional subtraction-related references if needed for consistency
+- beam center coordinates
 - detector masks
 - transmission ROI definition
 - optional transmission attenuation factor
@@ -29,6 +30,7 @@ but the water references may optionally come from **another configuration** if b
 
   /configuration (NXcollection)
   /references (NXcollection)
+  /beam_center (NXcollection)        # optional
   /mask (NXcollection)
   /transmission_roi (NXcollection)
   /transmission_setup (NXcollection)   # optional
@@ -127,6 +129,23 @@ This means:
 
 ---
 
+## `/entry/beam_center`
+
+This optional group stores beam center coordinates for each detector.
+
+Suggested layout:
+- `/entry/beam_center/detector0/beam_center_x`
+- `/entry/beam_center/detector0/beam_center_y`
+- `/entry/beam_center/detector1/beam_center_x`
+- `/entry/beam_center/detector1/beam_center_y`
+
+### Convention
+- coordinates are stored in detector pixel units
+- `beam_center_x` is the horizontal pixel coordinate
+- `beam_center_y` is the vertical pixel coordinate
+
+---
+
 ## `/entry/mask`
 
 This group stores detector masks.
@@ -135,13 +154,11 @@ Possible datasets:
 - `mask_detector0`
 - `mask_detector1`
 - ...
-- `beamstop_mask_detector0`
-- `beamstop_mask_detector1`
-- ...
 
 ### Convention
 - `1 = masked`
 - `0 = valid`
+- beamstop-masked pixels are included directly in these detector masks
 
 Masks are optional.
 

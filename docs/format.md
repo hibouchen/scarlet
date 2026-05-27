@@ -154,19 +154,29 @@ La sortie de `scarlet reduce-2d` copie le fichier brut si nécessaire puis ajout
   ...
 
 /processed_data (NXentry)
-  definition = "SCARLET_reduced_2d"
-  schema_version = "0.1"
+  definition = "SCARLET_azimuthal_iq"
+  schema_version = "0.2"
   /data (NXdata)
     # alias vers le premier détecteur réduit
   /data0 (NXdata)
-    I                 # image 2D corrigée pour detector0
-    Qx                # axe horizontal en 1/angstrom
-    Qy                # axe vertical en 1/angstrom
+    I                 # courbe azimutale 1D pour detector0
+    Q                 # centres des bins en 1/angstrom
+    Q_edges           # bords des bins
+    n_pixels          # nombre de pixels accumulés par bin
+  /data1 (NXdata)     # optionnel si detector1 existe
+    I
+    Q
+    Q_edges
+    n_pixels
+  /detector0 (NXcollection)
+    I_2d              # image 2D corrigée pour detector0
+    Qx
+    Qy
     sample_corrected
     water_corrected   # optionnel
     mask              # optionnel, 1 = masqué
-  /data1 (NXdata)     # optionnel si detector1 existe
-    I                 # image 2D corrigée, éventuellement normalisée par l'eau
+  /detector1 (NXcollection)   # optionnel si detector1 existe
+    I_2d
     Qx
     Qy
     sample_corrected
@@ -179,4 +189,4 @@ La sortie de `scarlet reduce-2d` copie le fichier brut si nécessaire puis ajout
     /inputs/...
 ```
 
-Ce produit `SCARLET_reduced_2d` est volontairement préliminaire : il ne contient pas encore de carte de `Q`, de propagation d’incertitudes, ni d’intégration azimutale.
+Ce produit `SCARLET_azimuthal_iq` reste volontairement préliminaire : il ne contient pas encore de propagation d’incertitudes ni de fusion multi-détecteurs.

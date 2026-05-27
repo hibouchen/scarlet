@@ -31,22 +31,17 @@ class TestCli(unittest.TestCase):
                 data = entry.create_group("data0")
                 data.attrs["NX_class"] = np.bytes_("NXdata")
                 data.attrs["signal"] = np.bytes_("I")
-                data.attrs["axes"] = np.asarray([np.bytes_("Qy"), np.bytes_("Qx")])
-                data.create_dataset("I", data=np.array([[1.0, 2.0], [3.0, 4.0]]))
-                data.create_dataset("Qx", data=np.array([0.0, 1.0]))
-                data.create_dataset("Qy", data=np.array([0.0, 1.0]))
+                data.attrs["axes"] = np.asarray([np.bytes_("Q")])
+                data.create_dataset("I", data=np.array([1.0, 2.0]))
+                data.create_dataset("Q", data=np.array([0.5, 1.5]))
+                data.create_dataset("Q_edges", data=np.array([0.0, 1.0, 2.0]))
+                data.create_dataset("n_pixels", data=np.array([3, 5]))
                 entry["data"] = entry["data0"]
 
             status = main([
                 "azimuthal-average",
                 str(reduced),
                 str(output),
-                "--bins",
-                "2",
-                "--q-min",
-                "0",
-                "--q-max",
-                "1.5",
                 "--overwrite",
             ])
             self.assertEqual(status, 0)

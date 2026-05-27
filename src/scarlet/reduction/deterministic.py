@@ -8,6 +8,7 @@ from typing import Optional, Union
 import h5py
 import numpy as np
 
+from .azimuthal import DetectorAzimuthalCurve, azimuthal_average_from_arrays, flatten_detector_iq, resolve_azimuthal_q_range
 from .corrections import (
     ROI,
     TransmissionComputation,
@@ -77,6 +78,8 @@ class Reduction2DResult:
     """Result of the first deterministic SCARLET 2D reduction pass."""
 
     detector_results: dict[int, DetectorReduction2DResult]
+    detector_q_axes: dict[int, tuple[np.ndarray, np.ndarray]]
+    azimuthal_results: dict[int, DetectorAzimuthalCurve]
     sample_transmission: TransmissionResult
     water_transmission: Optional[TransmissionResult]
     normalize_by: NormalizeBy
@@ -87,6 +90,8 @@ class Reduction2DResult:
     raw_entry: str
     processed_entry: str
     q_beam_centers: dict[int, tuple[float, float]]
+    azimuthal_q_min: float
+    azimuthal_q_max: float
 
     @property
     def detector_indices(self) -> list[int]:
@@ -232,6 +237,9 @@ def reduce_2d(
     raw_entry: str = RAW_ENTRY_PATH,
     processed_entry: str = PROCESSED_ENTRY_PATH,
     refs_entry: str = REFERENCE_BUNDLE_ENTRY_PATH,
+    azimuthal_bins: int = 200,
+    azimuthal_q_min: Optional[float] = None,
+    azimuthal_q_max: Optional[float] = None,
 ) -> Reduction2DResult:
     """
     Run SCARLET's first deterministic 2D reduction pass.
@@ -243,8 +251,12 @@ def reduce_2d(
 
     If ``detector_index`` is omitted, every detector present in the sample file
     is reduced. The transmission factor is computed once on the first selected
-    detector and then applied to all reduced detector images.
+    detector and then applied to all reduced detector images. The output entry
+    stores one azimuthal ``NXdata`` per detector.
     """
+    if azimuthal_bins <= 0:
+        raise ValueError(f"azimuthal_bins must be positive, got {azimuthal_bins}")
+
     sample_scattering = Path(sample_scattering)
     refs_sub = Path(refs_sub)
     refs_norm = None if refs_norm is None else Path(refs_norm)
@@ -531,8 +543,49 @@ def reduce_2d(
             if refs_norm_file is not None:
                 refs_norm_file.close()
 
+    detector_q_axes: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    all_q_values: list[np.ndarray] = []
+    with h5py.File(sample_scattering, "r") as sample_file:
+        for index in detector_indices:
+            det_result = detector_results[index]
+            qx, qy = compute_q_axes(
+                sample_file,
+                resolved_raw_entry,
+                detector_index=index,
+                shape=det_result.intensity.shape,
+                beam_center=q_beam_centers.get(index),
+            )
+            detector_q_axes[index] = (qx, qy)
+            q_values, _intensity_values = flatten_detector_iq(det_result.intensity, qx, qy)
+            if q_values.size:
+                all_q_values.append(q_values)
+
+    if not all_q_values:
+        raise ValueError("No finite reduced pixels available for azimuthal averaging")
+
+    resolved_azimuthal_q_min, resolved_azimuthal_q_max = resolve_azimuthal_q_range(
+        np.concatenate(all_q_values),
+        q_min=azimuthal_q_min,
+        q_max=azimuthal_q_max,
+    )
+    azimuthal_results: dict[int, DetectorAzimuthalCurve] = {}
+    for index in detector_indices:
+        det_result = detector_results[index]
+        qx, qy = detector_q_axes[index]
+        azimuthal_results[index] = azimuthal_average_from_arrays(
+            det_result.intensity,
+            qx,
+            qy,
+            detector_index=index,
+            n_bins=azimuthal_bins,
+            q_min=resolved_azimuthal_q_min,
+            q_max=resolved_azimuthal_q_max,
+        )
+
     result = Reduction2DResult(
         detector_results=detector_results,
+        detector_q_axes=detector_q_axes,
+        azimuthal_results=azimuthal_results,
         sample_transmission=sample_tr,
         water_transmission=water_tr,
         normalize_by=normalize_by,
@@ -543,6 +596,8 @@ def reduce_2d(
         raw_entry=resolved_raw_entry,
         processed_entry=processed_entry,
         q_beam_centers=q_beam_centers,
+        azimuthal_q_min=resolved_azimuthal_q_min,
+        azimuthal_q_max=resolved_azimuthal_q_max,
     )
 
     if output_path is not None:
@@ -568,7 +623,9 @@ def write_processed_2d_entry(
 
     If ``output_path`` differs from ``result.sample_scattering``, the raw sample
     file is copied first. The reduced output is then added under
-    ``/processed_data`` by default. Raw data are kept unchanged.
+    ``/processed_data`` by default. Raw data are kept unchanged, while the
+    final ``NXdata`` groups are written as per-detector azimuthal ``I(Q)``
+    curves.
     """
     output_path = copy_raw_file_for_processing(
         result.sample_scattering,
@@ -578,28 +635,33 @@ def write_processed_2d_entry(
 
     with h5py.File(output_path, "r+") as f:
         entry = create_processed_entry(f, processed_entry_path=processed_entry, overwrite=overwrite)
-        write_dataset(entry, "definition", "SCARLET_reduced_2d")
-        write_dataset(entry, "schema_version", "0.1")
+        write_dataset(entry, "definition", "SCARLET_azimuthal_iq")
+        write_dataset(entry, "schema_version", "0.2")
         write_dataset(entry, "created_utc", datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
         write_dataset(entry, "raw_entry", result.raw_entry)
 
         primary_name = f"data{result.primary_detector_index}"
         for index in result.detector_indices:
             det_result = result.detector_results[index]
+            azimuthal = result.azimuthal_results[index]
             data = entry.create_group(f"data{index}")
             data.attrs["NX_class"] = np.bytes_("NXdata")
             data.attrs["signal"] = np.bytes_("I")
-            data.attrs["axes"] = np.asarray([np.bytes_("Qy"), np.bytes_("Qx")])
-            write_dataset(data, "I", det_result.intensity)
-            qx, qy = compute_q_axes(
-                f,
-                result.raw_entry,
-                detector_index=index,
-                shape=det_result.intensity.shape,
-                beam_center=result.q_beam_centers.get(index),
-            )
-            qx_ds = write_dataset(data, "Qx", qx)
-            qy_ds = write_dataset(data, "Qy", qy)
+            data.attrs["axes"] = np.asarray([np.bytes_("Q")])
+            write_dataset(data, "I", azimuthal.intensity)
+            q_ds = write_dataset(data, "Q", azimuthal.q)
+            q_edges_ds = write_dataset(data, "Q_edges", azimuthal.q_edges)
+            write_dataset(data, "n_pixels", azimuthal.n_pixels)
+            write_dataset(data, "detector_index", int(index))
+            q_ds.attrs["units"] = np.bytes_("1/angstrom")
+            q_edges_ds.attrs["units"] = np.bytes_("1/angstrom")
+
+            detail = entry.create_group(f"detector{index}")
+            detail.attrs["NX_class"] = np.bytes_("NXcollection")
+            write_dataset(detail, "I_2d", det_result.intensity)
+            qx, qy = result.detector_q_axes[index]
+            qx_ds = write_dataset(detail, "Qx", qx)
+            qy_ds = write_dataset(detail, "Qy", qy)
             qx_ds.attrs["units"] = np.bytes_("1/angstrom")
             qy_ds.attrs["units"] = np.bytes_("1/angstrom")
             if index in result.q_beam_centers:
@@ -608,21 +670,24 @@ def write_processed_2d_entry(
                 write_dataset(center, "x", float(result.q_beam_centers[index][0]))
                 write_dataset(center, "y", float(result.q_beam_centers[index][1]))
                 write_dataset(center, "method", "center_of_mass_on_empty_beam_transmission_roi")
-            write_dataset(data, "sample_corrected", det_result.sample_corrected)
+            write_dataset(detail, "sample_corrected", det_result.sample_corrected)
             if det_result.water_corrected is not None:
-                write_dataset(data, "water_corrected", det_result.water_corrected)
+                write_dataset(detail, "water_corrected", det_result.water_corrected)
             if det_result.mask is not None:
-                write_dataset(data, "mask", det_result.mask.astype(np.uint8))
+                write_dataset(detail, "mask", det_result.mask.astype(np.uint8))
 
         entry["data"] = entry[primary_name]
 
         red = entry.create_group("reduction")
         red.attrs["NX_class"] = np.bytes_("NXprocess")
         write_dataset(red, "program", "scarlet")
-        write_dataset(red, "stage", "corrected_2d")
+        write_dataset(red, "stage", "azimuthal_iq")
         write_dataset(red, "detector_index", int(result.detector_index))
         write_dataset(red, "detector_indices", np.asarray(result.detector_indices, dtype=np.int64))
         write_dataset(red, "normalize_by", result.normalize_by)
+        write_dataset(red, "azimuthal_bins", int(result.azimuthal_results[result.primary_detector_index].q.size))
+        write_dataset(red, "azimuthal_q_min", float(result.azimuthal_q_min))
+        write_dataset(red, "azimuthal_q_max", float(result.azimuthal_q_max))
         write_dataset(red, "formula_sample_corrected", "(sample - dark - (empty_beam - dark)) - T_sample * (empty_cell - dark - (empty_beam - dark))")
         if result.water_corrected is not None:
             write_dataset(red, "formula_I", "sample_corrected / water_corrected")

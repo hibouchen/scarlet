@@ -578,7 +578,7 @@ def convert_sansllb_to_scarlet_nxsas_raw(
                 _write_dataset(det_out, "y_pixel_size", ypix_m if ypix_m is not None else float("nan"), units="m")
 
                 if "beam_center_x" in det_in:
-                    _write_dataset(det_out, "beam_center_x", det_in["beam_center_x"][()])
+                    _write_dataset(det_out, "beam_center_x", _as_float_scalar(det_in["beam_center_x"][()]))
                 else:
                     bx = float("nan")
                     if hasattr(data, "shape") and len(getattr(data, "shape", ())) >= 2:
@@ -587,7 +587,7 @@ def convert_sansllb_to_scarlet_nxsas_raw(
                     _write_dataset(det_out, "beam_center_x", bx)
 
                 if "beam_center_y" in det_in:
-                    _write_dataset(det_out, "beam_center_y", det_in["beam_center_y"][()])
+                    _write_dataset(det_out, "beam_center_y", _as_float_scalar(det_in["beam_center_y"][()]))
                 else:
                     by = float("nan")
                     if hasattr(data, "shape") and len(getattr(data, "shape", ())) >= 2:

@@ -134,6 +134,19 @@ nodes:
     kind: dataset
     required: false
 
+  # ---------------- Beam center ----------------
+  - path: /entry/beam_center
+    kind: group
+    required: false
+
+  - path_pattern: ^/entry/beam_center/detector\d+$
+    kind: group
+    required: false
+    rules:
+      required_datasets:
+        - beam_center_x
+        - beam_center_y
+
   # ---------------- Transmission ROI ----------------
   - path: /entry/transmission_roi
     kind: group

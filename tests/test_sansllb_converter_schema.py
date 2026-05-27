@@ -49,6 +49,8 @@ class TestSansLlbConverterSchema(unittest.TestCase):
             self.assertIn("/raw_data/instrument/collimation/aperture2", fout)
             self.assertEqual(float(fout["/raw_data/instrument/detector0/x_pixel_size"][()]), 0.005)
             self.assertEqual(fout["/raw_data/instrument/detector0/x_pixel_size"].attrs["units"], b"m")
+            self.assertEqual(fout["/raw_data/instrument/detector0/beam_center_x"].shape, ())
+            self.assertEqual(fout["/raw_data/instrument/detector0/beam_center_y"].shape, ())
             self.assertEqual(fout["/raw_data/instrument/collimation/collimation_distance"].attrs["units"], b"m")
             self.assertEqual(fout["/raw_data/instrument/collimation/aperture2"].attrs["NX_class"], b"NXslit")
             self.assertEqual(float(fout["/raw_data/instrument/collimation/aperture2/x_gap"][()]), 0.01)

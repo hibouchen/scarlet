@@ -11,6 +11,8 @@ from zipfile import ZIP_DEFLATED, ZipFile
 import h5py
 import numpy as np
 
+from test_edf import _write_simple_edf
+
 from scarlet.validation.schema_loader import load_schema
 from scarlet.validation.schema_validator import validate_nexus_file
 from scarlet.workflow.configuration import (
@@ -20,9 +22,9 @@ from scarlet.workflow.configuration import (
     Configuration,
     compare_configurations,
     configuration_from_nexus,
+    insert_beam_centers_in_refs_file,
+    insert_masks_in_refs_file,
     write_refs_norm_file,
-    write_refs_norm_files_from_excel,
-    write_refs_sub_files_from_excel,
     write_refs_sub_file,
 )
 
@@ -236,7 +238,11 @@ def _write_minimal_raw_nexus_file(
     wavelength_a: float = 6.0,
     sample_detector_distance_m: float = 4.2,
     count_time_s: float = 1.0,
+    beam_centers: Optional[Mapping[int, tuple[float, float]]] = None,
 ) -> None:
+    if beam_centers is None:
+        beam_centers = {0: (3.0, 3.0)}
+
     with h5py.File(path, "w") as f:
         entry = f.create_group("entry")
         entry.attrs["NX_class"] = b"NXentry"
@@ -252,13 +258,16 @@ def _write_minimal_raw_nexus_file(
         mono = inst.create_group("monochromator")
         _ds(mono, "wavelength", wavelength_a)
 
-        det = inst.create_group("detector0")
-        det.attrs["NX_class"] = b"NXdetector"
-        tr = det.create_group("transformations")
-        _ds(tr, "translation", np.array([0.0, 0.0, sample_detector_distance_m], dtype=float))
-        detector_data = np.zeros((7, 7), dtype=float)
-        detector_data[2:5, 2:5] = 100.0
-        _ds(det, "data", detector_data)
+        for detector_index, (beam_center_x, beam_center_y) in sorted(beam_centers.items()):
+            det = inst.create_group(f"detector{int(detector_index)}")
+            det.attrs["NX_class"] = b"NXdetector"
+            tr = det.create_group("transformations")
+            _ds(tr, "translation", np.array([0.0, 0.0, sample_detector_distance_m], dtype=float))
+            detector_data = np.zeros((7, 7), dtype=float)
+            detector_data[2:5, 2:5] = 100.0
+            _ds(det, "data", detector_data)
+            _ds(det, "beam_center_x", float(beam_center_x))
+            _ds(det, "beam_center_y", float(beam_center_y))
 
         col = inst.create_group("collimation")
         elems = col.create_group("elements")
@@ -341,9 +350,10 @@ class TestConfigurationFromNexus(unittest.TestCase):
                     str(wtr.resolve()),
                 )
                 np.testing.assert_array_equal(
-                    f["/entry/mask/beamstop_mask_detector0"][()],
-                    np.array([[1, 0], [0, 1]], dtype=np.uint8),
+                    f["/entry/mask/mask_detector0"][()],
+                    np.array([[1, 1], [1, 1]], dtype=np.uint8),
                 )
+                self.assertNotIn("/entry/mask/beamstop_mask_detector0", f)
 
     def test_write_refs_sub_file_matches_schema(self) -> None:
         schema = load_schema("scarlet_refs_sub_v1.0.yaml")
@@ -392,6 +402,51 @@ class TestConfigurationFromNexus(unittest.TestCase):
                 self.assertEqual(f["/entry/references/empty_beam_transmission/entry/title"][()].decode(), "ebt")
                 self.assertEqual(f["/entry/meta/dark_source_file"][()].decode(), str(dark.resolve()))
 
+    def test_write_refs_sub_file_copies_beam_centers_for_multiple_detectors(self) -> None:
+        schema = load_schema("scarlet_refs_sub_v1.0.yaml")
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            out = root / "refs_sub.nxs"
+            ebt = root / "empty_beam_transmission.nxs"
+            _write_minimal_raw_nexus_file(
+                ebt,
+                sample_name="empty_beam_open",
+                beam_centers={
+                    0: (12.5, 21.5),
+                    1: (7.25, 8.75),
+                },
+            )
+
+            configuration = Configuration(
+                wavelength=6.0,
+                sample_detector_distance=4.2,
+                config_id="cfg-1",
+                collimation=Collimation(
+                    aperture1=Aperture(type="slit", x_gap=0.002, y_gap=0.003),
+                    aperture2=Aperture(type="pinhole", diameter=0.004),
+                    collimation_distance=1.5,
+                    last_aperture_to_sample_distance=0.5,
+                ),
+            )
+
+            write_refs_sub_file(
+                out,
+                configuration,
+                empty_beam_transmission=ebt,
+                transmission_roi_detector=0,
+                transmission_roi=(1, 5, 1, 5),
+            )
+
+            report = validate_nexus_file(out, schema)
+            self.assertTrue(report.ok, report.format_lines())
+
+            with h5py.File(out, "r") as f:
+                self.assertAlmostEqual(float(f["/entry/beam_center/detector0/beam_center_x"][()]), 12.5)
+                self.assertAlmostEqual(float(f["/entry/beam_center/detector0/beam_center_y"][()]), 21.5)
+                self.assertAlmostEqual(float(f["/entry/beam_center/detector1/beam_center_x"][()]), 7.25)
+                self.assertAlmostEqual(float(f["/entry/beam_center/detector1/beam_center_y"][()]), 8.75)
+
     def test_write_refs_sub_file_rewrites_absolute_nxdata_links_in_references(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             out = Path(td) / "refs_sub.nxs"
@@ -433,170 +488,282 @@ class TestConfigurationFromNexus(unittest.TestCase):
                     np.arange(9, dtype=np.float32).reshape(3, 3),
                 )
 
-    def test_write_refs_sub_files_from_excel_generates_expected_references(self) -> None:
+    def test_insert_masks_in_refs_sub_file_updates_mask_group(self) -> None:
         schema = load_schema("scarlet_refs_sub_v1.0.yaml")
 
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            data_dir = root / "data"
-            out_dir = root / "refs_sub"
-            data_dir.mkdir()
+            out = root / "refs_sub.nxs"
+            ebt = root / "empty_beam_transmission.nxs"
+            _write_minimal_raw_nexus_file(ebt, sample_name="empty_beam_open")
 
-            files = {
-                "empty_beam_tr.nxs": "empty_beam_open",
-                "empty_beam_sc.nxs": "empty_beam_ws_beamstop",
-                "empty_cell_tr.nxs": "empty_cell",
-                "empty_cell_sc.nxs": "empty_cell",
-                "dark.nxs": "B4C",
-                "sample.nxs": "sample_a",
-            }
-            for filename, sample_name in files.items():
-                _write_minimal_raw_nexus_file(data_dir / filename, sample_name=sample_name)
-
-            excel_path = root / "runs.xlsx"
-            _write_simple_excel(
-                excel_path,
-                [
-                    ("data_file", "config_id", "configuration", "sample_name", "measurement_type", "measurement_confidence"),
-                    ("empty_beam_tr.nxs", "config_1", "", "empty_beam_open", "transmission", "1"),
-                    ("empty_beam_sc.nxs", "config_1", "", "empty_beam_ws_beamstop", "scattering", "1"),
-                    ("empty_cell_tr.nxs", "config_1", "", "empty_cell", "transmission", "1"),
-                    ("empty_cell_sc.nxs", "config_1", "", "empty_cell", "scattering", "1"),
-                    ("dark.nxs", "config_1", "", "B4C", "scattering", "1"),
-                    ("sample.nxs", "config_1", "", "sample_a", "scattering", "1"),
-                ],
+            configuration = Configuration(
+                wavelength=6.0,
+                sample_detector_distance=4.2,
+                config_id="cfg-1",
+                collimation=Collimation(
+                    aperture1=Aperture(type="slit", x_gap=0.002, y_gap=0.003),
+                    aperture2=Aperture(type="pinhole", diameter=0.004),
+                    collimation_distance=1.5,
+                    last_aperture_to_sample_distance=0.5,
+                ),
+            )
+            write_refs_sub_file(
+                out,
+                configuration,
+                empty_beam_transmission=ebt,
+                transmission_roi_detector=0,
+                transmission_roi=(1, 5, 1, 5),
             )
 
-            outputs = write_refs_sub_files_from_excel(excel_path, data_dir, out_dir, overwrite=True)
-            self.assertEqual(set(outputs), {"config_1"})
+            mask = np.zeros((7, 7), dtype=np.uint8)
+            mask[3, 3] = 1
+            insert_masks_in_refs_file(out, detector_number=0, mask=mask)
 
-            out = outputs["config_1"]
-            self.assertEqual(out.name, "refs_sub_config_1.nxs")
             report = validate_nexus_file(out, schema)
             self.assertTrue(report.ok, report.format_lines())
 
-            cfg, issues = configuration_from_nexus(out)
-            self.assertEqual(issues, [])
-            self.assertEqual(cfg.config_id, "config_1")
-
             with h5py.File(out, "r") as f:
-                self.assertIn("/entry/references/dark/entry", f)
-                self.assertIn("/entry/references/empty_beam_transmission/entry", f)
-                self.assertIn("/entry/references/empty_beam_scattering/entry", f)
-                self.assertIn("/entry/references/empty_cell_transmission/entry", f)
-                self.assertIn("/entry/references/empty_cell_scattering/entry", f)
-                self.assertEqual(f["/entry/meta/dark_source_file"][()].decode(), str((data_dir / "dark.nxs").resolve()))
-                self.assertEqual(int(f["/entry/transmission_roi/x0"][()]), 1)
-                self.assertEqual(int(f["/entry/transmission_roi/x1"][()]), 5)
-                self.assertEqual(int(f["/entry/transmission_roi/y0"][()]), 1)
-                self.assertEqual(int(f["/entry/transmission_roi/y1"][()]), 5)
+                np.testing.assert_array_equal(f["/entry/mask/mask_detector0"][()], mask)
+                self.assertEqual(f["/entry/meta/mask_convention"][()].decode(), "1=masked, 0=valid")
 
-    def test_write_refs_sub_files_from_excel_prefers_longest_count_time_for_dark(self) -> None:
+    def test_insert_beam_centers_in_refs_sub_file_updates_beam_center_group(self) -> None:
+        schema = load_schema("scarlet_refs_sub_v1.0.yaml")
+
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            data_dir = root / "data"
-            out_dir = root / "refs_sub"
-            data_dir.mkdir()
+            out = root / "refs_sub.nxs"
+            ebt = root / "empty_beam_transmission.nxs"
+            _write_minimal_raw_nexus_file(ebt, sample_name="empty_beam_open")
 
-            _write_minimal_raw_nexus_file(data_dir / "empty_beam_tr.nxs", sample_name="empty_beam_open", count_time_s=10.0)
-            _write_minimal_raw_nexus_file(data_dir / "dark_short.nxs", sample_name="Cd", count_time_s=5.0)
-            _write_minimal_raw_nexus_file(data_dir / "dark_long.nxs", sample_name="B4C", count_time_s=15.0)
-
-            excel_path = root / "runs.xlsx"
-            _write_simple_excel(
-                excel_path,
-                [
-                    ("data_file", "config_id", "configuration", "sample_name", "measurement_type", "measurement_confidence"),
-                    ("empty_beam_tr.nxs", "config_1", "", "empty_beam_open", "transmission", "1"),
-                    ("dark_short.nxs", "config_1", "", "Cd", "scattering", "1"),
-                    ("dark_long.nxs", "config_1", "", "B4C", "scattering", "1"),
-                ],
+            configuration = Configuration(
+                wavelength=6.0,
+                sample_detector_distance=4.2,
+                config_id="cfg-1",
+                collimation=Collimation(
+                    aperture1=Aperture(type="slit", x_gap=0.002, y_gap=0.003),
+                    aperture2=Aperture(type="pinhole", diameter=0.004),
+                    collimation_distance=1.5,
+                    last_aperture_to_sample_distance=0.5,
+                ),
+            )
+            write_refs_sub_file(
+                out,
+                configuration,
+                empty_beam_transmission=ebt,
+                transmission_roi_detector=0,
+                transmission_roi=(1, 5, 1, 5),
             )
 
-            outputs = write_refs_sub_files_from_excel(excel_path, data_dir, out_dir, overwrite=True)
-            out = outputs["config_1"]
+            insert_beam_centers_in_refs_file(out, 0, 12.5, 21.5)
+            insert_beam_centers_in_refs_file(out, 1, 7.25, 8.75)
+
+            report = validate_nexus_file(out, schema)
+            self.assertTrue(report.ok, report.format_lines())
 
             with h5py.File(out, "r") as f:
-                self.assertEqual(
-                    f["/entry/meta/dark_source_file"][()].decode(),
-                    str((data_dir / "dark_long.nxs").resolve()),
-                )
+                self.assertAlmostEqual(float(f["/entry/beam_center/detector0/beam_center_x"][()]), 12.5)
+                self.assertAlmostEqual(float(f["/entry/beam_center/detector0/beam_center_y"][()]), 21.5)
+                self.assertAlmostEqual(float(f["/entry/beam_center/detector1/beam_center_x"][()]), 7.25)
+                self.assertAlmostEqual(float(f["/entry/beam_center/detector1/beam_center_y"][()]), 8.75)
 
-    def test_write_refs_norm_files_from_excel_borrows_water_references_across_configs(self) -> None:
+    def test_insert_masks_in_refs_norm_file_writes_single_mask_per_detector(self) -> None:
         schema = load_schema("scarlet_refs_norm_v1.0.yaml")
 
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            data_dir = root / "data"
-            out_dir = root / "refs_norm"
-            data_dir.mkdir()
+            out = root / "refs_norm.nxs"
+            wtr = root / "water_transmission.nxs"
+            wsc = root / "water_scattering.nxs"
+            _write_minimal_raw_nexus_file(wtr, sample_name="water")
+            _write_minimal_raw_nexus_file(wsc, sample_name="water")
 
-            files = {
-                "empty_beam_tr_cfg1.nxs": ("empty_beam_open", 10.0),
-                "water_tr_cfg1.nxs": ("water", 12.0),
-                "water_sc_cfg1.nxs": ("water", 20.0),
-                "dark_cfg1.nxs": ("B4C", 8.0),
-                "empty_beam_tr_cfg2.nxs": ("empty_beam_open", 11.0),
-                "sample_cfg2.nxs": ("sample_b", 5.0),
-            }
-            for filename, (sample_name, count_time_s) in files.items():
-                _write_minimal_raw_nexus_file(
-                    data_dir / filename,
-                    sample_name=sample_name,
-                    count_time_s=count_time_s,
-                )
-
-            excel_path = root / "runs.xlsx"
-            _write_simple_excel(
-                excel_path,
-                [
-                    ("data_file", "config_id", "configuration", "sample_name", "measurement_type", "measurement_confidence"),
-                    ("empty_beam_tr_cfg1.nxs", "config_1", "", "empty_beam_open", "transmission", "1"),
-                    ("water_tr_cfg1.nxs", "config_1", "", "water", "transmission", "1"),
-                    ("water_sc_cfg1.nxs", "config_1", "", "water", "scattering", "1"),
-                    ("dark_cfg1.nxs", "config_1", "", "B4C", "scattering", "1"),
-                    ("empty_beam_tr_cfg2.nxs", "config_2", "", "empty_beam_open", "transmission", "1"),
-                    ("sample_cfg2.nxs", "config_2", "", "sample_b", "scattering", "1"),
-                ],
+            configuration = Configuration(
+                wavelength=6.0,
+                sample_detector_distance=4.2,
+                config_id="cfg-1",
+                collimation=Collimation(
+                    aperture1=Aperture(type="slit", x_gap=0.002, y_gap=0.003),
+                    aperture2=Aperture(type="pinhole", diameter=0.004),
+                    collimation_distance=1.5,
+                    last_aperture_to_sample_distance=0.5,
+                ),
+            )
+            write_refs_norm_file(
+                out,
+                configuration,
+                water_scattering=wsc,
+                water_transmission=wtr,
+                transmission_roi_detector=0,
+                transmission_roi=(1, 5, 1, 5),
             )
 
-            outputs = write_refs_norm_files_from_excel(excel_path, data_dir, out_dir, overwrite=True)
-            self.assertEqual(set(outputs), {"config_1", "config_2"})
+            user_mask = np.zeros((7, 7), dtype=np.uint8)
+            user_mask[2, 2] = 1
+            insert_masks_in_refs_file(
+                out,
+                detector_number=0,
+                mask=user_mask,
+                mask_convention="1=masked, 0=valid",
+            )
 
-            out1 = outputs["config_1"]
-            out2 = outputs["config_2"]
-            self.assertEqual(out1.name, "refs_norm_config_1.nxs")
-            self.assertEqual(out2.name, "refs_norm_config_2.nxs")
+            report = validate_nexus_file(out, schema)
+            self.assertTrue(report.ok, report.format_lines())
 
-            report1 = validate_nexus_file(out1, schema)
-            self.assertTrue(report1.ok, report1.format_lines())
-            report2 = validate_nexus_file(out2, schema)
-            self.assertTrue(report2.ok, report2.format_lines())
+            with h5py.File(out, "r") as f:
+                np.testing.assert_array_equal(f["/entry/mask/mask_detector0"][()], user_mask)
 
-            with h5py.File(out1, "r") as f:
-                self.assertIn("/entry/references/water_scattering/entry", f)
-                self.assertIn("/entry/references/water_transmission/entry", f)
-                self.assertNotIn("/entry/references/water_scattering/source_config_id", f)
-                self.assertNotIn("/entry/references/water_transmission/source_config_id", f)
+    def test_insert_masks_in_refs_norm_file_accepts_edf_paths(self) -> None:
+        schema = load_schema("scarlet_refs_norm_v1.0.yaml")
 
-            with h5py.File(out2, "r") as f:
-                self.assertEqual(
-                    f["/entry/references/water_scattering/source_config_id"][()].decode(),
-                    "config_1",
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            out = root / "refs_norm.nxs"
+            wtr = root / "water_transmission.nxs"
+            wsc = root / "water_scattering.nxs"
+            _write_minimal_raw_nexus_file(wtr, sample_name="water")
+            _write_minimal_raw_nexus_file(wsc, sample_name="water")
+
+            configuration = Configuration(
+                wavelength=6.0,
+                sample_detector_distance=4.2,
+                config_id="cfg-1",
+                collimation=Collimation(
+                    aperture1=Aperture(type="slit", x_gap=0.002, y_gap=0.003),
+                    aperture2=Aperture(type="pinhole", diameter=0.004),
+                    collimation_distance=1.5,
+                    last_aperture_to_sample_distance=0.5,
+                ),
+            )
+            write_refs_norm_file(
+                out,
+                configuration,
+                water_scattering=wsc,
+                water_transmission=wtr,
+                transmission_roi_detector=0,
+                transmission_roi=(1, 5, 1, 5),
+            )
+
+            mask_path = root / "mask.edf"
+            source_mask = np.zeros((7, 7), dtype=np.uint8)
+            source_mask[1:3, 4:6] = 1
+            _write_simple_edf(mask_path, source_mask)
+            insert_masks_in_refs_file(out, detector_number=0, mask=mask_path)
+
+            report = validate_nexus_file(out, schema)
+            self.assertTrue(report.ok, report.format_lines())
+
+            with h5py.File(out, "r") as f:
+                stored_mask = np.asarray(f["/entry/mask/mask_detector0"][()])
+                np.testing.assert_array_equal(stored_mask, source_mask)
+
+    def test_insert_masks_in_refs_file_removes_legacy_beamstop_mask_for_detector(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            out = root / "refs_norm.nxs"
+            wtr = root / "water_transmission.nxs"
+            wsc = root / "water_scattering.nxs"
+            _write_minimal_raw_nexus_file(wtr, sample_name="water")
+            _write_minimal_raw_nexus_file(wsc, sample_name="water")
+
+            configuration = Configuration(
+                wavelength=6.0,
+                sample_detector_distance=4.2,
+                config_id="cfg-1",
+                collimation=Collimation(
+                    aperture1=Aperture(type="slit", x_gap=0.002, y_gap=0.003),
+                    aperture2=Aperture(type="pinhole", diameter=0.004),
+                    collimation_distance=1.5,
+                    last_aperture_to_sample_distance=0.5,
+                ),
+            )
+            write_refs_norm_file(
+                out,
+                configuration,
+                water_scattering=wsc,
+                water_transmission=wtr,
+                transmission_roi_detector=0,
+                transmission_roi=(1, 5, 1, 5),
+                beamstop_masks={0: np.ones((7, 7), dtype=np.uint8)},
+            )
+
+            insert_masks_in_refs_file(
+                out,
+                detector_number=0,
+                mask=np.zeros((7, 7), dtype=np.uint8),
+            )
+
+            with h5py.File(out, "r") as f:
+                self.assertIn("/entry/mask/mask_detector0", f)
+                self.assertNotIn("/entry/mask/beamstop_mask_detector0", f)
+
+    def test_write_refs_norm_file_merges_beamstop_masks_into_mask_detector(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            out = root / "refs_norm.nxs"
+            wtr = root / "water_transmission.nxs"
+            wsc = root / "water_scattering.nxs"
+            _write_minimal_raw_nexus_file(wtr, sample_name="water")
+            _write_minimal_raw_nexus_file(wsc, sample_name="water")
+
+            configuration = Configuration(
+                wavelength=6.0,
+                sample_detector_distance=4.2,
+                config_id="cfg-1",
+                collimation=Collimation(
+                    aperture1=Aperture(type="slit", x_gap=0.002, y_gap=0.003),
+                    aperture2=Aperture(type="pinhole", diameter=0.004),
+                    collimation_distance=1.5,
+                    last_aperture_to_sample_distance=0.5,
+                ),
+            )
+            write_refs_norm_file(
+                out,
+                configuration,
+                water_scattering=wsc,
+                water_transmission=wtr,
+                transmission_roi_detector=0,
+                transmission_roi=(1, 5, 1, 5),
+                masks={0: np.array([[0, 1], [1, 0]], dtype=np.uint8)},
+                beamstop_masks={0: np.array([[1, 0], [0, 1]], dtype=np.uint8)},
+            )
+
+            with h5py.File(out, "r") as f:
+                np.testing.assert_array_equal(
+                    f["/entry/mask/mask_detector0"][()],
+                    np.array([[1, 1], [1, 1]], dtype=np.uint8),
                 )
-                self.assertEqual(
-                    f["/entry/references/water_transmission/source_config_id"][()].decode(),
-                    "config_1",
-                )
-                self.assertEqual(
-                    f["/entry/meta/water_scattering_source_file"][()].decode(),
-                    str((data_dir / "water_sc_cfg1.nxs").resolve()),
-                )
-                self.assertEqual(
-                    f["/entry/meta/water_transmission_source_file"][()].decode(),
-                    str((data_dir / "water_tr_cfg1.nxs").resolve()),
-                )
-                self.assertEqual(f["/entry/transmission_roi/notes"][()].decode(), "estimated from empty_beam transmission image")
+                self.assertNotIn("/entry/mask/beamstop_mask_detector0", f)
+
+    def test_insert_masks_in_refs_file_rejects_shape_mismatch_for_target_detector(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            out = root / "refs_sub.nxs"
+            ebt = root / "empty_beam_transmission.nxs"
+            _write_minimal_raw_nexus_file(ebt, sample_name="empty_beam_open")
+
+            configuration = Configuration(
+                wavelength=6.0,
+                sample_detector_distance=4.2,
+                config_id="cfg-1",
+                collimation=Collimation(
+                    aperture1=Aperture(type="slit", x_gap=0.002, y_gap=0.003),
+                    aperture2=Aperture(type="pinhole", diameter=0.004),
+                    collimation_distance=1.5,
+                    last_aperture_to_sample_distance=0.5,
+                ),
+            )
+            write_refs_sub_file(
+                out,
+                configuration,
+                empty_beam_transmission=ebt,
+                transmission_roi_detector=0,
+                transmission_roi=(1, 5, 1, 5),
+            )
+
+            bad_mask = np.zeros((8, 8), dtype=np.uint8)
+            with self.assertRaisesRegex(ValueError, "shape mismatch"):
+                insert_masks_in_refs_file(out, detector_number=0, mask=bad_mask)
 
     def test_refs_sub_style_round_trip_with_collimation(self) -> None:
         with tempfile.TemporaryDirectory() as td:

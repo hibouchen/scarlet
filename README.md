@@ -164,17 +164,16 @@ scarlet reduce-2d \
   --overwrite
 ```
 
-This first pass writes a `SCARLET_reduced_2d` entry under `/processed_data`. It does not yet compute `Q`, propagate uncertainties or perform azimuthal integration.
-By default it reduces every detector found in the raw file. The main `/processed_data/data` group aliases the first reduced detector, and `/processed_data/data0`, `/processed_data/data1`, ... store each detector explicitly.
-Each reduced `NXdata` now also carries `Qx` and `Qy` axes in `1/angstrom`, derived from the detector geometry stored in the raw entry.
+This first pass writes a `SCARLET_azimuthal_iq` entry under `/processed_data`.
+By default it reduces every detector found in the raw file. The main `/processed_data/data` group aliases the first reduced detector, and `/processed_data/data0`, `/processed_data/data1`, ... store one azimuthal `NXdata` per detector.
+The final `NXdata` groups contain `I(Q)`, `n_pixels` and `Q_edges`; the underlying 2D corrected images plus `Qx`/`Qy` axes are kept under `/processed_data/detector0`, `/processed_data/detector1`, ...
 
-Compute an azimuthal average from a reduced 2D file:
+Export or merge azimuthal detector curves from a reduced file:
 
 ```bash
 scarlet azimuthal-average \
   data/SANSLLB/processed/reduced_2d/sample_reduced_2d.nxs \
   data/SANSLLB/processed/azimuthal_average/sample_iq.csv \
-  --bins 200 \
   --overwrite
 ```
 

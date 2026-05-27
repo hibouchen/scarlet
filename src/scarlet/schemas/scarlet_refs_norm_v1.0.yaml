@@ -154,9 +154,17 @@ nodes:
     kind: dataset
     required: false
 
-  - path_pattern: ^/entry/mask/beamstop_mask_detector\d+$
-    kind: dataset
+  - path: /entry/beam_center
+    kind: group
     required: false
+
+  - path_pattern: ^/entry/beam_center/detector\d+$
+    kind: group
+    required: false
+    rules:
+      required_datasets:
+        - beam_center_x
+        - beam_center_y
 
   - path: /entry/transmission_roi
     kind: group
