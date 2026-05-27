@@ -1,10 +1,56 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from typing import Mapping, Optional, Union
 
 import h5py
 import numpy as np
+
+
+def insert_beam_centers_in_refs_file(
+    file_path: Union[str, Path],
+    detector_number: int,
+    beam_center_x: float,
+    beam_center_y: float,
+    *,
+    entry_path: str = "/entry",
+) -> Path:
+    from . import configuration as _cfg
+
+    file_path = Path(file_path)
+    if not file_path.exists():
+        raise FileNotFoundError(f"Reference bundle not found: {file_path}")
+    detector_number = int(detector_number)
+    if detector_number < 0:
+        raise ValueError(f"Detector index must be >= 0, got {detector_number}")
+    beam_center_x = _cfg._require_number("beam_center_x", beam_center_x)
+    beam_center_y = _cfg._require_number("beam_center_y", beam_center_y)
+
+    with h5py.File(file_path, "r+") as f:
+        if entry_path not in f or not isinstance(f[entry_path], h5py.Group):
+            raise ValueError(f"Missing entry group: {entry_path}")
+        entry = f[entry_path]
+
+        if "definition" not in entry:
+            raise ValueError(f"Missing {entry_path}/definition")
+        definition_raw = entry["definition"][()]
+        definition = (
+            definition_raw.decode(errors="replace")
+            if isinstance(definition_raw, (bytes, bytearray))
+            else str(definition_raw)
+        )
+        if definition != "SCARLET_refs_sub":
+            raise ValueError(f"Unsupported refs bundle definition: {definition!r}")
+
+        beam_center_group = entry.require_group("beam_center")
+        beam_center_group.attrs["NX_class"] = np.bytes_("NXcollection")
+        detector_group = beam_center_group.require_group(f"detector{detector_number}")
+        detector_group.attrs["NX_class"] = np.bytes_("NXcollection")
+        _cfg._replace_dataset(detector_group, "beam_center_x", beam_center_x)
+        _cfg._replace_dataset(detector_group, "beam_center_y", beam_center_y)
+
+    return file_path
 
 
 def insert_masks_in_refs_file(
@@ -22,12 +68,50 @@ def insert_masks_in_refs_file(
         raise FileNotFoundError(f"Reference bundle not found: {file_path}")
     if mask is None and mask_convention is None:
         raise ValueError("Provide mask or mask_convention")
-    if mask is not None and detector_number is None:
-        raise ValueError("detector_number is required when inserting a mask")
     if detector_number is not None:
         detector_number = int(detector_number)
         if detector_number < 0:
             raise ValueError(f"Detector index must be >= 0, got {detector_number}")
+
+    def _read_text_dataset(group: h5py.Group, dataset_path: str) -> Optional[str]:
+        if dataset_path not in group:
+            return None
+        raw = group[dataset_path][()]
+        if isinstance(raw, (bytes, bytearray)):
+            return raw.decode(errors="replace")
+        return str(raw)
+
+    def _load_masks_from_bundle(mask_file: Union[str, Path]) -> tuple[dict[int, np.ndarray], Optional[str]]:
+        mask_file = Path(mask_file)
+        if not mask_file.exists():
+            raise FileNotFoundError(f"Mask bundle not found: {mask_file}")
+
+        with h5py.File(mask_file, "r") as source:
+            if "/entry" not in source or not isinstance(source["/entry"], h5py.Group):
+                raise ValueError(f"Missing /entry group in mask bundle: {mask_file}")
+            entry = source["/entry"]
+            definition = _read_text_dataset(entry, "definition")
+            if definition != "SCARLET_masks":
+                raise ValueError(f"Unsupported mask bundle definition: {definition!r}")
+            if "mask" not in entry or not isinstance(entry["mask"], h5py.Group):
+                raise ValueError(f"Missing /entry/mask group in mask bundle: {mask_file}")
+
+            loaded_masks: dict[int, np.ndarray] = {}
+            for dataset_name, dataset in entry["mask"].items():
+                if not isinstance(dataset, h5py.Dataset):
+                    continue
+                match = re.fullmatch(r"mask_detector(\d+)", dataset_name)
+                if match is None:
+                    continue
+                detector_index = int(match.group(1))
+                loaded_masks[detector_index] = _cfg._normalize_mask_array(
+                    np.asarray(dataset[()]),
+                    label=dataset_name,
+                )
+            if not loaded_masks:
+                raise ValueError(f"No mask_detectorN datasets found in mask bundle: {mask_file}")
+
+            return loaded_masks, _read_text_dataset(entry, "meta/mask_convention")
 
     with h5py.File(file_path, "r+") as f:
         if entry_path not in f or not isinstance(f[entry_path], h5py.Group):
@@ -62,8 +146,21 @@ def insert_masks_in_refs_file(
                 del mask_group[legacy_beamstop_name]
 
         if mask is not None:
-            assert detector_number is not None
-            write_single_mask(detector_number, mask)
+            if isinstance(mask, (str, Path)):
+                loaded_masks, loaded_mask_convention = _load_masks_from_bundle(mask)
+                if detector_number is None:
+                    for loaded_detector_index, loaded_mask in sorted(loaded_masks.items()):
+                        write_single_mask(loaded_detector_index, loaded_mask)
+                else:
+                    if detector_number not in loaded_masks:
+                        raise ValueError(f"mask bundle does not contain mask_detector{detector_number}")
+                    write_single_mask(detector_number, loaded_masks[detector_number])
+                if mask_convention is None:
+                    mask_convention = loaded_mask_convention
+            else:
+                if detector_number is None:
+                    raise ValueError("detector_number is required when inserting an array mask")
+                write_single_mask(detector_number, mask)
 
         meta = entry.require_group("meta")
         meta.attrs["NX_class"] = np.bytes_("NXcollection")

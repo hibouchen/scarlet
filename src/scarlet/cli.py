@@ -204,6 +204,20 @@ def _cmd_azimuthal_average(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_mask_gui(args: argparse.Namespace) -> int:
+    from scarlet.gui import run_mask_editor
+
+    try:
+        run_mask_editor(
+            None if args.file is None else Path(args.file),
+            output_file=None if args.output is None else Path(args.output),
+        )
+    except (FileNotFoundError, ValueError, OSError) as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="scarlet", description="SCARLET utilities")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -334,6 +348,11 @@ def build_parser() -> argparse.ArgumentParser:
     avg.add_argument("--q-max", type=float, default=None, help="Maximum Q in A^-1 (default: auto)")
     avg.add_argument("--overwrite", action="store_true", help="Overwrite existing output CSV")
     avg.set_defaults(func=_cmd_azimuthal_average)
+
+    gui = sub.add_parser("mask-gui", help="Open the graphical mask editor for detector masks")
+    gui.add_argument("file", nargs="?", help="Optional input NeXus/HDF5 file to load at startup")
+    gui.add_argument("--output", default=None, help="Optional output NeXus/HDF5 mask bundle path")
+    gui.set_defaults(func=_cmd_mask_gui)
 
     return p
 

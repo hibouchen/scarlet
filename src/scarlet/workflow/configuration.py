@@ -378,68 +378,12 @@ def _normalize_mask_array(mask: Union[np.ndarray, str, Path], *, label: str) -> 
     return array.astype(np.uint8, copy=False)
 
 
-def insert_beam_centers_in_refs_file(
-    file_path: Union[str, Path],
-    detector_number: int,
-    beam_center_x: float,
-    beam_center_y: float,
-    *,
-    entry_path: str = "/entry",
-) -> Path:
-    """
-    Insert or replace one detector beam center in an existing SCARLET refs_sub bundle.
-
-    Parameters
-    ----------
-    file_path:
-        Existing SCARLET refs_sub file to update in place.
-    detector_number:
-        Detector index to update.
-    beam_center_x:
-        Beam center x coordinate written to
-        ``/entry/beam_center/detector{detector_number}/beam_center_x``.
-    beam_center_y:
-        Beam center y coordinate written to
-        ``/entry/beam_center/detector{detector_number}/beam_center_y``.
-    entry_path:
-        Entry group path in the refs file. Defaults to ``/entry``.
-    """
-
-    file_path = Path(file_path)
-    if not file_path.exists():
-        raise FileNotFoundError(f"Reference bundle not found: {file_path}")
-    detector_number = int(detector_number)
-    if detector_number < 0:
-        raise ValueError(f"Detector index must be >= 0, got {detector_number}")
-    beam_center_x = _require_number("beam_center_x", beam_center_x)
-    beam_center_y = _require_number("beam_center_y", beam_center_y)
-
-    with h5py.File(file_path, "r+") as f:
-        if entry_path not in f or not isinstance(f[entry_path], h5py.Group):
-            raise ValueError(f"Missing entry group: {entry_path}")
-        entry = f[entry_path]
-
-        if "definition" not in entry:
-            raise ValueError(f"Missing {entry_path}/definition")
-        definition_raw = entry["definition"][()]
-        definition = (
-            definition_raw.decode(errors="replace")
-            if isinstance(definition_raw, (bytes, bytearray))
-            else str(definition_raw)
-        )
-        if definition != "SCARLET_refs_sub":
-            raise ValueError(f"Unsupported refs bundle definition: {definition!r}")
-
-        beam_center_group = entry.require_group("beam_center")
-        beam_center_group.attrs["NX_class"] = np.bytes_("NXcollection")
-        detector_group = beam_center_group.require_group(f"detector{detector_number}")
-        detector_group.attrs["NX_class"] = np.bytes_("NXcollection")
-        _replace_dataset(detector_group, "beam_center_x", beam_center_x)
-        _replace_dataset(detector_group, "beam_center_y", beam_center_y)
-
-    return file_path
-
-from .reference import insert_masks_in_refs_file, write_refs_norm_file, write_refs_sub_file
+from .reference import (
+    insert_beam_centers_in_refs_file,
+    insert_masks_in_refs_file,
+    write_refs_norm_file,
+    write_refs_sub_file,
+)
 
 
 def configuration_from_nexus(
@@ -822,4 +766,3 @@ def _transmission_roi_from_file(
         max(0, y0 - pad_y),
         min(ny - 1, y1 + pad_y),
     )
-

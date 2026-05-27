@@ -11,8 +11,6 @@ from zipfile import ZIP_DEFLATED, ZipFile
 import h5py
 import numpy as np
 
-from test_edf import _write_simple_edf
-
 from scarlet.validation.schema_loader import load_schema
 from scarlet.validation.schema_validator import validate_nexus_file
 from scarlet.workflow.configuration import (
@@ -229,6 +227,29 @@ def _write_simple_excel(path: Path, rows: list[tuple[str, ...]]) -> None:
             '</styleSheet>',
         )
         zf.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+
+
+def _write_minimal_masks_file(
+    path: Path,
+    *,
+    masks: Mapping[int, np.ndarray],
+    mask_convention: str = "1=masked, 0=valid",
+    config_id: Optional[str] = None,
+) -> None:
+    with h5py.File(path, "w") as f:
+        entry = f.create_group("entry")
+        entry.attrs["NX_class"] = b"NXentry"
+        _ds(entry, "definition", "SCARLET_masks")
+        _ds(entry, "schema_version", "1.0")
+        if config_id is not None:
+            _ds(entry, "config_id", config_id)
+        mask_group = entry.create_group("mask")
+        mask_group.attrs["NX_class"] = b"NXcollection"
+        for detector_index, mask in sorted(masks.items()):
+            _ds(mask_group, f"mask_detector{detector_index}", np.asarray(mask, dtype=np.uint8))
+        meta = entry.create_group("meta")
+        meta.attrs["NX_class"] = b"NXcollection"
+        _ds(meta, "mask_convention", mask_convention)
 
 
 def _write_minimal_raw_nexus_file(
@@ -613,7 +634,7 @@ class TestConfigurationFromNexus(unittest.TestCase):
             with h5py.File(out, "r") as f:
                 np.testing.assert_array_equal(f["/entry/mask/mask_detector0"][()], user_mask)
 
-    def test_insert_masks_in_refs_norm_file_accepts_edf_paths(self) -> None:
+    def test_insert_masks_in_refs_norm_file_accepts_scarlet_mask_paths(self) -> None:
         schema = load_schema("scarlet_refs_norm_v1.0.yaml")
 
         with tempfile.TemporaryDirectory() as td:
@@ -621,6 +642,7 @@ class TestConfigurationFromNexus(unittest.TestCase):
             out = root / "refs_norm.nxs"
             wtr = root / "water_transmission.nxs"
             wsc = root / "water_scattering.nxs"
+            mask_path = root / "masks.nxs"
             _write_minimal_raw_nexus_file(wtr, sample_name="water")
             _write_minimal_raw_nexus_file(wsc, sample_name="water")
 
@@ -644,10 +666,9 @@ class TestConfigurationFromNexus(unittest.TestCase):
                 transmission_roi=(1, 5, 1, 5),
             )
 
-            mask_path = root / "mask.edf"
             source_mask = np.zeros((7, 7), dtype=np.uint8)
             source_mask[1:3, 4:6] = 1
-            _write_simple_edf(mask_path, source_mask)
+            _write_minimal_masks_file(mask_path, masks={0: source_mask})
             insert_masks_in_refs_file(out, detector_number=0, mask=mask_path)
 
             report = validate_nexus_file(out, schema)
@@ -656,6 +677,54 @@ class TestConfigurationFromNexus(unittest.TestCase):
             with h5py.File(out, "r") as f:
                 stored_mask = np.asarray(f["/entry/mask/mask_detector0"][()])
                 np.testing.assert_array_equal(stored_mask, source_mask)
+
+    def test_insert_masks_in_refs_sub_file_reads_all_masks_from_scarlet_mask_bundle(self) -> None:
+        schema = load_schema("scarlet_refs_sub_v1.0.yaml")
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            out = root / "refs_sub.nxs"
+            ebt = root / "empty_beam_transmission.nxs"
+            mask_path = root / "masks.nxs"
+            _write_minimal_raw_nexus_file(
+                ebt,
+                sample_name="empty_beam_open",
+                beam_centers={0: (3.0, 3.0), 1: (2.0, 2.0)},
+            )
+
+            configuration = Configuration(
+                wavelength=6.0,
+                sample_detector_distance=4.2,
+                config_id="cfg-1",
+                collimation=Collimation(
+                    aperture1=Aperture(type="slit", x_gap=0.002, y_gap=0.003),
+                    aperture2=Aperture(type="pinhole", diameter=0.004),
+                    collimation_distance=1.5,
+                    last_aperture_to_sample_distance=0.5,
+                ),
+            )
+            write_refs_sub_file(
+                out,
+                configuration,
+                empty_beam_transmission=ebt,
+                transmission_roi_detector=0,
+                transmission_roi=(1, 5, 1, 5),
+            )
+
+            mask0 = np.zeros((7, 7), dtype=np.uint8)
+            mask0[1, 1] = 1
+            mask1 = np.zeros((7, 7), dtype=np.uint8)
+            mask1[5, 5] = 1
+            _write_minimal_masks_file(mask_path, masks={0: mask0, 1: mask1})
+
+            insert_masks_in_refs_file(out, mask=mask_path)
+
+            report = validate_nexus_file(out, schema)
+            self.assertTrue(report.ok, report.format_lines())
+
+            with h5py.File(out, "r") as f:
+                np.testing.assert_array_equal(f["/entry/mask/mask_detector0"][()], mask0)
+                np.testing.assert_array_equal(f["/entry/mask/mask_detector1"][()], mask1)
 
     def test_insert_masks_in_refs_file_removes_legacy_beamstop_mask_for_detector(self) -> None:
         with tempfile.TemporaryDirectory() as td:
