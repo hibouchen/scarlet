@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from collections import OrderedDict
 import csv
 from html import escape
+import json
 import re
 
 import numpy as np
@@ -334,6 +335,43 @@ class WorkflowContext:
     def get_transmission(self, sample_id: str, config_id: str) -> Optional[float]:
         return self.transmissions.get((sample_id, config_id))
 
+    def update_root_dir(self, root_dir: Path) -> WorkflowContext:
+        """Update the raw data root directory and rebase registered run paths."""
+        old_root_dir = self.root_dir.resolve()
+        new_root_dir = Path(root_dir).resolve()
+        self.runs = {
+            key: _rebase_path_if_under(path, old_root_dir, new_root_dir)
+            for key, path in self.runs.items()
+        }
+        self.root_dir = new_root_dir
+        return self
+
+    def update_output_dir(self, output_dir: Path) -> WorkflowContext:
+        """Update the output directory and rebase generated file paths."""
+        old_output_dir = self.output_dir.resolve()
+        new_output_dir = Path(output_dir).resolve()
+        self.refs_sub_files = {
+            config_id: _rebase_path_if_under(path, old_output_dir, new_output_dir)
+            for config_id, path in self.refs_sub_files.items()
+        }
+        self.refs_norm_files = {
+            config_id: _rebase_path_if_under(path, old_output_dir, new_output_dir)
+            for config_id, path in self.refs_norm_files.items()
+        }
+        self.masks_files = {
+            config_id: _rebase_path_if_under(path, old_output_dir, new_output_dir)
+            for config_id, path in self.masks_files.items()
+        }
+        self.artifacts = [
+            replace(artifact, path=_rebase_path_if_under(artifact.path, old_output_dir, new_output_dir))
+            for artifact in self.artifacts
+        ]
+        runs_report_csv = self.store.get("runs_report_csv")
+        if isinstance(runs_report_csv, Path):
+            self.store["runs_report_csv"] = _rebase_path_if_under(runs_report_csv, old_output_dir, new_output_dir)
+        self.output_dir = new_output_dir
+        return self
+
     def runs_table(self) -> TableView:
         """Return a notebook-friendly table view of runs using the runs_report.csv columns."""
         return TableView(
@@ -365,13 +403,41 @@ class WorkflowContext:
         )
 
 
+def _write_scalar_dataset(parent: h5py.Group, name: str, value: Any) -> None:
+    if isinstance(value, Path):
+        value = str(value)
+    if isinstance(value, str):
+        parent.create_dataset(name, data=np.bytes_(value))
+    else:
+        parent.create_dataset(name, data=value)
+
+
+def _replace_scalar_dataset(parent: h5py.Group, name: str, value: Any) -> None:
+    if name in parent:
+        del parent[name]
+    _write_scalar_dataset(parent, name, value)
+
+
 def _read_text_dataset(dataset: h5py.Dataset) -> str:
     value = dataset[()]
+    return _read_text_value(value)
+
+
+def _read_text_value(value: Any) -> str:
     if isinstance(value, np.ndarray) and value.size == 1:
         value = value.reshape(()).item()
     if isinstance(value, (bytes, bytearray, np.bytes_)):
         return value.decode(errors="replace")
     return str(value)
+
+
+def _rebase_path_if_under(path: Path, old_base: Path, new_base: Path) -> Path:
+    resolved_path = Path(path).resolve()
+    try:
+        relative_path = resolved_path.relative_to(old_base)
+    except ValueError:
+        return resolved_path
+    return (new_base / relative_path).resolve()
 
 
 def _read_sample_name(path: Path) -> str:
@@ -418,6 +484,125 @@ def _is_hdf5_file(path: Path) -> bool:
         return h5py.is_hdf5(path)
     except Exception:
         return False
+
+
+def _path_to_storage_string(path: Path, *, base_dir: Path) -> str:
+    path = Path(path).resolve()
+    try:
+        return str(path.relative_to(base_dir))
+    except ValueError:
+        return str(path)
+
+
+def _resolve_stored_path(raw_path: str, *, base_dir: Path) -> Path:
+    path = Path(raw_path)
+    if path.is_absolute():
+        return path.resolve()
+    return (base_dir / path).resolve()
+
+
+def _to_json_compatible(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Path):
+        return {"__type__": "path", "value": str(value)}
+    if isinstance(value, list):
+        return [_to_json_compatible(item) for item in value]
+    if isinstance(value, tuple):
+        return {"__type__": "tuple", "items": [_to_json_compatible(item) for item in value]}
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("Only string dict keys are supported")
+            out[key] = _to_json_compatible(item)
+        return out
+    raise TypeError(f"Unsupported value type: {type(value).__name__}")
+
+
+def _from_json_compatible(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_from_json_compatible(item) for item in value]
+    if isinstance(value, dict):
+        value_type = value.get("__type__")
+        if value_type == "path":
+            return Path(str(value["value"]))
+        if value_type == "tuple":
+            return tuple(_from_json_compatible(item) for item in value["items"])
+        return {key: _from_json_compatible(item) for key, item in value.items()}
+    return value
+
+
+def _serialize_configuration(parent: h5py.Group, configuration: Any) -> None:
+    _write_scalar_dataset(parent, "wavelength", float(configuration.wavelength))
+    sample_detector_distance = configuration.sample_detector_distance
+    if isinstance(sample_detector_distance, list):
+        parent.create_dataset("sample_detector_distance", data=np.asarray(sample_detector_distance, dtype=np.float64))
+    else:
+        _write_scalar_dataset(parent, "sample_detector_distance", float(sample_detector_distance))
+    if configuration.config_id is not None:
+        _write_scalar_dataset(parent, "config_id", configuration.config_id)
+    if configuration.notes is not None:
+        _write_scalar_dataset(parent, "notes", configuration.notes)
+
+    if configuration.collimation is None:
+        return
+
+    col = parent.create_group("collimation")
+    _write_scalar_dataset(col, "collimation_distance", float(configuration.collimation.collimation_distance))
+    _write_scalar_dataset(
+        col,
+        "last_aperture_to_sample_distance",
+        float(configuration.collimation.last_aperture_to_sample_distance),
+    )
+    for aperture_name in ("aperture1", "aperture2"):
+        aperture = getattr(configuration.collimation, aperture_name)
+        ap = col.create_group(aperture_name)
+        _write_scalar_dataset(ap, "type", aperture.type)
+        if aperture.x_gap is not None:
+            _write_scalar_dataset(ap, "x_gap", float(aperture.x_gap))
+        if aperture.y_gap is not None:
+            _write_scalar_dataset(ap, "y_gap", float(aperture.y_gap))
+        if aperture.diameter is not None:
+            _write_scalar_dataset(ap, "diameter", float(aperture.diameter))
+
+
+def _deserialize_configuration(group: h5py.Group) -> Any:
+    from scarlet.workflow.configuration import Aperture, Collimation, Configuration
+
+    sample_detector_distance_ds = group["sample_detector_distance"][()]
+    sample_detector_distance_arr = np.asarray(sample_detector_distance_ds)
+    if sample_detector_distance_arr.ndim == 0:
+        sample_detector_distance: float | list[float] = float(sample_detector_distance_arr.reshape(()))
+    else:
+        sample_detector_distance = [float(item) for item in sample_detector_distance_arr.tolist()]
+
+    collimation = None
+    if "collimation" in group:
+        col_group = group["collimation"]
+
+        def read_aperture(ap_group: h5py.Group) -> Aperture:
+            return Aperture(
+                type=_read_text_dataset(ap_group["type"]),
+                x_gap=float(ap_group["x_gap"][()]) if "x_gap" in ap_group else None,
+                y_gap=float(ap_group["y_gap"][()]) if "y_gap" in ap_group else None,
+                diameter=float(ap_group["diameter"][()]) if "diameter" in ap_group else None,
+            )
+
+        collimation = Collimation(
+            aperture1=read_aperture(col_group["aperture1"]),
+            aperture2=read_aperture(col_group["aperture2"]),
+            collimation_distance=float(col_group["collimation_distance"][()]),
+            last_aperture_to_sample_distance=float(col_group["last_aperture_to_sample_distance"][()]),
+        )
+
+    return Configuration(
+        wavelength=float(group["wavelength"][()]),
+        sample_detector_distance=sample_detector_distance,
+        collimation=collimation,
+        config_id=_read_text_dataset(group["config_id"]) if "config_id" in group else None,
+        notes=_read_text_dataset(group["notes"]) if "notes" in group else None,
+    )
 
 
 def _runs_report_rows(workflow_context: WorkflowContext) -> List[Dict[str, str]]:
@@ -491,6 +676,293 @@ def _configurations_rows(workflow_context: WorkflowContext) -> List[Dict[str, st
             }
         )
     return rows
+
+
+def save_workflow_context(
+    workflow_context: WorkflowContext,
+    file_path: str | Path,
+) -> Path:
+    """
+    Save the lightweight state of a WorkflowContext to a NeXus/HDF5 file.
+
+    Heavy transient caches such as open HDF5 handles, frames and frame errors
+    are intentionally excluded.
+    """
+    file_path = Path(file_path).resolve()
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    base_dir = file_path.parent
+
+    with h5py.File(file_path, "w") as f:
+        entry = f.create_group("entry")
+        entry.attrs["NX_class"] = np.bytes_("NXentry")
+        _write_scalar_dataset(entry, "definition", "SCARLET_workflow_context")
+        _write_scalar_dataset(entry, "schema_version", "1.0")
+
+        metadata = entry.create_group("metadata")
+        metadata.attrs["NX_class"] = np.bytes_("NXcollection")
+        _write_scalar_dataset(metadata, "experiment_id", workflow_context.experiment_id)
+        _write_scalar_dataset(metadata, "instrument_name", workflow_context.instrument_name)
+        _write_scalar_dataset(metadata, "root_dir", _path_to_storage_string(workflow_context.root_dir, base_dir=base_dir))
+        _write_scalar_dataset(metadata, "output_dir", _path_to_storage_string(workflow_context.output_dir, base_dir=base_dir))
+        _write_scalar_dataset(metadata, "schema_raw", workflow_context.schema_raw)
+        _write_scalar_dataset(metadata, "schema_refs_sub", workflow_context.schema_refs_sub)
+        _write_scalar_dataset(metadata, "schema_refs_norm", workflow_context.schema_refs_norm)
+        _write_scalar_dataset(metadata, "schema_masks", workflow_context.schema_masks)
+        _write_scalar_dataset(metadata, "created_utc", datetime.now(timezone.utc).isoformat())
+
+        runs_group = entry.create_group("runs")
+        runs_group.attrs["NX_class"] = np.bytes_("NXcollection")
+        dt = h5py.string_dtype(encoding="utf-8")
+        rows = _runs_report_rows(workflow_context)
+        runs_group.create_dataset("sample_name", data=np.asarray([row["sample_name"] for row in rows], dtype=dt))
+        runs_group.create_dataset("config_id", data=np.asarray([row["config_id"] for row in rows], dtype=dt))
+        runs_group.create_dataset("mode", data=np.asarray([row["mode"] for row in rows], dtype=dt))
+        runs_group.create_dataset("entity", data=np.asarray([row["entity"] for row in rows], dtype=dt))
+        runs_group.create_dataset(
+            "file_path",
+            data=np.asarray(
+                [_path_to_storage_string(Path(row["file_path"]), base_dir=base_dir) for row in rows],
+                dtype=dt,
+            ),
+        )
+
+        configs_group = entry.create_group("configurations")
+        configs_group.attrs["NX_class"] = np.bytes_("NXcollection")
+        for config_id, configuration in sorted(workflow_context.configurations.items()):
+            cfg_group = configs_group.create_group(config_id)
+            cfg_group.attrs["NX_class"] = np.bytes_("NXcollection")
+            _serialize_configuration(cfg_group, configuration)
+
+        refs_group = entry.create_group("references")
+        refs_group.attrs["NX_class"] = np.bytes_("NXcollection")
+        for group_name, mapping in (
+            ("refs_sub_files", workflow_context.refs_sub_files),
+            ("refs_norm_files", workflow_context.refs_norm_files),
+            ("masks_files", workflow_context.masks_files),
+        ):
+            subgroup = refs_group.create_group(group_name)
+            subgroup.attrs["NX_class"] = np.bytes_("NXcollection")
+            for config_id, path in sorted(mapping.items()):
+                _write_scalar_dataset(subgroup, config_id, _path_to_storage_string(path, base_dir=base_dir))
+
+        masks_group = entry.create_group("masks")
+        masks_group.attrs["NX_class"] = np.bytes_("NXcollection")
+        for (config_id, detector), mask in sorted(workflow_context.masks.items()):
+            cfg_group = masks_group.require_group(config_id)
+            cfg_group.attrs["NX_class"] = np.bytes_("NXcollection")
+            cfg_group.create_dataset(f"detector{detector}", data=np.asarray(mask, dtype=np.uint8))
+
+        transmissions_group = entry.create_group("transmissions")
+        transmissions_group.attrs["NX_class"] = np.bytes_("NXcollection")
+        transmissions_group.create_dataset(
+            "sample_name",
+            data=np.asarray([sample_name for sample_name, _ in workflow_context.transmissions.keys()], dtype=dt),
+        )
+        transmissions_group.create_dataset(
+            "config_id",
+            data=np.asarray([config_id for _, config_id in workflow_context.transmissions.keys()], dtype=dt),
+        )
+        transmissions_group.create_dataset(
+            "value",
+            data=np.asarray(list(workflow_context.transmissions.values()), dtype=np.float64),
+        )
+
+        artifacts_group = entry.create_group("artifacts")
+        artifacts_group.attrs["NX_class"] = np.bytes_("NXcollection")
+        artifacts_group.create_dataset("name", data=np.asarray([artifact.name for artifact in workflow_context.artifacts], dtype=dt))
+        artifacts_group.create_dataset(
+            "path",
+            data=np.asarray(
+                [_path_to_storage_string(artifact.path, base_dir=base_dir) for artifact in workflow_context.artifacts],
+                dtype=dt,
+            ),
+        )
+        artifacts_group.create_dataset("kind", data=np.asarray([artifact.kind for artifact in workflow_context.artifacts], dtype=dt))
+        artifacts_group.create_dataset(
+            "created_utc",
+            data=np.asarray([artifact.created_utc for artifact in workflow_context.artifacts], dtype=dt),
+        )
+
+        logs_group = entry.create_group("logs")
+        logs_group.attrs["NX_class"] = np.bytes_("NXcollection")
+        logs_group.create_dataset("level", data=np.asarray([log.level for log in workflow_context.logs], dtype=dt))
+        logs_group.create_dataset("message", data=np.asarray([log.message for log in workflow_context.logs], dtype=dt))
+        logs_group.create_dataset(
+            "where",
+            data=np.asarray([(log.where or "") for log in workflow_context.logs], dtype=dt),
+        )
+        logs_group.create_dataset("when_utc", data=np.asarray([log.when_utc for log in workflow_context.logs], dtype=dt))
+        logs_group.create_dataset(
+            "meta_json",
+            data=np.asarray([json.dumps(_to_json_compatible(log.meta), sort_keys=True) for log in workflow_context.logs], dtype=dt),
+        )
+
+        issues_group = entry.create_group("issues")
+        issues_group.attrs["NX_class"] = np.bytes_("NXcollection")
+        issues_group.create_dataset("level", data=np.asarray([issue.level for issue in workflow_context.issues], dtype=dt))
+        issues_group.create_dataset("message", data=np.asarray([issue.message for issue in workflow_context.issues], dtype=dt))
+        issues_group.create_dataset(
+            "where",
+            data=np.asarray([(issue.where or "") for issue in workflow_context.issues], dtype=dt),
+        )
+        issues_group.create_dataset(
+            "key",
+            data=np.asarray([(issue.key or "") for issue in workflow_context.issues], dtype=dt),
+        )
+        issues_group.create_dataset("when_utc", data=np.asarray([issue.when_utc for issue in workflow_context.issues], dtype=dt))
+        issues_group.create_dataset(
+            "meta_json",
+            data=np.asarray([json.dumps(_to_json_compatible(issue.meta), sort_keys=True) for issue in workflow_context.issues], dtype=dt),
+        )
+
+        timings_group = entry.create_group("timings")
+        timings_group.attrs["NX_class"] = np.bytes_("NXcollection")
+        for key, value in sorted(workflow_context.timings.items()):
+            _write_scalar_dataset(timings_group, key, float(value))
+
+        store_group = entry.create_group("store")
+        store_group.attrs["NX_class"] = np.bytes_("NXcollection")
+        skipped_store_keys: list[str] = []
+        for key, value in sorted(workflow_context.store.items()):
+            if key in {"frames", "frame_errors", "masks", "transmissions"}:
+                continue
+            try:
+                encoded = json.dumps(_to_json_compatible(value), sort_keys=True)
+            except TypeError:
+                skipped_store_keys.append(key)
+                continue
+            _write_scalar_dataset(store_group, key, encoded)
+        if skipped_store_keys:
+            _write_scalar_dataset(store_group, "_skipped_keys", json.dumps(sorted(skipped_store_keys)))
+
+    return file_path
+
+
+def load_workflow_context(file_path: str | Path) -> WorkflowContext:
+    """Load a WorkflowContext previously saved with save_workflow_context()."""
+    file_path = Path(file_path).resolve()
+    base_dir = file_path.parent
+
+    with h5py.File(file_path, "r") as f:
+        entry = f["/entry"]
+        definition = _read_text_dataset(entry["definition"])
+        if definition != "SCARLET_workflow_context":
+            raise ValueError(f"Unsupported workflow context definition: {definition!r}")
+
+        metadata = entry["metadata"]
+        workflow_context = WorkflowContext(
+            experiment_id=_read_text_dataset(metadata["experiment_id"]),
+            instrument_name=_read_text_dataset(metadata["instrument_name"]),
+            root_dir=_resolve_stored_path(_read_text_dataset(metadata["root_dir"]), base_dir=base_dir),
+            output_dir=_resolve_stored_path(_read_text_dataset(metadata["output_dir"]), base_dir=base_dir),
+        )
+        workflow_context.schema_raw = _read_text_dataset(metadata["schema_raw"])
+        workflow_context.schema_refs_sub = _read_text_dataset(metadata["schema_refs_sub"])
+        workflow_context.schema_refs_norm = _read_text_dataset(metadata["schema_refs_norm"])
+        workflow_context.schema_masks = _read_text_dataset(metadata["schema_masks"])
+
+        runs_group = entry["runs"]
+        sample_names = [_read_text_value(runs_group["sample_name"][i]) for i in range(len(runs_group["sample_name"]))]
+        config_ids = [_read_text_value(runs_group["config_id"][i]) for i in range(len(runs_group["config_id"]))]
+        modes = [_read_text_value(runs_group["mode"][i]) for i in range(len(runs_group["mode"]))]
+        entities = [_read_text_value(runs_group["entity"][i]) for i in range(len(runs_group["entity"]))]
+        file_paths = [_read_text_value(runs_group["file_path"][i]) for i in range(len(runs_group["file_path"]))]
+        for sample_name, config_id, mode, entity, raw_path in zip(sample_names, config_ids, modes, entities, file_paths):
+            workflow_context.add_run(
+                RunKey(
+                    config_id=config_id,
+                    entity=cast(Entity, entity),
+                    mode=cast(Mode, mode),
+                    sample_name=sample_name or None,
+                ),
+                _resolve_stored_path(raw_path, base_dir=base_dir),
+            )
+
+        if "configurations" in entry:
+            for config_id, group in entry["configurations"].items():
+                if isinstance(group, h5py.Group):
+                    workflow_context.configurations[config_id] = _deserialize_configuration(group)
+
+        refs_group = entry["references"]
+        for attribute_name, group_name in (
+            ("refs_sub_files", "refs_sub_files"),
+            ("refs_norm_files", "refs_norm_files"),
+            ("masks_files", "masks_files"),
+        ):
+            mapping = cast(dict[str, Path], getattr(workflow_context, attribute_name))
+            for key, dataset in refs_group[group_name].items():
+                if isinstance(dataset, h5py.Dataset):
+                    mapping[key] = _resolve_stored_path(_read_text_dataset(dataset), base_dir=base_dir)
+
+        if "masks" in entry:
+            for config_id, config_group in entry["masks"].items():
+                if not isinstance(config_group, h5py.Group):
+                    continue
+                for detector_name, dataset in config_group.items():
+                    if not isinstance(dataset, h5py.Dataset):
+                        continue
+                    detector = int(detector_name.removeprefix("detector"))
+                    workflow_context.set_mask(config_id, detector, np.asarray(dataset[()], dtype=np.uint8))
+
+        if "transmissions" in entry:
+            transmissions_group = entry["transmissions"]
+            sample_names = [_read_text_value(transmissions_group["sample_name"][i]) for i in range(len(transmissions_group["sample_name"]))]
+            config_ids = [_read_text_value(transmissions_group["config_id"][i]) for i in range(len(transmissions_group["config_id"]))]
+            values = np.asarray(transmissions_group["value"][()], dtype=np.float64)
+            for sample_name, config_id, value in zip(sample_names, config_ids, values):
+                workflow_context.set_transmission(sample_name, config_id, float(value))
+
+        if "artifacts" in entry:
+            artifacts_group = entry["artifacts"]
+            for i in range(len(artifacts_group["name"])):
+                workflow_context.artifacts.append(
+                    Artifact(
+                        name=_read_text_value(artifacts_group["name"][i]),
+                        path=_resolve_stored_path(_read_text_value(artifacts_group["path"][i]), base_dir=base_dir),
+                        kind=_read_text_value(artifacts_group["kind"][i]),
+                        created_utc=_read_text_value(artifacts_group["created_utc"][i]),
+                    )
+                )
+
+        if "logs" in entry:
+            logs_group = entry["logs"]
+            for i in range(len(logs_group["level"])):
+                workflow_context.logs.append(
+                    LogMessage(
+                        level=cast(Level, _read_text_value(logs_group["level"][i])),
+                        message=_read_text_value(logs_group["message"][i]),
+                        where=(_read_text_value(logs_group["where"][i]) or None),
+                        when_utc=_read_text_value(logs_group["when_utc"][i]),
+                        meta=_from_json_compatible(json.loads(_read_text_value(logs_group["meta_json"][i]))),
+                    )
+                )
+
+        if "issues" in entry:
+            issues_group = entry["issues"]
+            for i in range(len(issues_group["level"])):
+                workflow_context.issues.append(
+                    Issue(
+                        level=cast(Literal["WARN", "ERROR"], _read_text_value(issues_group["level"][i])),
+                        message=_read_text_value(issues_group["message"][i]),
+                        where=(_read_text_value(issues_group["where"][i]) or None),
+                        key=(_read_text_value(issues_group["key"][i]) or None),
+                        when_utc=_read_text_value(issues_group["when_utc"][i]),
+                        meta=_from_json_compatible(json.loads(_read_text_value(issues_group["meta_json"][i]))),
+                    )
+                )
+
+        if "timings" in entry:
+            for key, dataset in entry["timings"].items():
+                if isinstance(dataset, h5py.Dataset):
+                    workflow_context.timings[key] = float(dataset[()])
+
+        if "store" in entry:
+            for key, dataset in entry["store"].items():
+                if not isinstance(dataset, h5py.Dataset) or key == "_skipped_keys":
+                    continue
+                workflow_context.store[key] = _from_json_compatible(json.loads(_read_text_dataset(dataset)))
+
+    return workflow_context
 
 
 def initialize_workflow_context_from_raw_directory(

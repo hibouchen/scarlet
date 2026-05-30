@@ -3,12 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 from typing import Mapping, Optional
 
 import h5py
 import numpy as np
 
-from scarlet.reduction.nexus import list_detector_indices_in_file
 from scarlet.workflow.configuration import Aperture, Collimation, Configuration, configuration_from_nexus
 
 
@@ -25,9 +25,35 @@ class MaskEditorSource:
         return sorted(self.detector_data)
 
 
+def _resolve_entry_path(f: h5py.File) -> str:
+    for entry_path in ("/raw_data", "/entry", "/entry0", "/entry1"):
+        if entry_path in f and isinstance(f[entry_path], h5py.Group):
+            return entry_path
+    raise ValueError("No raw-data entry group found")
+
+
+def _list_detector_indices_in_file(file_path: Path | str) -> tuple[str, list[int]]:
+    file_path = Path(file_path).resolve()
+    with h5py.File(file_path, "r") as f:
+        entry_path = _resolve_entry_path(f)
+        instrument_path = f"{entry_path}/instrument"
+        if instrument_path not in f or not isinstance(f[instrument_path], h5py.Group):
+            return entry_path, []
+
+        indices: list[int] = []
+        for name in f[instrument_path].keys():
+            match = re.fullmatch(r"detector(\d+)", name)
+            if match is None:
+                continue
+            data_path = f"{instrument_path}/{name}/data"
+            if data_path in f:
+                indices.append(int(match.group(1)))
+        return entry_path, sorted(indices)
+
+
 def load_mask_source(file_path: Path | str) -> MaskEditorSource:
     file_path = Path(file_path).resolve()
-    entry_path, detector_indices = list_detector_indices_in_file(file_path)
+    entry_path, detector_indices = _list_detector_indices_in_file(file_path)
     if not detector_indices:
         raise ValueError(f"No detector data found in {file_path}")
 

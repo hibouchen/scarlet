@@ -1,0 +1,132 @@
+schema:
+  name: SCARLET_workflow_context
+  version: "1.0"
+  profile: "mono"
+  entry_path: /entry
+
+nodes:
+
+  - path: /entry
+    kind: group
+    nx_class: NXentry
+    required: true
+
+  - path: /entry/definition
+    kind: dataset
+    required: true
+    const: "SCARLET_workflow_context"
+
+  - path: /entry/schema_version
+    kind: dataset
+    required: true
+    const: "1.0"
+
+  - path: /entry/metadata
+    kind: group
+    required: true
+    rules:
+      required_datasets:
+        - experiment_id
+        - instrument_name
+        - root_dir
+        - output_dir
+        - schema_raw
+        - schema_refs_sub
+        - schema_refs_norm
+        - schema_masks
+        - created_utc
+
+  - path: /entry/runs
+    kind: group
+    required: true
+    rules:
+      required_datasets:
+        - sample_name
+        - config_id
+        - mode
+        - entity
+        - file_path
+
+  - path: /entry/configurations
+    kind: group
+    required: true
+
+  - path_pattern: ^/entry/configurations/[^/]+$
+    kind: group
+    required: false
+    rules:
+      required_datasets:
+        - wavelength
+        - sample_detector_distance
+      optional_datasets:
+        - config_id
+        - notes
+      optional_groups:
+        - collimation
+
+  - path: /entry/references
+    kind: group
+    required: true
+    rules:
+      required_groups:
+        - refs_sub_files
+        - refs_norm_files
+        - masks_files
+
+  - path: /entry/masks
+    kind: group
+    required: true
+
+  - path_pattern: ^/entry/masks/[^/]+/detector\d+$
+    kind: dataset
+    required: false
+
+  - path: /entry/transmissions
+    kind: group
+    required: true
+    rules:
+      required_datasets:
+        - sample_name
+        - config_id
+        - value
+
+  - path: /entry/artifacts
+    kind: group
+    required: true
+    rules:
+      required_datasets:
+        - name
+        - path
+        - kind
+        - created_utc
+
+  - path: /entry/logs
+    kind: group
+    required: true
+    rules:
+      required_datasets:
+        - level
+        - message
+        - where
+        - when_utc
+        - meta_json
+
+  - path: /entry/issues
+    kind: group
+    required: true
+    rules:
+      required_datasets:
+        - level
+        - message
+        - where
+        - key
+        - when_utc
+        - meta_json
+
+  - path: /entry/timings
+    kind: group
+    required: true
+
+  - path: /entry/store
+    kind: group
+    required: true
