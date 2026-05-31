@@ -402,6 +402,13 @@ class WorkflowContext:
             rows=_configurations_rows(self),
         )
 
+    def transmissions_table(self) -> TableView:
+        """Return a notebook-friendly table view of sample transmissions."""
+        return TableView(
+            columns=("sample_name", "config_id", "transmission"),
+            rows=_transmissions_rows(self),
+        )
+
 
 def _write_scalar_dataset(parent: h5py.Group, name: str, value: Any) -> None:
     if isinstance(value, Path):
@@ -673,6 +680,22 @@ def _configurations_rows(workflow_context: WorkflowContext) -> List[Dict[str, st
                 "aperture2_x_gap": _format_value(None if aperture2 is None else aperture2.x_gap),
                 "aperture2_y_gap": _format_value(None if aperture2 is None else aperture2.y_gap),
                 "aperture2_diameter": _format_value(None if aperture2 is None else aperture2.diameter),
+            }
+        )
+    return rows
+
+
+def _transmissions_rows(workflow_context: WorkflowContext) -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+    for (sample_name, config_id), value in sorted(
+        workflow_context.transmissions.items(),
+        key=lambda item: (item[0][0], item[0][1]),
+    ):
+        rows.append(
+            {
+                "sample_name": sample_name,
+                "config_id": config_id,
+                "transmission": _format_value(value),
             }
         )
     return rows
@@ -1470,6 +1493,193 @@ def generate_reference_files_from_workflow_context(ctx: WorkflowContext) -> Work
     return ctx
 
 
+def update_transmissions_from_workflow_context(
+    ctx: WorkflowContext,
+    *,
+    refs_entry_path: str = "/entry",
+) -> WorkflowContext:
+    from scarlet.reduction.transmission import compute_transmission
+
+    if not ctx.runs:
+        raise ValueError("WorkflowContext has no runs")
+
+    all_runs = [(key, path.resolve()) for key, path in ctx.runs.items()]
+    sample_targets = sorted(
+        {
+            (key.config_id, key.sample_name)
+            for key, _ in all_runs
+            if key.entity == "sample" and key.sample_name
+        }
+    )
+    if not sample_targets:
+        ctx.transmissions.clear()
+        return ctx
+
+    count_time_cache: dict[Path, float] = {}
+
+    def _entry_path_from_file(handle: h5py.File, path: Path) -> str:
+        for entry_path in ("/raw_data", "/entry", "/entry0", "/entry1"):
+            if entry_path in handle:
+                return entry_path
+        raise ValueError(f"No entry group found in {path}")
+
+    def _count_time(path: Path) -> float:
+        path = Path(path).resolve()
+        cached = count_time_cache.get(path)
+        if cached is not None:
+            return cached
+
+        handle = ctx.open_h5(path)
+        entry_path = _entry_path_from_file(handle, path)
+        value = float("-inf")
+        for dataset_path in (
+            f"{entry_path}/control/count_time",
+            f"{entry_path}/instrument/monitor0/count_time",
+            f"{entry_path}/instrument/monitor1/count_time",
+            f"{entry_path}/instrument/monitor2/count_time",
+        ):
+            if dataset_path not in handle:
+                continue
+            try:
+                value = float(handle[dataset_path][()])
+                break
+            except Exception:
+                continue
+        count_time_cache[path] = value
+        return value
+
+    def _best_sample_transmission_run(config_id: str, sample_name: str) -> Optional[tuple[RunKey, Path]]:
+        candidates = [
+            (key, path)
+            for key, path in all_runs
+            if key.config_id == config_id
+            and key.entity == "sample"
+            and key.mode == "transmission"
+            and key.sample_name == sample_name
+        ]
+        return max(candidates, key=lambda item: _count_time(item[1]), default=None)
+
+    def _configuration_wavelength(config_id: str, refs_sub_path: Path) -> float:
+        configuration = ctx.configurations.get(config_id)
+        if configuration is not None:
+            try:
+                return float(getattr(configuration, "wavelength"))
+            except Exception:
+                pass
+
+        with h5py.File(refs_sub_path, "r") as refs_file:
+            dataset_path = f"{refs_entry_path}/configuration/wavelength"
+            if dataset_path not in refs_file:
+                raise ValueError(f"Missing configuration wavelength in refs_sub: {dataset_path}")
+            return float(np.asarray(refs_file[dataset_path][()]).reshape(()))
+
+    def _read_text_dataset(group: h5py.Group, dataset_path: str) -> Optional[str]:
+        if dataset_path not in group:
+            return None
+        raw = group[dataset_path][()]
+        if isinstance(raw, (bytes, bytearray, np.bytes_)):
+            return raw.decode(errors="replace")
+        return str(raw)
+
+    ctx.transmissions.clear()
+    direct_values: dict[tuple[str, str], float] = {}
+    wavelength_by_config: dict[str, float] = {}
+
+    config_ids = sorted({config_id for config_id, _ in sample_targets})
+    for config_id in config_ids:
+        refs_sub_path = ctx.refs_sub_files.get(config_id)
+        if refs_sub_path is None:
+            raise ValueError(f"Missing refs_sub for config_id={config_id}")
+        refs_sub_path = refs_sub_path.resolve()
+        wavelength_by_config[config_id] = _configuration_wavelength(config_id, refs_sub_path)
+
+        with h5py.File(refs_sub_path, "r") as refs_file:
+            definition_path = f"{refs_entry_path}/definition"
+            if definition_path not in refs_file:
+                raise ValueError(f"Missing refs_sub definition: {definition_path}")
+            definition = np.asarray(refs_file[definition_path][()]).reshape(()).item()
+            if isinstance(definition, (bytes, bytearray, np.bytes_)):
+                definition = definition.decode(errors="replace")
+            if str(definition) != "SCARLET_refs_sub":
+                raise ValueError(f"Unsupported refs bundle definition: {definition!r}")
+
+            roi_root = f"{refs_entry_path}/transmission_roi"
+            roi = (
+                int(np.asarray(refs_file[f"{roi_root}/x0"][()]).reshape(())),
+                int(np.asarray(refs_file[f"{roi_root}/x1"][()]).reshape(())),
+                int(np.asarray(refs_file[f"{roi_root}/y0"][()]).reshape(())),
+                int(np.asarray(refs_file[f"{roi_root}/y1"][()]).reshape(())),
+            )
+            detector_raw = np.asarray(refs_file[f"{roi_root}/detector"][()]).reshape(()).item()
+            if isinstance(detector_raw, (bytes, bytearray, np.bytes_)):
+                detector_raw = detector_raw.decode(errors="replace")
+            if isinstance(detector_raw, str) and detector_raw.lower().startswith("detector"):
+                detector_number = int(detector_raw[len("detector") :])
+            else:
+                detector_number = int(detector_raw)
+
+            empty_beam_source = _read_text_dataset(refs_file, f"{refs_entry_path}/meta/empty_beam_transmission_source_file")
+            if empty_beam_source is None:
+                raise ValueError(f"refs_sub is missing empty_beam_transmission_source_file for {config_id}")
+            empty_beam_transmission_file = Path(empty_beam_source).resolve()
+
+        config_sample_names = sorted(
+            {
+                sample_name
+                for target_config_id, sample_name in sample_targets
+                if target_config_id == config_id and sample_name is not None
+            }
+        )
+        for sample_name in config_sample_names:
+            transmission_run = _best_sample_transmission_run(config_id, sample_name)
+            if transmission_run is None:
+                continue
+            value = compute_transmission(
+                transmission_run[1],
+                empty_beam_transmission_file,
+                roi,
+                detector_number=detector_number,
+            )
+            ctx.set_transmission(sample_name, config_id, value)
+            direct_values[(sample_name, config_id)] = value
+
+    for config_id, sample_name in sample_targets:
+        if sample_name is None or (sample_name, config_id) in ctx.transmissions:
+            continue
+        wavelength = wavelength_by_config.get(config_id)
+        if wavelength is None:
+            refs_sub_path = ctx.refs_sub_files.get(config_id)
+            if refs_sub_path is None:
+                continue
+            wavelength = _configuration_wavelength(config_id, refs_sub_path)
+            wavelength_by_config[config_id] = wavelength
+
+        fallback_value = None
+        for (other_sample_name, other_config_id), value in sorted(direct_values.items()):
+            if other_sample_name != sample_name or other_config_id == config_id:
+                continue
+            other_wavelength = wavelength_by_config.get(other_config_id)
+            if other_wavelength is None:
+                refs_sub_path = ctx.refs_sub_files.get(other_config_id)
+                if refs_sub_path is None:
+                    continue
+                other_wavelength = _configuration_wavelength(other_config_id, refs_sub_path)
+                wavelength_by_config[other_config_id] = other_wavelength
+            if np.isclose(wavelength, other_wavelength, rtol=0.0, atol=1e-6):
+                fallback_value = value
+                break
+        if fallback_value is not None:
+            ctx.set_transmission(sample_name, config_id, fallback_value)
+        else:
+            ctx.warn(
+                "No transmission file or wavelength-matched fallback found",
+                where="update_transmissions_from_workflow_context",
+                key=f"{config_id}:{sample_name}",
+            )
+
+    return ctx
+
+
 def update_reference_masks_from_workflow_context(
     ctx: WorkflowContext,
     *,
@@ -1591,5 +1801,358 @@ def update_reference_masks_from_workflow_context(
         refs_norm_path = ctx.refs_norm_files.get(config_id)
         if refs_norm_path is not None and refs_norm_path.exists():
             insert_masks_in_refs_file(refs_norm_path, mask=mask_path)
+
+    return ctx
+
+
+def integrate_scattering_from_workflow_context(
+    ctx: WorkflowContext,
+    *,
+    n_bins: int = 200,
+    refs_entry_path: str = "/entry",
+) -> WorkflowContext:
+    from scarlet.reduction import (
+        azimuthal_average,
+        compute_q_norm_map,
+        compute_q_resolution_circular,
+        normalize_by_monitor,
+        normalize_by_solid_angle,
+        subtract_scattering_references,
+    )
+
+    if not ctx.runs:
+        raise ValueError("WorkflowContext has no runs")
+
+    if int(n_bins) <= 0:
+        raise ValueError(f"n_bins must be > 0, got {n_bins!r}")
+
+    ctx.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def _entry_path_from_file(handle: h5py.File, path: Path) -> str:
+        for entry_path in ("/raw_data", "/entry", "/entry0", "/entry1"):
+            if entry_path in handle:
+                return entry_path
+        raise ValueError(f"No entry group found in {path}")
+
+    def _read_monitor_value(handle: h5py.File, entry_path: str, *, path: Path) -> float:
+        dataset_path = f"{entry_path}/control/integral"
+        if dataset_path not in handle:
+            raise ValueError(f"Missing monitor integral in {path}: {dataset_path}")
+        monitor_value = float(np.asarray(handle[dataset_path][()]).reshape(()))
+        if not np.isfinite(monitor_value) or monitor_value <= 0.0:
+            raise ValueError(f"Monitor integral must be > 0 in {path}: {dataset_path}")
+        return monitor_value
+
+    def _available_detectors(path: Path) -> list[int]:
+        path = Path(path).resolve()
+        with h5py.File(path, "r") as handle:
+            entry_path = _entry_path_from_file(handle, path)
+            instrument_path = f"{entry_path}/instrument"
+            if instrument_path not in handle or not isinstance(handle[instrument_path], h5py.Group):
+                raise ValueError(f"Missing instrument group in {path}: {instrument_path}")
+            detector_numbers: list[int] = []
+            for name, group in handle[instrument_path].items():
+                if not isinstance(group, h5py.Group):
+                    continue
+                match = re.fullmatch(r"detector(\d+)", name)
+                if match is None:
+                    continue
+                if f"{instrument_path}/{name}/data" in handle:
+                    detector_numbers.append(int(match.group(1)))
+            if not detector_numbers:
+                raise ValueError(f"No detectorN/data datasets found in {path}")
+            return sorted(detector_numbers)
+
+    def _read_raw_detector_image_and_error(
+        path: Path,
+        detector_number: int,
+    ) -> tuple[np.ndarray, np.ndarray, tuple[float, float]]:
+        path = Path(path).resolve()
+        with h5py.File(path, "r") as handle:
+            entry_path = _entry_path_from_file(handle, path)
+            detector_path = f"{entry_path}/instrument/detector{detector_number}"
+            data_path = f"{detector_path}/data"
+            if data_path not in handle:
+                raise ValueError(f"Missing detector data in {path}: {data_path}")
+            x_pixel_size_path = f"{detector_path}/x_pixel_size"
+            y_pixel_size_path = f"{detector_path}/y_pixel_size"
+            if x_pixel_size_path not in handle or y_pixel_size_path not in handle:
+                raise ValueError(f"Missing pixel size datasets in {path}: {detector_path}")
+
+            raw_data = np.asarray(handle[data_path][()], dtype=np.float64)
+            if raw_data.ndim != 2:
+                raise ValueError(f"Detector data must be 2D in {path}, got shape {raw_data.shape}")
+            monitor_value = _read_monitor_value(handle, entry_path, path=path)
+            normalized = normalize_by_monitor(raw_data, monitor_value)
+            error = np.sqrt(np.clip(raw_data, 0.0, None)) / monitor_value
+            pixel_size = (
+                float(np.asarray(handle[x_pixel_size_path][()]).reshape(())),
+                float(np.asarray(handle[y_pixel_size_path][()]).reshape(())),
+            )
+            return normalized, error, pixel_size
+
+    def _read_reference_detector_image_and_error(
+        refs_file: h5py.File,
+        reference_name: str,
+        detector_number: int,
+    ) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        reference_root = f"{refs_entry_path}/references/{reference_name}/entry"
+        if reference_root not in refs_file or not isinstance(refs_file[reference_root], h5py.Group):
+            return None, None
+        data_path = f"{reference_root}/instrument/detector{detector_number}/data"
+        if data_path not in refs_file:
+            return None, None
+
+        raw_data = np.asarray(refs_file[data_path][()], dtype=np.float64)
+        if raw_data.ndim != 2:
+            raise ValueError(f"Reference detector data must be 2D, got shape {raw_data.shape}")
+        monitor_value = _read_monitor_value(refs_file, reference_root, path=Path(reference_name))
+        normalized = normalize_by_monitor(raw_data, monitor_value)
+        error = np.sqrt(np.clip(raw_data, 0.0, None)) / monitor_value
+        return normalized, error
+
+    def _combine_masks(
+        base_mask: Optional[np.ndarray],
+        invalid_mask: np.ndarray,
+    ) -> np.ndarray:
+        invalid = np.asarray(invalid_mask, dtype=bool)
+        if base_mask is None:
+            return invalid.astype(np.uint8)
+        base = np.asarray(base_mask, dtype=bool)
+        if base.shape != invalid.shape:
+            raise ValueError(f"Mask shape mismatch: expected {invalid.shape}, got {base.shape}")
+        return np.logical_or(base, invalid).astype(np.uint8)
+
+    def _read_beam_center_and_mask(
+        refs_sub_path: Path,
+        detector_number: int,
+    ) -> tuple[tuple[float, float], Optional[np.ndarray]]:
+        with h5py.File(refs_sub_path, "r") as refs_file:
+            beam_center_root = f"{refs_entry_path}/beam_center/detector{detector_number}"
+            beam_center_x_path = f"{beam_center_root}/beam_center_x"
+            beam_center_y_path = f"{beam_center_root}/beam_center_y"
+            if beam_center_x_path not in refs_file or beam_center_y_path not in refs_file:
+                raise ValueError(f"Missing beam center in refs_sub: {beam_center_root}")
+            beam_center = (
+                float(np.asarray(refs_file[beam_center_x_path][()]).reshape(())),
+                float(np.asarray(refs_file[beam_center_y_path][()]).reshape(())),
+            )
+            mask_path = f"{refs_entry_path}/mask/mask_detector{detector_number}"
+            mask = None
+            if mask_path in refs_file:
+                mask = np.asarray(refs_file[mask_path][()], dtype=np.uint8)
+            return beam_center, mask
+
+    def _scalar_detector_distance(configuration: Any, detector_number: int) -> float:
+        value = getattr(configuration, "sample_detector_distance", None)
+        if isinstance(value, list):
+            if len(value) == 1:
+                value = value[0]
+            elif detector_number < len(value):
+                value = value[detector_number]
+            else:
+                raise ValueError(f"Missing detector distance for detector{detector_number}")
+        distance = float(value)
+        if not np.isfinite(distance) or distance <= 0.0:
+            raise ValueError(f"Invalid sample_detector_distance: {value!r}")
+        return distance
+
+    def _empty_cell_transmission_from_context(config_id: str) -> Optional[float]:
+        for key, _ in ctx.iter_runs(config_id=config_id, entity="empty_cell"):
+            if key.sample_name is None:
+                continue
+            value = ctx.get_transmission(key.sample_name, config_id)
+            if value is not None:
+                return float(value)
+        return None
+
+    def _empty_cell_transmission_from_refs(refs_file: h5py.File) -> Optional[float]:
+        dataset_path = f"{refs_entry_path}/references/empty_cell_transmission/entry/sample/transmission"
+        if dataset_path not in refs_file:
+            return None
+        value = float(np.asarray(refs_file[dataset_path][()]).reshape(()))
+        return value if np.isfinite(value) and value > 0.0 else None
+
+    def _sample_transmission(sample_name: str, config_id: str) -> float:
+        value = ctx.get_transmission(sample_name, config_id)
+        if value is None:
+            raise ValueError(f"Missing transmission in workflow context for sample={sample_name!r}, config_id={config_id}")
+        return float(value)
+
+    scattering_runs = [
+        (key, path.resolve())
+        for key, path in ctx.runs.items()
+        if key.entity == "sample" and key.mode == "scattering" and key.sample_name
+    ]
+    if not scattering_runs:
+        raise ValueError("WorkflowContext has no sample scattering runs")
+
+    for key, path in scattering_runs:
+        sample_name = key.sample_name or "sample"
+        config_id = key.config_id
+        refs_sub_path = ctx.refs_sub_files.get(config_id)
+        if refs_sub_path is None:
+            raise ValueError(f"Missing refs_sub for config_id={config_id}")
+        refs_sub_path = refs_sub_path.resolve()
+        refs_norm_path = ctx.refs_norm_files.get(config_id)
+        if refs_norm_path is None:
+            raise ValueError(f"Missing refs_norm for config_id={config_id}")
+        refs_norm_path = refs_norm_path.resolve()
+
+        configuration = ctx.configurations.get(config_id)
+        if configuration is None:
+            raise ValueError(f"Missing configuration for config_id={config_id}")
+        wavelength = float(getattr(configuration, "wavelength"))
+        sample_t = _sample_transmission(sample_name, config_id)
+        for detector_number in _available_detectors(path):
+            detector_distance = _scalar_detector_distance(configuration, detector_number)
+            sample_image, sample_error, pixel_size = _read_raw_detector_image_and_error(path, detector_number)
+            beam_center, mask = _read_beam_center_and_mask(refs_sub_path, detector_number)
+
+            with h5py.File(refs_sub_path, "r") as refs_file:
+                dark_image, dark_error = _read_reference_detector_image_and_error(refs_file, "dark", detector_number)
+                empty_cell_image, empty_cell_error = _read_reference_detector_image_and_error(
+                    refs_file,
+                    "empty_cell_scattering",
+                    detector_number,
+                )
+                empty_beam_image, empty_beam_error = _read_reference_detector_image_and_error(
+                    refs_file,
+                    "empty_beam_scattering",
+                    detector_number,
+                )
+
+                empty_cell_t = None
+                if empty_cell_image is not None:
+                    empty_cell_t = _empty_cell_transmission_from_context(config_id)
+                    if empty_cell_t is None:
+                        empty_cell_t = _empty_cell_transmission_from_refs(refs_file)
+                    if empty_cell_t is None:
+                        raise ValueError(f"Missing empty-cell transmission for config_id={config_id}")
+
+            corrected = subtract_scattering_references(
+                sample_image,
+                sample_t,
+                dark=dark_image,
+                empty_cell=empty_cell_image,
+                empty_cell_transmission=empty_cell_t,
+                empty_beam=empty_beam_image,
+                empty_beam_transmission=1.0 if empty_beam_image is not None else None,
+                distance=detector_distance,
+                beam_center=beam_center,
+            )
+
+            corrected_variance = np.square(sample_error) / (sample_t * sample_t)
+            if dark_error is not None and empty_cell_image is None:
+                corrected_variance += np.square(dark_error) / (sample_t * sample_t)
+            elif dark_error is not None and empty_cell_image is not None and empty_cell_t is not None:
+                corrected_variance += np.square(dark_error) * np.square((1.0 / empty_cell_t) - (1.0 / sample_t))
+            if empty_cell_error is not None and empty_cell_t is not None:
+                corrected_variance += np.square(empty_cell_error) / (empty_cell_t * empty_cell_t)
+            corrected_error = np.sqrt(corrected_variance)
+
+            solid_angle_corrected = normalize_by_solid_angle(
+                corrected,
+                detector_distance=detector_distance,
+                beam_center=beam_center,
+                pixel_size=pixel_size,
+            )
+            solid_angle_correction = normalize_by_solid_angle(
+                np.ones_like(corrected, dtype=np.float64),
+                detector_distance=detector_distance,
+                beam_center=beam_center,
+                pixel_size=pixel_size,
+            )
+            solid_angle_error = corrected_error * solid_angle_correction
+
+            with h5py.File(refs_norm_path, "r") as refs_norm_file:
+                water_corrected_image, _ = _read_reference_detector_image_and_error(
+                    refs_norm_file,
+                    "water_corrected",
+                    detector_number,
+                )
+            if water_corrected_image is None:
+                raise ValueError(
+                    f"Missing water_corrected in refs_norm for config_id={config_id}, detector{detector_number}"
+                )
+            if water_corrected_image.shape != solid_angle_corrected.shape:
+                raise ValueError(
+                    f"water_corrected shape mismatch for detector{detector_number}: "
+                    f"expected {solid_angle_corrected.shape}, got {water_corrected_image.shape}"
+                )
+            invalid_water_mask = ~np.isfinite(water_corrected_image) | (water_corrected_image <= 0.0)
+            solid_angle_corrected = solid_angle_corrected / water_corrected_image
+            solid_angle_error = solid_angle_error / np.abs(water_corrected_image)
+            mask = _combine_masks(mask, invalid_water_mask)
+
+            q_map = compute_q_norm_map(
+                corrected,
+                beam_center=beam_center,
+                detector_distance=detector_distance,
+                pixel_size=pixel_size,
+                wavelength=wavelength,
+            )
+
+            q_error_map = None
+            wavelength_spread = ctx.get("wavelength_spread")
+            collimation = getattr(configuration, "collimation", None)
+            if (
+                wavelength_spread is not None
+                and collimation is not None
+                and getattr(collimation.aperture1, "diameter", None) is not None
+                and getattr(collimation.aperture2, "diameter", None) is not None
+            ):
+                q_error_map = compute_q_resolution_circular(
+                    q_map,
+                    r1=float(collimation.aperture1.diameter),
+                    r2=float(collimation.aperture2.diameter),
+                    collimation_distance=float(collimation.collimation_distance),
+                    distance=detector_distance,
+                    wavelength_spread=float(wavelength_spread),
+                    wavelength=wavelength,
+                    pixel_size=pixel_size,
+                )
+
+            integration = azimuthal_average(
+                solid_angle_corrected,
+                q_map,
+                mask=mask,
+                intensity_error=solid_angle_error,
+                q_error=q_error_map,
+                n_bins=n_bins,
+            )
+
+            valid_bins = integration.counts > 0
+            q_values = integration.q[valid_bins]
+            intensity_values = integration.intensity[valid_bins]
+            intensity_error_values = (
+                np.full_like(q_values, np.nan)
+                if integration.intensity_error is None
+                else integration.intensity_error[valid_bins]
+            )
+            q_error_values = (
+                np.full_like(q_values, np.nan)
+                if integration.q_error is None
+                else integration.q_error[valid_bins]
+            )
+
+            safe_sample_name = re.sub(r"[^A-Za-z0-9._-]+", "_", sample_name).strip("_") or "sample"
+            output_path = (ctx.output_dir / f"{safe_sample_name}_det{detector_number}_{config_id}.txt").resolve()
+            header = "\n".join(
+                (
+                    f"sample_name: {sample_name}",
+                    f"config_id: {config_id}",
+                    f"detector: detector{detector_number}",
+                    f"transmission: {sample_t:.6g}",
+                    "columns: q i i_error q_error",
+                )
+            )
+            np.savetxt(
+                output_path,
+                np.column_stack((q_values, intensity_values, intensity_error_values, q_error_values)),
+                header=header,
+                comments="# ",
+            )
+            ctx.add_artifact(output_path.name, output_path, kind="text")
 
     return ctx

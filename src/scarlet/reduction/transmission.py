@@ -172,114 +172,6 @@ def compute_transmission(
     return sample_value / empty_beam_value
 
 
-def compute_corrected_water_scattering(
-    ref_norm_file: str | Path,
-    *,
-    detector_number: int = 0,
-    refs_entry_path: str = "/entry",
-) -> np.ndarray:
-    """
-    Compute the corrected water-scattering image stored in a SCARLET refs_norm file.
-
-    The computation uses monitor-normalized reference images copied in the bundle:
-
-    ``water_scattering - dark - (empty_beam_scattering - dark)
-       - T_water * (empty_cell_scattering - dark - (empty_beam_scattering - dark))``
-
-    where ``T_water`` is computed from ``water_transmission`` and
-    ``empty_beam_transmission`` using the transmission ROI stored in the refs file.
-    """
-    ref_norm_file = Path(ref_norm_file).resolve()
-    detector_number = int(detector_number)
-    if detector_number < 0:
-        raise ValueError(f"Detector index must be >= 0, got {detector_number}")
-
-    with h5py.File(ref_norm_file, "r") as f:
-        definition_path = f"{refs_entry_path}/definition"
-        if definition_path not in f:
-            raise ValueError(f"Missing refs_norm definition: {definition_path}")
-        definition = np.asarray(f[definition_path][()]).reshape(()).item()
-        if isinstance(definition, (bytes, bytearray)):
-            definition = definition.decode(errors="replace")
-        if str(definition) != "SCARLET_refs_norm":
-            raise ValueError(f"Unsupported reference bundle definition: {definition!r}")
-
-        water_scattering = _read_reference_detector_image(
-            f,
-            "water_scattering",
-            detector_number=detector_number,
-            refs_entry_path=refs_entry_path,
-        )
-        if water_scattering is None:
-            raise ValueError("refs_norm must contain a water_scattering reference")
-
-        dark = _read_reference_detector_image(
-            f,
-            "dark",
-            detector_number=detector_number,
-            refs_entry_path=refs_entry_path,
-        )
-        if dark is None:
-            dark = np.zeros_like(water_scattering, dtype=np.float64)
-        _require_same_shape("dark", water_scattering, dark)
-
-        empty_beam_scattering = _read_reference_detector_image(
-            f,
-            "empty_beam_scattering",
-            detector_number=detector_number,
-            refs_entry_path=refs_entry_path,
-        )
-        if empty_beam_scattering is not None:
-            _require_same_shape("empty_beam_scattering", water_scattering, empty_beam_scattering)
-
-        empty_cell_scattering = _read_reference_detector_image(
-            f,
-            "empty_cell_scattering",
-            detector_number=detector_number,
-            refs_entry_path=refs_entry_path,
-        )
-        if empty_cell_scattering is not None:
-            _require_same_shape("empty_cell_scattering", water_scattering, empty_cell_scattering)
-
-        water_transmission = _read_reference_detector_image(
-            f,
-            "water_transmission",
-            detector_number=detector_number,
-            refs_entry_path=refs_entry_path,
-        )
-        if water_transmission is None:
-            raise ValueError("refs_norm must contain a water_transmission reference")
-        _require_same_shape("water_transmission", water_scattering, water_transmission)
-
-        empty_beam_transmission = _read_reference_detector_image(
-            f,
-            "empty_beam_transmission",
-            detector_number=detector_number,
-            refs_entry_path=refs_entry_path,
-        )
-        if empty_beam_transmission is None:
-            raise ValueError("refs_norm must contain an empty_beam_transmission reference")
-        _require_same_shape("empty_beam_transmission", water_scattering, empty_beam_transmission)
-
-        roi = _read_transmission_roi(f, refs_entry_path=refs_entry_path)
-        water_transmission_value = _roi_sum(water_transmission - dark, roi) / _roi_sum(
-            empty_beam_transmission - dark,
-            roi,
-        )
-
-        water_background_corrected = water_scattering - dark
-        if empty_beam_scattering is not None:
-            water_background_corrected = water_background_corrected - (empty_beam_scattering - dark)
-
-        if empty_cell_scattering is None:
-            return water_background_corrected
-
-        empty_cell_corrected = empty_cell_scattering - dark
-        if empty_beam_scattering is not None:
-            empty_cell_corrected = empty_cell_corrected - (empty_beam_scattering - dark)
-        return water_background_corrected - water_transmission_value * empty_cell_corrected
-
-
 def _write_sample_transmission(entry_group: h5py.Group, value: float) -> None:
     sample_group = entry_group.require_group("sample")
     sample_group.attrs["NX_class"] = np.bytes_("NXsample")
@@ -315,20 +207,10 @@ def _compute_reference_transmission_value(
         raise ValueError("Missing empty_beam_transmission reference")
     _require_same_shape("empty_beam_transmission", transmission_image, empty_beam_transmission)
 
-    dark = _read_reference_detector_image(
-        refs_file,
-        "dark",
-        detector_number=detector_number,
-        refs_entry_path=refs_entry_path,
-    )
-    if dark is None:
-        dark = np.zeros_like(transmission_image, dtype=np.float64)
-    _require_same_shape("dark", transmission_image, dark)
-
-    empty_beam_roi_sum = _roi_sum(empty_beam_transmission - dark, roi)
+    empty_beam_roi_sum = _roi_sum(empty_beam_transmission, roi)
     if empty_beam_roi_sum == 0.0:
         raise ValueError("Cannot compute transmission: empty-beam ROI sum is zero")
-    return _roi_sum(transmission_image - dark, roi) / empty_beam_roi_sum
+    return _roi_sum(transmission_image, roi) / empty_beam_roi_sum
 
 
 def compute_reference_transmissions(

@@ -16,6 +16,35 @@ class AzimuthalAverageResult:
     q_error: np.ndarray | None
     counts: np.ndarray
 
+def regiso(image, mask, x0, y0, x_pixel_size, y_pixel_size, bins=None, error=None):
+    y, x = np.indices(image.shape, dtype='float')
+    y = (y-y0)*y_pixel_size
+    x = (x-x0)*x_pixel_size
+    r_grid = np.ma.masked_array(data=np.sqrt(x**2+y**2), mask=mask).compressed()
+    masked_data = np.ma.masked_array(data=image, mask=mask, dtype='float').compressed()
+    # masked_data = np.ma.masked_invalid(masked_data)
+    if bins is None:
+        maxd = np.max(r_grid)
+        bins = len(np.arange(0, maxd))
+    edges = np.histogram_bin_edges(r_grid, bins=bins)
+    # edges = np.arange(np.max(r_grid))
+    indexes = np.digitize(r_grid, edges, right=False)
+    counts = np.bincount(indexes)[1:]
+    r_mean = np.bincount(indexes, weights=r_grid)[1:]/counts
+    r_square = np.bincount(indexes, weights=r_grid**2)[1:]/counts
+    intensity = np.bincount(indexes, weights=masked_data)[1:]/counts
+    if error is None:
+        di = np.sqrt(intensity*counts)/counts
+    else:
+        masked_error = np.ma.masked_array(data=error, mask=mask, dtype='float').compressed()
+        di = np.sqrt(np.bincount(indexes, weights=masked_error**2)[1:]) / counts
+    # TODO: check error bar on r
+    dr = np.sqrt(r_square-r_mean**2+1/12)  # 1/12 is the variance of one pixel
+    # dr = np.sqrt(r_square - r_mean ** 2 + 1 / 12)
+    d = {'counts': np.bincount(indexes), 'edges': edges, 'indexes': indexes, 'r_grid': r_grid,
+         'masked_data':  masked_data}
+    return r_mean, intensity, di, dr
+
 
 def azimuthal_average(
     image: Any,
@@ -85,11 +114,13 @@ def azimuthal_average(
         edge_padding = max(abs(q_min_value), 1.0) * 1e-12
         q_min_value -= edge_padding
         q_max_value += edge_padding
-    bin_edges = np.linspace(q_min_value, q_max_value, int(n_bins) + 1, dtype=np.float64)
+    bin_edges = np.histogram_bin_edges(q_values, bins=int(n_bins))
+    indexes = np.digitize(q_values, bin_edges, right=False)
+    indexes = np.clip(indexes, 1, int(n_bins))
 
-    counts, _ = np.histogram(q_values, bins=bin_edges)
-    intensity_sum, _ = np.histogram(q_values, bins=bin_edges, weights=image_values)
-    q_sum, _ = np.histogram(q_values, bins=bin_edges, weights=q_values)
+    counts = np.bincount(indexes, minlength=int(n_bins) + 1)[1:]
+    q_sum = np.bincount(indexes, weights=q_values, minlength=int(n_bins) + 1)[1:]
+    intensity_sum = np.bincount(indexes, weights=image_values, minlength=int(n_bins) + 1)[1:]
 
     intensity = np.full(int(n_bins), np.nan, dtype=np.float64)
     q_binned = np.full(int(n_bins), np.nan, dtype=np.float64)
@@ -99,11 +130,11 @@ def azimuthal_average(
 
     if intensity_error_array is not None:
         error_values = intensity_error_array[valid].ravel()
-        variance_sum, _ = np.histogram(
-            q_values,
-            bins=bin_edges,
+        variance_sum = np.bincount(
+            indexes,
             weights=np.square(error_values),
-        )
+            minlength=int(n_bins) + 1,
+        )[1:]
         binned_intensity_error = np.full(int(n_bins), np.nan, dtype=np.float64)
         binned_intensity_error[non_empty] = np.sqrt(variance_sum[non_empty]) / counts[non_empty]
     else:
@@ -111,11 +142,11 @@ def azimuthal_average(
 
     if q_error_array is not None:
         q_error_values = q_error_array[valid].ravel()
-        q_variance_sum, _ = np.histogram(
-            q_values,
-            bins=bin_edges,
+        q_variance_sum = np.bincount(
+            indexes,
             weights=np.square(q_error_values),
-        )
+            minlength=int(n_bins) + 1,
+        )[1:]
         binned_q_error = np.full(int(n_bins), np.nan, dtype=np.float64)
         binned_q_error[non_empty] = np.sqrt(q_variance_sum[non_empty]) / counts[non_empty]
     else:

@@ -1,0 +1,13 @@
+Je veux que fichiers scattering soit normaliser par leur moniteur.
+L'image normalisée est soustraite par le ref_sub file grâce au fonction dans le module correction. Il faut que les images des fichiers de references soit normalisée par leur monituer respectif avec la soustraction. Les valeurs des transmissions nécessaire à la soustraction sont à prendre dans les attributs du workflow.
+Ensuite, les images soustraites sont normalisées par l'angle solide avec la fonction présente dans le module correction.
+
+On fait ensuite le regroupement azimutal des données grâce au module integration.py.
+
+Le résultats de l'intégration est un fichiers texte 4 colonnes (q,i,i_error, q_error) avec un header qui décrit le nom de l'échantillon, le nom de la config et la valeur de sa transmission.Je veux que fichiers scattering soit normaliser par leur moniteur.
+L'image normalisée est soustraite par le ref_sub file grâce au fonction dans le module correction. Il faut que les images des fichiers de references soit normalisée par leur monituer respectif avec la soustraction. Les valeurs des transmissions nécessaire à la soustraction sont à prendre dans les attributs du workflow.
+Ensuite, les images soustraites sont normalisées par l'angle solide avec la fonction présente dans le module correction.
+
+On fait ensuite le regroupement azimutal des données grâce au module integration.py.
+
+Le résultats de l'intégration est un fichiers texte 4 colonnes (q,i,i_error, q_error) avec un header qui décrit le nom de l'échantillon, le nom de la config et la valeur de sa transmission.

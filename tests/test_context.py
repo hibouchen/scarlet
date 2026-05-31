@@ -13,14 +13,89 @@ from scarlet.workflow.context import (
     RunKey,
     WorkflowContext,
     generate_reference_files_from_workflow_context,
+    integrate_scattering_from_workflow_context,
     load_workflow_context,
     save_workflow_context,
     update_reference_masks_from_workflow_context,
+    update_transmissions_from_workflow_context,
     update_workflow_context_from_runs_report_csv,
     write_runs_report_csv,
 )
+from scarlet.workflow.reference import write_refs_norm_file, write_refs_sub_file
 
 from test_workflow_configuration import _write_minimal_masks_file, _write_minimal_raw_nexus_file
+
+
+def _write_transmission_file(
+    path: Path,
+    *,
+    data: np.ndarray,
+    monitor_integral: float,
+    entry_name: str = "entry",
+) -> None:
+    with h5py.File(path, "w") as f:
+        entry = f.create_group(entry_name)
+        entry.attrs["NX_class"] = b"NXentry"
+        control = entry.create_group("control")
+        control.attrs["NX_class"] = b"NXmonitor"
+        control.create_dataset("integral", data=float(monitor_integral))
+        control.create_dataset("count_time", data=1.0)
+        instrument = entry.create_group("instrument")
+        instrument.attrs["NX_class"] = b"NXinstrument"
+        detector = instrument.create_group("detector0")
+        detector.attrs["NX_class"] = b"NXdetector"
+        detector.create_dataset("data", data=np.asarray(data, dtype=np.float64))
+
+
+def _write_scattering_file(
+    path: Path,
+    *,
+    data: np.ndarray,
+    monitor_integral: float,
+    pixel_size_m: tuple[float, float] = (0.0005, 0.0005),
+    extra_detectors: dict[int, np.ndarray] | None = None,
+) -> None:
+    with h5py.File(path, "w") as f:
+        entry = f.create_group("entry")
+        entry.attrs["NX_class"] = b"NXentry"
+        sample = entry.create_group("sample")
+        sample.attrs["NX_class"] = b"NXsample"
+        sample.create_dataset("name", data=np.bytes_(path.stem))
+        control = entry.create_group("control")
+        control.attrs["NX_class"] = b"NXmonitor"
+        control.create_dataset("integral", data=float(monitor_integral))
+        control.create_dataset("count_time", data=1.0)
+        instrument = entry.create_group("instrument")
+        instrument.attrs["NX_class"] = b"NXinstrument"
+        detector = instrument.create_group("detector0")
+        detector.attrs["NX_class"] = b"NXdetector"
+        detector.create_dataset("data", data=np.asarray(data, dtype=np.float64))
+        detector.create_dataset("x_pixel_size", data=float(pixel_size_m[0]))
+        detector.create_dataset("y_pixel_size", data=float(pixel_size_m[1]))
+        for detector_number, detector_data in sorted((extra_detectors or {}).items()):
+            extra_detector = instrument.create_group(f"detector{int(detector_number)}")
+            extra_detector.attrs["NX_class"] = b"NXdetector"
+            extra_detector.create_dataset("data", data=np.asarray(detector_data, dtype=np.float64))
+            extra_detector.create_dataset("x_pixel_size", data=float(pixel_size_m[0]))
+            extra_detector.create_dataset("y_pixel_size", data=float(pixel_size_m[1]))
+
+
+def _write_constant_water_corrected(refs_norm_path: Path, *, values: dict[int, float]) -> None:
+    with h5py.File(refs_norm_path, "r+") as f:
+        references = f["/entry/references"]
+        if "water_corrected" in references:
+            del references["water_corrected"]
+        f.copy("/entry/references/water_scattering", references, name="water_corrected")
+        corrected_entry = f["/entry/references/water_corrected/entry"]
+        control = corrected_entry["control"]
+        if "integral" in control:
+            del control["integral"]
+        control.create_dataset("integral", data=1.0)
+        for detector_number, value in sorted(values.items()):
+            detector = corrected_entry[f"instrument/detector{detector_number}"]
+            shape = detector["data"].shape
+            del detector["data"]
+            detector.create_dataset("data", data=np.full(shape, float(value), dtype=np.float64))
 
 
 class TestWorkflowContextRunsReport(unittest.TestCase):
@@ -184,6 +259,23 @@ class TestWorkflowContextRunsReport(unittest.TestCase):
         self.assertEqual(table.rows[0]["aperture2_diameter"], "0.004")
         self.assertIn("<table>", table._repr_html_())
 
+    def test_transmissions_table_displays_sample_transmissions(self) -> None:
+        ctx = WorkflowContext()
+        ctx.set_transmission("polymer", "config_2", 0.75)
+        ctx.set_transmission("water", "config_1", 0.5)
+
+        table = ctx.transmissions_table()
+
+        self.assertEqual(table.columns, ("sample_name", "config_id", "transmission"))
+        self.assertEqual(len(table.rows), 2)
+        self.assertEqual(table.rows[0]["sample_name"], "polymer")
+        self.assertEqual(table.rows[0]["config_id"], "config_2")
+        self.assertEqual(table.rows[0]["transmission"], "0.75")
+        self.assertEqual(table.rows[1]["sample_name"], "water")
+        self.assertEqual(table.rows[1]["config_id"], "config_1")
+        self.assertEqual(table.rows[1]["transmission"], "0.5")
+        self.assertIn("<table>", table._repr_html_())
+
     def test_generate_reference_files_from_workflow_context_refreshes_refs_properties(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -266,6 +358,242 @@ class TestWorkflowContextRunsReport(unittest.TestCase):
                 np.testing.assert_array_equal(f["/entry/mask/mask_detector0"][()], mask0)
             with h5py.File(ctx.get_refs_norm_path("config_1"), "r") as f:
                 np.testing.assert_array_equal(f["/entry/mask/mask_detector0"][()], mask0)
+
+    def test_update_transmissions_from_workflow_context_uses_refs_sub_and_wavelength_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            refs_dir = root / "refs"
+            refs_dir.mkdir()
+
+            empty_beam_cfg1 = root / "empty_beam_cfg1.nxs"
+            empty_beam_cfg2 = root / "empty_beam_cfg2.nxs"
+            sample_transmission_cfg1 = root / "sample_transmission_cfg1.nxs"
+            sample_scattering_cfg1 = root / "sample_scattering_cfg1.nxs"
+            sample_scattering_cfg2 = root / "sample_scattering_cfg2.nxs"
+
+            empty_beam_data = np.zeros((4, 4), dtype=np.float64)
+            empty_beam_data[1:3, 1:3] = 100.0
+            sample_transmission_data = np.zeros((4, 4), dtype=np.float64)
+            sample_transmission_data[1:3, 1:3] = 50.0
+            sample_scattering_data = np.zeros((4, 4), dtype=np.float64)
+            sample_scattering_data[1:3, 1:3] = 10.0
+
+            _write_transmission_file(empty_beam_cfg1, data=empty_beam_data, monitor_integral=10.0)
+            _write_transmission_file(empty_beam_cfg2, data=empty_beam_data, monitor_integral=10.0)
+            _write_transmission_file(sample_transmission_cfg1, data=sample_transmission_data, monitor_integral=10.0)
+            _write_transmission_file(sample_scattering_cfg1, data=sample_scattering_data, monitor_integral=10.0)
+            _write_transmission_file(sample_scattering_cfg2, data=sample_scattering_data, monitor_integral=10.0)
+
+            configuration_1 = Configuration(
+                wavelength=6.0,
+                sample_detector_distance=4.2,
+                config_id="config_1",
+                collimation=Collimation(
+                    aperture1=Aperture(type="slit", x_gap=0.002, y_gap=0.003),
+                    aperture2=Aperture(type="pinhole", diameter=0.004),
+                    collimation_distance=1.5,
+                    last_aperture_to_sample_distance=0.5,
+                ),
+            )
+            configuration_2 = Configuration(
+                wavelength=6.0,
+                sample_detector_distance=1.2,
+                config_id="config_2",
+                collimation=Collimation(
+                    aperture1=Aperture(type="slit", x_gap=0.002, y_gap=0.003),
+                    aperture2=Aperture(type="pinhole", diameter=0.004),
+                    collimation_distance=1.5,
+                    last_aperture_to_sample_distance=0.5,
+                ),
+            )
+
+            refs_sub_cfg1 = write_refs_sub_file(
+                refs_dir / "refs_sub_config_1.nxs",
+                configuration_1,
+                empty_beam_transmission=empty_beam_cfg1,
+                transmission_roi_detector=0,
+                transmission_roi=(1, 3, 1, 3),
+                beam_centers={0: (1.0, 1.0)},
+                overwrite=True,
+            ).resolve()
+            refs_sub_cfg2 = write_refs_sub_file(
+                refs_dir / "refs_sub_config_2.nxs",
+                configuration_2,
+                empty_beam_transmission=empty_beam_cfg2,
+                transmission_roi_detector=0,
+                transmission_roi=(1, 3, 1, 3),
+                beam_centers={0: (1.0, 1.0)},
+                overwrite=True,
+            ).resolve()
+
+            ctx = WorkflowContext(root_dir=root, output_dir=root / "out")
+            ctx.configurations["config_1"] = configuration_1
+            ctx.configurations["config_2"] = configuration_2
+            ctx.set_refs_sub("config_1", refs_sub_cfg1)
+            ctx.set_refs_sub("config_2", refs_sub_cfg2)
+            ctx.add_run(
+                RunKey(config_id="config_1", entity="sample", mode="scattering", sample_name="polymer"),
+                sample_scattering_cfg1,
+            )
+            ctx.add_run(
+                RunKey(config_id="config_1", entity="sample", mode="transmission", sample_name="polymer"),
+                sample_transmission_cfg1,
+            )
+            ctx.add_run(
+                RunKey(config_id="config_2", entity="sample", mode="scattering", sample_name="polymer"),
+                sample_scattering_cfg2,
+            )
+
+            out = update_transmissions_from_workflow_context(ctx)
+
+            self.assertIs(out, ctx)
+            self.assertAlmostEqual(ctx.get_transmission("polymer", "config_1") or 0.0, 0.5)
+            self.assertAlmostEqual(ctx.get_transmission("polymer", "config_2") or 0.0, 0.5)
+
+    def test_integrate_scattering_from_workflow_context_writes_four_column_text(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            output_dir = root / "out"
+            output_dir.mkdir()
+            refs_dir = root / "refs"
+            refs_dir.mkdir()
+
+            sample_scattering = root / "sample_scattering.nxs"
+            empty_beam_transmission = root / "empty_beam_transmission.nxs"
+            empty_cell_transmission = root / "empty_cell_transmission.nxs"
+            empty_cell_scattering = root / "empty_cell_scattering.nxs"
+            water_scattering = root / "water_scattering.nxs"
+            water_transmission = root / "water_transmission.nxs"
+            dark = root / "dark.nxs"
+
+            scattering_data = np.zeros((5, 5), dtype=np.float64)
+            scattering_data[2, 2] = 100.0
+            scattering_data[1:4, 1:4] += 10.0
+            detector1_data = np.zeros((5, 5), dtype=np.float64)
+            detector1_data[2, 1:4] = 40.0
+            _write_scattering_file(
+                sample_scattering,
+                data=scattering_data,
+                monitor_integral=20.0,
+                extra_detectors={1: detector1_data},
+            )
+
+            reference_data = np.zeros((5, 5), dtype=np.float64)
+            reference_data[2:4, 2:4] = 50.0
+            _write_transmission_file(empty_beam_transmission, data=reference_data + 50.0, monitor_integral=10.0)
+            _write_transmission_file(empty_cell_transmission, data=reference_data + 25.0, monitor_integral=10.0)
+            _write_transmission_file(empty_cell_scattering, data=np.full((5, 5), 5.0, dtype=np.float64), monitor_integral=5.0)
+            _write_transmission_file(water_scattering, data=np.full((5, 5), 8.0, dtype=np.float64), monitor_integral=4.0)
+            _write_transmission_file(water_transmission, data=np.full((5, 5), 8.0, dtype=np.float64), monitor_integral=4.0)
+            _write_transmission_file(dark, data=np.full((5, 5), 1.0, dtype=np.float64), monitor_integral=5.0)
+
+            configuration = Configuration(
+                wavelength=6.0,
+                sample_detector_distance=4.2,
+                config_id="config_1",
+                collimation=Collimation(
+                    aperture1=Aperture(type="pinhole", diameter=0.002),
+                    aperture2=Aperture(type="pinhole", diameter=0.001),
+                    collimation_distance=1.5,
+                    last_aperture_to_sample_distance=0.5,
+                ),
+            )
+
+            refs_sub_path = write_refs_sub_file(
+                refs_dir / "refs_sub_config_1.nxs",
+                configuration,
+                empty_beam_transmission=empty_beam_transmission,
+                dark=dark,
+                empty_cell_transmission=empty_cell_transmission,
+                empty_cell_scattering=empty_cell_scattering,
+                transmission_roi_detector=0,
+                transmission_roi=(1, 4, 1, 4),
+                beam_centers={0: (2.0, 2.0), 1: (2.0, 2.0)},
+                overwrite=True,
+            ).resolve()
+            refs_norm_path = write_refs_norm_file(
+                refs_dir / "refs_norm_config_1.nxs",
+                configuration,
+                water_scattering=water_scattering,
+                water_transmission=water_transmission,
+                dark=dark,
+                empty_beam_transmission=empty_beam_transmission,
+                empty_cell_scattering=empty_cell_scattering,
+                transmission_roi_detector=0,
+                transmission_roi=(1, 4, 1, 4),
+                masks={0: np.zeros((5, 5), dtype=np.uint8), 1: np.zeros((5, 5), dtype=np.uint8)},
+                overwrite=True,
+            ).resolve()
+            with h5py.File(refs_norm_path, "r+") as f:
+                for reference_name, value in (
+                    ("water_scattering", 8.0),
+                    ("dark", 1.0),
+                    ("empty_cell_scattering", 5.0),
+                ):
+                    if f"/entry/references/{reference_name}/entry/instrument/detector1" in f:
+                        continue
+                    instrument = f[f"/entry/references/{reference_name}/entry/instrument"]
+                    det1 = instrument.create_group("detector1")
+                    det1.attrs["NX_class"] = b"NXdetector"
+                    det1.create_dataset("data", data=np.full((5, 5), value, dtype=np.float64))
+                if "/entry/references/empty_beam_transmission/entry/instrument/detector1" not in f:
+                    instrument = f["/entry/references/empty_beam_transmission/entry/instrument"]
+                    det1 = instrument.create_group("detector1")
+                    det1.attrs["NX_class"] = b"NXdetector"
+                    det1.create_dataset("data", data=np.full((5, 5), 10.0, dtype=np.float64))
+            _write_constant_water_corrected(refs_norm_path, values={0: 1.0, 1: 1.0})
+
+            ctx = WorkflowContext(root_dir=root, output_dir=output_dir)
+            ctx.configurations["config_1"] = configuration
+            ctx.set_refs_sub("config_1", refs_sub_path)
+            ctx.set_refs_norm("config_1", refs_norm_path)
+            ctx.set_transmission("sampleA", "config_1", 0.5)
+            ctx.set_transmission("empty_cell_A", "config_1", 0.8)
+            ctx.set("wavelength_spread", 0.6)
+            ctx.add_run(
+                RunKey(config_id="config_1", entity="sample", mode="scattering", sample_name="sampleA"),
+                sample_scattering,
+            )
+            ctx.add_run(
+                RunKey(config_id="config_1", entity="empty_cell", mode="transmission", sample_name="empty_cell_A"),
+                empty_cell_transmission,
+            )
+
+            out = integrate_scattering_from_workflow_context(ctx, n_bins=8)
+
+            self.assertIs(out, ctx)
+            generated0 = output_dir / "sampleA_det0_config_1.txt"
+            generated1 = output_dir / "sampleA_det1_config_1.txt"
+            self.assertTrue(generated0.exists())
+            self.assertTrue(generated1.exists())
+
+            content0 = generated0.read_text(encoding="utf-8")
+            self.assertIn("sample_name: sampleA", content0)
+            self.assertIn("config_id: config_1", content0)
+            self.assertIn("detector: detector0", content0)
+            self.assertIn("transmission: 0.5", content0)
+
+            content1 = generated1.read_text(encoding="utf-8")
+            self.assertIn("detector: detector1", content1)
+
+            data0 = np.loadtxt(generated0)
+            data1 = np.loadtxt(generated1)
+            self.assertEqual(data0.shape[1], 4)
+            self.assertEqual(data1.shape[1], 4)
+            self.assertTrue(np.all(np.isfinite(data0)))
+            self.assertTrue(np.all(np.isfinite(data1)))
+
+            baseline0 = data0.copy()
+            baseline1 = data1.copy()
+
+            _write_constant_water_corrected(refs_norm_path, values={0: 2.0, 1: 2.0})
+            integrate_scattering_from_workflow_context(ctx, n_bins=8)
+            divided0 = np.loadtxt(generated0)
+            divided1 = np.loadtxt(generated1)
+            np.testing.assert_allclose(divided0[:, 1], baseline0[:, 1] / 2.0)
+            np.testing.assert_allclose(divided1[:, 1], baseline1[:, 1] / 2.0)
+            np.testing.assert_allclose(divided0[:, 2], baseline0[:, 2] / 2.0)
+            np.testing.assert_allclose(divided1[:, 2], baseline1[:, 2] / 2.0)
 
     def test_update_root_dir_rebases_registered_run_paths(self) -> None:
         with tempfile.TemporaryDirectory() as td:

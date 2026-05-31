@@ -22,6 +22,7 @@ from scarlet.workflow.configuration import (
     configuration_from_nexus,
     insert_beam_centers_in_refs_file,
     insert_masks_in_refs_file,
+    update_detector0_beam_center_from_empty_beam_transmission,
     write_refs_norm_file,
     write_refs_sub_file,
 )
@@ -587,6 +588,48 @@ class TestConfigurationFromNexus(unittest.TestCase):
                 self.assertAlmostEqual(float(f["/entry/beam_center/detector0/beam_center_y"][()]), 21.5)
                 self.assertAlmostEqual(float(f["/entry/beam_center/detector1/beam_center_x"][()]), 7.25)
                 self.assertAlmostEqual(float(f["/entry/beam_center/detector1/beam_center_y"][()]), 8.75)
+
+    def test_update_detector0_beam_center_from_empty_beam_transmission_uses_roi_center_of_mass(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            out = root / "refs_sub.nxs"
+            ebt = root / "empty_beam_transmission.nxs"
+            _write_minimal_raw_nexus_file(
+                ebt,
+                sample_name="empty_beam_open",
+                beam_centers={0: (1.0, 1.0)},
+            )
+            with h5py.File(ebt, "r+") as f:
+                data = np.zeros((7, 7), dtype=np.float64)
+                data[2, 3] = 2.0
+                data[4, 4] = 1.0
+                f["/entry/instrument/detector0/data"][...] = data
+
+            configuration = Configuration(
+                wavelength=6.0,
+                sample_detector_distance=4.2,
+                config_id="cfg-1",
+                collimation=Collimation(
+                    aperture1=Aperture(type="slit", x_gap=0.002, y_gap=0.003),
+                    aperture2=Aperture(type="pinhole", diameter=0.004),
+                    collimation_distance=1.5,
+                    last_aperture_to_sample_distance=0.5,
+                ),
+            )
+            write_refs_sub_file(
+                out,
+                configuration,
+                empty_beam_transmission=ebt,
+                transmission_roi_detector=0,
+                transmission_roi=(1, 5, 1, 5),
+                beam_centers={0: (0.0, 0.0)},
+            )
+
+            update_detector0_beam_center_from_empty_beam_transmission(out)
+
+            with h5py.File(out, "r") as f:
+                self.assertAlmostEqual(float(f["/entry/beam_center/detector0/beam_center_x"][()]), 10.0 / 3.0)
+                self.assertAlmostEqual(float(f["/entry/beam_center/detector0/beam_center_y"][()]), 8.0 / 3.0)
 
     def test_insert_masks_in_refs_norm_file_writes_single_mask_per_detector(self) -> None:
         schema = load_schema("scarlet_refs_norm_v1.0.yaml")

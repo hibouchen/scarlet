@@ -379,8 +379,11 @@ def _normalize_mask_array(mask: Union[np.ndarray, str, Path], *, label: str) -> 
 
 
 from .reference import (
+    compute_corrected_water_scattering,
     insert_beam_centers_in_refs_file,
     insert_masks_in_refs_file,
+    update_detector0_beam_center_from_empty_beam_transmission,
+    write_corrected_water_scattering,
     write_refs_norm_file,
     write_refs_sub_file,
 )

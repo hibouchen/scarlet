@@ -16,7 +16,6 @@ from .geometry import (
 from .integration import AzimuthalAverageResult, azimuthal_average
 from .resolution import compute_q_resolution_circular
 from .transmission import (
-    compute_corrected_water_scattering,
     compute_reference_transmissions,
     compute_transmission,
 )
@@ -34,7 +33,6 @@ __all__ = [
     "normalize_by_monitor",
     "normalize_by_solid_angle",
     "subtract_scattering_references",
-    "compute_corrected_water_scattering",
     "compute_reference_transmissions",
     "compute_transmission",
 ]

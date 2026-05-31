@@ -8,6 +8,75 @@ import h5py
 import numpy as np
 
 
+def update_detector0_beam_center_from_empty_beam_transmission(
+    file_path: Union[str, Path],
+    *,
+    entry_path: str = "/entry",
+) -> Path:
+    from scarlet.reduction.transmission import _resolve_entry_path, _read_transmission_roi
+
+    file_path = Path(file_path)
+    if not file_path.exists():
+        raise FileNotFoundError(f"Reference bundle not found: {file_path}")
+
+    with h5py.File(file_path, "r") as refs_file:
+        if entry_path not in refs_file or not isinstance(refs_file[entry_path], h5py.Group):
+            raise ValueError(f"Missing entry group: {entry_path}")
+        entry = refs_file[entry_path]
+        if "definition" not in entry:
+            raise ValueError(f"Missing {entry_path}/definition")
+        definition_raw = entry["definition"][()]
+        definition = (
+            definition_raw.decode(errors="replace")
+            if isinstance(definition_raw, (bytes, bytearray))
+            else str(definition_raw)
+        )
+        if definition != "SCARLET_refs_sub":
+            raise ValueError(f"Unsupported refs bundle definition: {definition!r}")
+
+        source_dataset_path = f"{entry_path}/meta/empty_beam_transmission_source_file"
+        if source_dataset_path not in refs_file:
+            raise ValueError(f"Missing source file dataset: {source_dataset_path}")
+        source_raw = np.asarray(refs_file[source_dataset_path][()]).reshape(()).item()
+        if isinstance(source_raw, (bytes, bytearray)):
+            source_raw = source_raw.decode(errors="replace")
+        empty_beam_transmission_file = Path(str(source_raw)).resolve()
+        roi = _read_transmission_roi(refs_file, refs_entry_path=entry_path)
+
+    if not empty_beam_transmission_file.exists():
+        raise FileNotFoundError(f"Empty-beam transmission source not found: {empty_beam_transmission_file}")
+
+    x0, x1, y0, y1 = roi
+    with h5py.File(empty_beam_transmission_file, "r") as source_file:
+        source_entry_path = _resolve_entry_path(source_file)
+        data_path = f"{source_entry_path}/instrument/detector0/data"
+        if data_path not in source_file:
+            raise ValueError(f"Missing detector0 data in {empty_beam_transmission_file}: {data_path}")
+        data = np.asarray(source_file[data_path][()], dtype=np.float64)
+        if data.ndim != 2:
+            raise ValueError(f"detector0 data must be 2D, got shape {data.shape}")
+        if not (0 <= x0 < x1 <= data.shape[1] and 0 <= y0 < y1 <= data.shape[0]):
+            raise ValueError(f"Invalid ROI {roi} for detector0 data shape {data.shape}")
+
+        roi_data = data[y0:y1, x0:x1]
+        roi_sum = float(np.sum(roi_data, dtype=np.float64))
+        if not np.isfinite(roi_sum) or roi_sum <= 0.0:
+            raise ValueError(f"ROI sum must be > 0 to compute beam center, got {roi_sum!r}")
+
+        x_coords = np.arange(x0, x1, dtype=np.float64)
+        y_coords = np.arange(y0, y1, dtype=np.float64)
+        beam_center_x = float(np.sum(roi_data * x_coords[np.newaxis, :], dtype=np.float64) / roi_sum)
+        beam_center_y = float(np.sum(roi_data * y_coords[:, np.newaxis], dtype=np.float64) / roi_sum)
+
+    return insert_beam_centers_in_refs_file(
+        file_path,
+        0,
+        beam_center_x,
+        beam_center_y,
+        entry_path=entry_path,
+    )
+
+
 def insert_beam_centers_in_refs_file(
     file_path: Union[str, Path],
     detector_number: int,
@@ -173,6 +242,245 @@ def insert_masks_in_refs_file(
         _cfg._replace_dataset(meta, "mask_convention", mask_convention)
 
     return file_path
+
+
+def compute_corrected_water_scattering(
+    ref_norm_file: Union[str, Path],
+    *,
+    detector_number: int = 0,
+    entry_path: str = "/entry",
+) -> np.ndarray:
+    from scarlet.reduction.transmission import (
+        _read_reference_detector_image,
+        _read_transmission_roi,
+        _read_transmission_roi_detector,
+        _roi_sum,
+        _require_same_shape,
+    )
+
+    ref_norm_file = Path(ref_norm_file).resolve()
+    detector_number = int(detector_number)
+    if detector_number < 0:
+        raise ValueError(f"Detector index must be >= 0, got {detector_number}")
+
+    with h5py.File(ref_norm_file, "r") as f:
+        if entry_path not in f or not isinstance(f[entry_path], h5py.Group):
+            raise ValueError(f"Missing entry group: {entry_path}")
+        entry = f[entry_path]
+        if "definition" not in entry:
+            raise ValueError(f"Missing {entry_path}/definition")
+        definition_raw = entry["definition"][()]
+        definition = (
+            definition_raw.decode(errors="replace")
+            if isinstance(definition_raw, (bytes, bytearray))
+            else str(definition_raw)
+        )
+        if definition != "SCARLET_refs_norm":
+            raise ValueError(f"Unsupported reference bundle definition: {definition!r}")
+
+        water_scattering = _read_reference_detector_image(
+            f,
+            "water_scattering",
+            detector_number=detector_number,
+            refs_entry_path=entry_path,
+        )
+        if water_scattering is None:
+            raise ValueError("refs_norm must contain a water_scattering reference")
+
+        dark = _read_reference_detector_image(
+            f,
+            "dark",
+            detector_number=detector_number,
+            refs_entry_path=entry_path,
+        )
+        if dark is None:
+            dark = np.zeros_like(water_scattering, dtype=np.float64)
+        _require_same_shape("dark", water_scattering, dark)
+
+        empty_beam_scattering = _read_reference_detector_image(
+            f,
+            "empty_beam_scattering",
+            detector_number=detector_number,
+            refs_entry_path=entry_path,
+        )
+        if empty_beam_scattering is not None:
+            _require_same_shape("empty_beam_scattering", water_scattering, empty_beam_scattering)
+
+        empty_cell_scattering = _read_reference_detector_image(
+            f,
+            "empty_cell_scattering",
+            detector_number=detector_number,
+            refs_entry_path=entry_path,
+        )
+        if empty_cell_scattering is not None:
+            _require_same_shape("empty_cell_scattering", water_scattering, empty_cell_scattering)
+
+        roi_detector_number = _read_transmission_roi_detector(f, refs_entry_path=entry_path)
+
+        water_transmission = _read_reference_detector_image(
+            f,
+            "water_transmission",
+            detector_number=roi_detector_number,
+            refs_entry_path=entry_path,
+        )
+        if water_transmission is None:
+            raise ValueError("refs_norm must contain a water_transmission reference")
+
+        empty_beam_transmission = _read_reference_detector_image(
+            f,
+            "empty_beam_transmission",
+            detector_number=roi_detector_number,
+            refs_entry_path=entry_path,
+        )
+        if empty_beam_transmission is None:
+            raise ValueError("refs_norm must contain an empty_beam_transmission reference")
+
+        dark_for_transmission = _read_reference_detector_image(
+            f,
+            "dark",
+            detector_number=roi_detector_number,
+            refs_entry_path=entry_path,
+        )
+        if dark_for_transmission is None:
+            dark_for_transmission = np.zeros_like(water_transmission, dtype=np.float64)
+
+        _require_same_shape("dark", water_transmission, dark_for_transmission)
+        _require_same_shape("empty_beam_transmission", water_transmission, empty_beam_transmission)
+
+        roi = _read_transmission_roi(f, refs_entry_path=entry_path)
+        water_transmission_value = _roi_sum(water_transmission - dark_for_transmission, roi) / _roi_sum(
+            empty_beam_transmission - dark_for_transmission,
+            roi,
+        )
+
+        water_background_corrected = water_scattering - dark
+        if empty_beam_scattering is not None:
+            water_background_corrected = water_background_corrected - (empty_beam_scattering - dark)
+
+        if empty_cell_scattering is None:
+            return water_background_corrected
+
+        empty_cell_corrected = empty_cell_scattering - dark
+        if empty_beam_scattering is not None:
+            empty_cell_corrected = empty_cell_corrected - (empty_beam_scattering - dark)
+        return water_background_corrected - water_transmission_value * empty_cell_corrected
+
+
+def write_corrected_water_scattering(
+    ref_norm_file: Union[str, Path],
+    *,
+    entry_path: str = "/entry",
+) -> dict[int, np.ndarray]:
+    from scarlet.reduction import normalize_by_solid_angle
+
+    ref_norm_file = Path(ref_norm_file).resolve()
+    corrected_by_detector: dict[int, np.ndarray] = {}
+
+    with h5py.File(ref_norm_file, "r+") as refs_file:
+        if entry_path not in refs_file or not isinstance(refs_file[entry_path], h5py.Group):
+            raise ValueError(f"Missing entry group: {entry_path}")
+        entry = refs_file[entry_path]
+
+        if "definition" not in entry:
+            raise ValueError(f"Missing {entry_path}/definition")
+        definition_raw = entry["definition"][()]
+        definition = (
+            definition_raw.decode(errors="replace")
+            if isinstance(definition_raw, (bytes, bytearray))
+            else str(definition_raw)
+        )
+        if definition != "SCARLET_refs_norm":
+            raise ValueError(f"Unsupported refs bundle definition: {definition!r}")
+
+        references = entry.get("references")
+        if not isinstance(references, h5py.Group):
+            raise ValueError(f"Missing references group: {entry_path}/references")
+        water_scattering = references.get("water_scattering")
+        if not isinstance(water_scattering, h5py.Group):
+            raise ValueError("refs_norm must contain a water_scattering reference")
+        water_entry = water_scattering.get("entry")
+        if not isinstance(water_entry, h5py.Group):
+            raise ValueError("refs_norm water_scattering reference is missing its entry group")
+
+        instrument = water_entry.get("instrument")
+        if not isinstance(instrument, h5py.Group):
+            raise ValueError("refs_norm water_scattering reference is missing its instrument group")
+
+        detector_numbers: list[int] = []
+        for name, group in instrument.items():
+            if not isinstance(group, h5py.Group):
+                continue
+            match = re.fullmatch(r"detector(\d+)", name)
+            if match is None:
+                continue
+            if "data" in group:
+                detector_numbers.append(int(match.group(1)))
+        detector_numbers.sort()
+        if not detector_numbers:
+            raise ValueError("refs_norm must contain at least one water_scattering detector image")
+
+        configuration_group = entry.get("configuration")
+        if not isinstance(configuration_group, h5py.Group) or "sample_detector_distance" not in configuration_group:
+            raise ValueError(f"Missing {entry_path}/configuration/sample_detector_distance")
+        detector_distance = float(np.asarray(configuration_group["sample_detector_distance"][()]).reshape(()))
+
+        for detector_number in detector_numbers:
+            corrected = compute_corrected_water_scattering(
+                ref_norm_file,
+                detector_number=detector_number,
+                entry_path=entry_path,
+            )
+            detector_group = water_entry.get(f"instrument/detector{detector_number}")
+            if not isinstance(detector_group, h5py.Group):
+                raise ValueError(f"Missing water_scattering detector group: detector{detector_number}")
+            if "x_pixel_size" not in detector_group or "y_pixel_size" not in detector_group:
+                raise ValueError(f"Missing pixel size datasets in water_scattering detector{detector_number}")
+            if "beam_center_x" not in detector_group or "beam_center_y" not in detector_group:
+                raise ValueError(f"Missing beam center datasets in water_scattering detector{detector_number}")
+            pixel_size = (
+                float(np.asarray(detector_group["x_pixel_size"][()]).reshape(())),
+                float(np.asarray(detector_group["y_pixel_size"][()]).reshape(())),
+            )
+            beam_center = (
+                float(np.asarray(detector_group["beam_center_x"][()]).reshape(())),
+                float(np.asarray(detector_group["beam_center_y"][()]).reshape(())),
+            )
+            corrected_by_detector[detector_number] = normalize_by_solid_angle(
+                corrected,
+                detector_distance=detector_distance,
+                beam_center=beam_center,
+                pixel_size=pixel_size,
+            )
+
+        if "water_corrected" in references:
+            del references["water_corrected"]
+        refs_file.copy(f"{entry_path}/references/water_scattering", references, name="water_corrected")
+
+        water_corrected = references["water_corrected"]
+        corrected_entry = water_corrected["entry"]
+        control = corrected_entry.require_group("control")
+        if "integral" in control:
+            del control["integral"]
+        control.create_dataset("integral", data=1.0)
+
+        for detector_number, corrected in corrected_by_detector.items():
+            detector_group = corrected_entry[f"instrument/detector{detector_number}"]
+            if "data" in detector_group:
+                del detector_group["data"]
+            detector_group.create_dataset("data", data=np.asarray(corrected, dtype=np.float64))
+
+        water_transmission = references.get("water_transmission")
+        if isinstance(water_transmission, h5py.Group):
+            transmission_entry = water_transmission.get("entry")
+            if isinstance(transmission_entry, h5py.Group) and "sample/transmission" in transmission_entry:
+                transmission_value = float(np.asarray(transmission_entry["sample/transmission"][()]).reshape(()))
+                sample = corrected_entry.require_group("sample")
+                sample.attrs["NX_class"] = np.bytes_("NXsample")
+                if "transmission" in sample:
+                    del sample["transmission"]
+                sample.create_dataset("transmission", data=transmission_value)
+
+    return corrected_by_detector
 
 
 def write_refs_sub_file(
