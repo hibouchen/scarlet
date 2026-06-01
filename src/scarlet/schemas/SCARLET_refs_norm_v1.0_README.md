@@ -45,7 +45,7 @@ This group stores the **target instrumental configuration** for which normalizat
 
 ### Required fields
 - `wavelength` (float, angstrom)
-- `sample_detector_distance` (float, m)
+- `sample_detector_distance` (float or 1D float array, m)
 
 ### Optional fields
 - `notes` (string)

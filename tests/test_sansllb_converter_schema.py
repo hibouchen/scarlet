@@ -51,6 +51,18 @@ class TestSansLlbConverterSchema(unittest.TestCase):
             self.assertEqual(fout["/raw_data/instrument/detector0/x_pixel_size"].attrs["units"], b"m")
             self.assertEqual(fout["/raw_data/instrument/detector0/beam_center_x"].shape, ())
             self.assertEqual(fout["/raw_data/instrument/detector0/beam_center_y"].shape, ())
+            for detector_name, data_view, detector_index in (
+                ("left_detector", "left_data", 1),
+                ("bottom_detector", "bottom_data", 2),
+            ):
+                data_group = fin[f"{entry}/{data_view}"]
+                for axis in ("x", "y"):
+                    coord = numpy.asarray(data_group[axis][()], dtype=float).reshape(-1)
+                    pos = numpy.asarray(data_group[f"pos{axis}"][()], dtype=float).reshape(-1)
+                    slope, intercept = numpy.polyfit(coord, pos, 1)
+                    expected = float(-intercept / slope)
+                    actual = float(fout[f"/raw_data/instrument/detector{detector_index}/beam_center_{axis}"][()])
+                    self.assertAlmostEqual(actual, expected)
             self.assertEqual(fout["/raw_data/instrument/collimation/collimation_distance"].attrs["units"], b"m")
             self.assertEqual(fout["/raw_data/instrument/collimation/aperture2"].attrs["NX_class"], b"NXslit")
             self.assertEqual(float(fout["/raw_data/instrument/collimation/aperture2/x_gap"][()]), 0.01)

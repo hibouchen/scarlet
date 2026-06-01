@@ -14,6 +14,7 @@ dependencies = ["PyYAML>=6.0", "h5py>=3.10", "numpy>=1.26"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+notebook = ["jupyterlab>=4"]
 
 [project.scripts]
 scarlet = "scarlet.cli:main"

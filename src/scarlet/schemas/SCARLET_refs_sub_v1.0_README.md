@@ -43,7 +43,7 @@ This group stores the instrumental configuration associated with the reference f
 
 ### Required fields
 - `wavelength` (float, angstrom)
-- `sample_detector_distance` (float, m)
+- `sample_detector_distance` (float or 1D float array, m)
 
 ### Optional fields
 - `notes` (string)

@@ -22,6 +22,65 @@ from ._units import MM_TO_M, length_dataset_to_m as _length_dataset_to_m, mm_or_
 NM_TO_ANGSTROM = 10.0
 
 
+def _sansllb_detector_view_name(detector_name: str) -> Optional[str]:
+    """Map raw SANS-LLB detector groups to their NXdata view holding posx/posy axes."""
+    explicit = {
+        "left_detector": "left_data",
+        "bottom_detector": "bottom_data",
+    }
+    return explicit.get(detector_name)
+
+
+def _beam_center_axis_from_positions(
+    data_group: h5py.Group,
+    *,
+    axis: str,
+) -> Optional[float]:
+    """Infer the beam-center pixel coordinate from the raw pos{axis} axis where pos=0 at the direct beam."""
+    if axis not in {"x", "y"}:
+        raise ValueError(f"Unsupported axis {axis!r}")
+    coord_name = axis
+    pos_name = f"pos{axis}"
+    if coord_name not in data_group or pos_name not in data_group:
+        return None
+
+    coord = np.asarray(data_group[coord_name][()], dtype=np.float64).reshape(-1)
+    pos = np.asarray(data_group[pos_name][()], dtype=np.float64).reshape(-1)
+    if coord.size != pos.size or coord.size < 2:
+        return None
+
+    finite = np.isfinite(coord) & np.isfinite(pos)
+    if int(np.count_nonzero(finite)) < 2:
+        return None
+    coord = coord[finite]
+    pos = pos[finite]
+
+    slope, intercept = np.polyfit(coord, pos, 1)
+    if not np.isfinite(slope) or not np.isfinite(intercept) or abs(slope) <= 1e-12:
+        return None
+    return float(-intercept / slope)
+
+
+def _beam_center_from_sansllb_positions(
+    fin: h5py.File,
+    *,
+    entry: str,
+    detector_name: str,
+) -> tuple[Optional[float], Optional[float]]:
+    """Infer beam_center_x/y from entry-level NXdata views such as left_data and bottom_data."""
+    view_name = _sansllb_detector_view_name(detector_name)
+    if view_name is None:
+        return None, None
+    group_path = f"{entry}/{view_name}"
+    if group_path not in fin or not isinstance(fin[group_path], h5py.Group):
+        return None, None
+    data_group = fin[group_path]
+    return (
+        _beam_center_axis_from_positions(data_group, axis="x"),
+        _beam_center_axis_from_positions(data_group, axis="y"),
+    )
+
+
 def _wavelength_dataset_to_angstrom(ds: Optional[h5py.Dataset]) -> Optional[float]:
     """Convert a raw SANS-LLB wavelength dataset to angstrom when units are known."""
     if ds is None:
@@ -577,7 +636,15 @@ def convert_sansllb_to_scarlet_nxsas_raw(
                 _write_dataset(det_out, "x_pixel_size", xpix_m if xpix_m is not None else float("nan"), units="m")
                 _write_dataset(det_out, "y_pixel_size", ypix_m if ypix_m is not None else float("nan"), units="m")
 
-                if "beam_center_x" in det_in:
+                derived_beam_center_x, derived_beam_center_y = _beam_center_from_sansllb_positions(
+                    fin,
+                    entry=entry,
+                    detector_name=det_name,
+                )
+
+                if derived_beam_center_x is not None:
+                    _write_dataset(det_out, "beam_center_x", derived_beam_center_x)
+                elif "beam_center_x" in det_in:
                     _write_dataset(det_out, "beam_center_x", _as_float_scalar(det_in["beam_center_x"][()]))
                 else:
                     bx = float("nan")
@@ -586,7 +653,9 @@ def convert_sansllb_to_scarlet_nxsas_raw(
                     warnings.append(f"{det_name}: missing beam_center_x; writing {bx}")
                     _write_dataset(det_out, "beam_center_x", bx)
 
-                if "beam_center_y" in det_in:
+                if derived_beam_center_y is not None:
+                    _write_dataset(det_out, "beam_center_y", derived_beam_center_y)
+                elif "beam_center_y" in det_in:
                     _write_dataset(det_out, "beam_center_y", _as_float_scalar(det_in["beam_center_y"][()]))
                 else:
                     by = float("nan")

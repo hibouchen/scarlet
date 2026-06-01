@@ -105,12 +105,89 @@ def _require_number(name: str, value: Optional[float]) -> float:
     return out
 
 
-def _scalar_distance(value: Union[float, List[float]], *, output_kind: str) -> float:
+def _normalize_distance_values(
+    value: Union[float, List[float]],
+    *,
+    name: str,
+) -> float | np.ndarray:
     if isinstance(value, list):
-        if len(value) != 1:
-            raise ValueError(f"sample_detector_distance must be a scalar for {output_kind} output")
-        value = value[0]
-    return _require_number("sample_detector_distance", float(value))
+        if not value:
+            raise ValueError(f"{name} must not be empty")
+        normalized = np.asarray([_require_number(f"{name}[{idx}]", item) for idx, item in enumerate(value)], dtype=np.float64)
+        if normalized.size == 1:
+            return float(normalized[0])
+        return normalized
+    return _require_number(name, float(value))
+
+
+def _read_distance_value(
+    f: h5py.File,
+    p: str,
+    *,
+    issues: List[str],
+) -> Optional[Union[float, List[float]]]:
+    if p not in f:
+        return None
+    try:
+        raw = np.asarray(f[p][()], dtype=np.float64)
+    except Exception:
+        issues.append(f"{p}: cannot read as float or float array")
+        return None
+    if raw.ndim == 0:
+        return float(raw.reshape(()))
+    if raw.ndim != 1:
+        issues.append(f"{p}: expected scalar or 1D float array, got shape {raw.shape}")
+        return None
+    return [float(item) for item in raw.tolist()]
+
+
+def _distance_for_detector(
+    value: Union[float, List[float]],
+    detector_number: int,
+    *,
+    name: str = "sample_detector_distance",
+) -> float:
+    if isinstance(value, list):
+        if detector_number >= len(value):
+            raise ValueError(f"Missing {name} for detector{detector_number}")
+        value = value[detector_number]
+    return _require_number(name, float(value))
+
+
+def _compare_distance_values(
+    a: Union[float, List[float]],
+    b: Union[float, List[float]],
+    tol: float,
+) -> Tuple[bool, List[str]]:
+    if not isinstance(a, list) and not isinstance(b, list):
+        ok, d = _close(a, b, tol)
+        if ok:
+            return True, []
+        return False, [_fmt_diff("sample_detector_distance", a, b, d, tol, "m")]
+
+    a_values = a if isinstance(a, list) else [float(a)]
+    b_values = b if isinstance(b, list) else [float(b)]
+    if len(a_values) != len(b_values):
+        return False, [
+            "sample_detector_distance: length mismatch "
+            f"(a={len(a_values)}, b={len(b_values)})"
+        ]
+
+    diffs: List[str] = []
+    for detector_number, (a_value, b_value) in enumerate(zip(a_values, b_values)):
+        ok, d = _close(a_value, b_value, tol)
+        if not ok:
+            diffs.append(
+                _fmt_diff(
+                    f"sample_detector_distance[{detector_number}]",
+                    a_value,
+                    b_value,
+                    d,
+                    tol,
+                    "m",
+                )
+            )
+    return len(diffs) == 0, diffs
 
 
 def _write_aperture(parent: h5py.Group, name: str, aperture: "Aperture") -> None:
@@ -192,7 +269,10 @@ def _write_configuration_group(entry: h5py.Group, configuration: "Configuration"
     _write_dataset(
         cfg,
         "sample_detector_distance",
-        _scalar_distance(configuration.sample_detector_distance, output_kind=output_kind),
+        _normalize_distance_values(
+            configuration.sample_detector_distance,
+            name=f"sample_detector_distance for {output_kind}",
+        ),
     )
     if configuration.notes is not None:
         _write_dataset(cfg, "notes", configuration.notes)
@@ -449,7 +529,7 @@ def configuration_from_nexus(
         cfg_path = f"{entry_path}/configuration"
         if cfg_path in f and isinstance(f[cfg_path], h5py.Group):
             wl = _read_scalar(f, f"{cfg_path}/wavelength")
-            dsd = _read_scalar(f, f"{cfg_path}/sample_detector_distance")
+            dsd = _read_distance_value(f, f"{cfg_path}/sample_detector_distance", issues=issues)
             notes = _read_text(f, f"{cfg_path}/notes")
             config_id = _read_text(f, f"{entry_path}/config_id")
 
@@ -484,7 +564,7 @@ def configuration_from_nexus(
 
             return Configuration(
                 wavelength=float(wl),
-                sample_detector_distance=float(dsd),
+                sample_detector_distance=float(dsd) if not isinstance(dsd, list) else dsd,
                 collimation=collimation_obj,
                 config_id=config_id,
                 notes=notes,
@@ -504,21 +584,50 @@ def configuration_from_nexus(
             wl = float("nan")
 
         # sample-detector distance: prefer detector{idx}/transformations/translation[2], else detector/distance
-        det = f"{inst}/detector{detector_index}"
-        dsd = None
-        tr_path = f"{det}/transformations/translation"
-        if tr_path in f:
-            try:
-                t = np.array(f[tr_path][()], dtype=float).reshape(-1)
-                if t.size >= 3:
-                    dsd = float(t[2])
-            except Exception:
-                issues.append(f"{tr_path}: cannot read translation vector")
-        if dsd is None:
-            dsd = _read_scalar(f, f"{det}/distance")
-        if dsd is None:
-            issues.append(f"Could not infer sample_detector_distance from {det}")
-            dsd = float("nan")
+        instrument_group = f.get(inst)
+        detector_numbers: list[int] = []
+        if isinstance(instrument_group, h5py.Group):
+            for name, group in instrument_group.items():
+                if not isinstance(group, h5py.Group):
+                    continue
+                match = re.fullmatch(r"detector(\d+)", name)
+                if match is None:
+                    continue
+                detector_numbers.append(int(match.group(1)))
+        if detector_index not in detector_numbers:
+            detector_numbers.append(detector_index)
+        detector_numbers = sorted(set(detector_numbers))
+
+        inferred_distances: dict[int, float] = {}
+        for number in detector_numbers:
+            det = f"{inst}/detector{number}"
+            dsd = None
+            tr_path = f"{det}/transformations/translation"
+            if tr_path in f:
+                try:
+                    t = np.array(f[tr_path][()], dtype=float).reshape(-1)
+                    if t.size >= 3:
+                        dsd = float(t[2])
+                except Exception:
+                    issues.append(f"{tr_path}: cannot read translation vector")
+            if dsd is None:
+                dsd = _read_scalar(f, f"{det}/distance")
+            if dsd is None:
+                if number == detector_index:
+                    issues.append(f"Could not infer sample_detector_distance from {det}")
+                continue
+            inferred_distances[number] = float(dsd)
+
+        if not inferred_distances:
+            sample_detector_distance: Union[float, List[float]] = float("nan")
+        elif len(inferred_distances) == 1 and detector_index in inferred_distances:
+            sample_detector_distance = inferred_distances[detector_index]
+        else:
+            max_detector = max(inferred_distances)
+            sample_detector_distance = [
+                inferred_distances.get(detector_number, float("nan"))
+                for detector_number in range(max_detector + 1)
+            ]
 
         # Attempt to infer collimation from /instrument/collimation elements:
         collimation_obj: Optional[Collimation] = None
@@ -566,7 +675,7 @@ def configuration_from_nexus(
 
         return Configuration(
             wavelength=float(wl),
-            sample_detector_distance=float(dsd),
+            sample_detector_distance=sample_detector_distance,
             collimation=collimation_obj,
             config_id=None,
             notes=None,
@@ -638,9 +747,9 @@ def compare_configurations(
     if not ok:
         diffs.append(_fmt_diff("wavelength", a.wavelength, b.wavelength, d, tol.wavelength_a, "Å"))
 
-    ok, d = _close(a.sample_detector_distance, b.sample_detector_distance, tol.distance_m)
+    ok, distance_diffs = _compare_distance_values(a.sample_detector_distance, b.sample_detector_distance, tol.distance_m)
     if not ok:
-        diffs.append(_fmt_diff("sample_detector_distance", a.sample_detector_distance, b.sample_detector_distance, d, tol.distance_m, "m"))
+        diffs.extend(distance_diffs)
 
     # Collimation
     if a.collimation is None or b.collimation is None:

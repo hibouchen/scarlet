@@ -102,6 +102,16 @@ class TableView:
         return "\n".join(lines)
 
 
+@dataclass(frozen=True)
+class WorkflowReductionResult:
+    """One reduction-pipeline execution derived from a workflow context."""
+
+    run_key: RunKey
+    detector_number: int
+    source_path: Path
+    state: Any
+
+
 # -----------------------------
 # WorkflowContext
 # -----------------------------
@@ -372,6 +382,37 @@ class WorkflowContext:
         self.output_dir = new_output_dir
         return self
 
+    def update_beam_center(
+        self,
+        config_id: str,
+        detector_number: int,
+        beam_center_x: float,
+        beam_center_y: float,
+    ) -> WorkflowContext:
+        """Update the beam center for one detector in both refs_sub and refs_norm."""
+        from scarlet.workflow.reference import insert_beam_centers_in_refs_file
+
+        refs_sub_path = self.refs_sub_files.get(config_id)
+        if refs_sub_path is None:
+            raise KeyError(f"Missing refs_sub for config_id={config_id}")
+        refs_norm_path = self.refs_norm_files.get(config_id)
+        if refs_norm_path is None:
+            raise KeyError(f"Missing refs_norm for config_id={config_id}")
+
+        insert_beam_centers_in_refs_file(
+            refs_sub_path,
+            detector_number,
+            beam_center_x,
+            beam_center_y,
+        )
+        insert_beam_centers_in_refs_file(
+            refs_norm_path,
+            detector_number,
+            beam_center_x,
+            beam_center_y,
+        )
+        return self
+
     def runs_table(self) -> TableView:
         """Return a notebook-friendly table view of runs using the runs_report.csv columns."""
         return TableView(
@@ -491,6 +532,124 @@ def _is_hdf5_file(path: Path) -> bool:
         return h5py.is_hdf5(path)
     except Exception:
         return False
+
+
+def _next_generated_config_id(existing_config_ids: Iterable[str]) -> str:
+    taken = set(existing_config_ids)
+    index = 1
+    while True:
+        candidate = f"config_{index}"
+        if candidate not in taken:
+            return candidate
+        index += 1
+
+
+def _ingest_raw_directory_into_workflow_context(
+    ctx: WorkflowContext,
+    *,
+    input_dir: Path,
+    output_dir: Path,
+    instrument_name: str | None,
+    overwrite: bool,
+    where: str,
+) -> WorkflowContext:
+    from scarlet.io.converters import convert_to_scarlet_nxsas_raw
+    from scarlet.io.mode_inference import guess_measurement_mode_from_nexus_image
+    from scarlet.workflow.configuration import compare_configurations, configuration_from_nexus
+
+    candidate_files = sorted(
+        path
+        for path in input_dir.rglob("*")
+        if path.is_file() and not _is_relative_to(path.resolve(), output_dir)
+    )
+    if not candidate_files:
+        raise FileNotFoundError(f"No input files found in {input_dir}")
+
+    raw_files: list[Path] = []
+    for path in candidate_files:
+        if _is_hdf5_file(path):
+            raw_files.append(path)
+            continue
+        ctx.warn(
+            "Skipping non-HDF5 input file",
+            where=where,
+            key=str(path),
+        )
+
+    if not raw_files:
+        raise FileNotFoundError(f"No HDF5 input files found in {input_dir}")
+
+    existing_run_paths = {path.resolve() for path in ctx.runs.values()}
+    existing_artifact_paths = {artifact.path.resolve() for artifact in ctx.artifacts}
+
+    for raw_path in raw_files:
+        converted_path = (output_dir / _flattened_nxsas_name(input_dir, raw_path)).resolve()
+        if converted_path in existing_run_paths and not overwrite:
+            continue
+
+        if not converted_path.exists() or overwrite:
+            report = convert_to_scarlet_nxsas_raw(
+                instrument_name,
+                raw_path,
+                converted_path,
+                overwrite=overwrite,
+            )
+        else:
+            report = None
+
+        if converted_path not in existing_artifact_paths:
+            ctx.add_artifact(converted_path.name, converted_path, kind="nexus")
+            existing_artifact_paths.add(converted_path)
+
+        configuration, issues = configuration_from_nexus(converted_path)
+        for issue in issues:
+            ctx.warn(issue, where="configuration_from_nexus", key=str(converted_path))
+
+        config_id: Optional[str] = None
+        for existing_config_id, existing_configuration in ctx.configurations.items():
+            same, _ = compare_configurations(configuration, existing_configuration)
+            if same:
+                config_id = existing_config_id
+                break
+        if config_id is None:
+            config_id = _next_generated_config_id(ctx.configurations.keys())
+            ctx.configurations[config_id] = replace(configuration, config_id=config_id)
+
+        sample_name = _read_sample_name(converted_path)
+        entity = _classify_entity_from_sample_name(sample_name)
+        mode_guess = guess_measurement_mode_from_nexus_image(converted_path)
+        if mode_guess.mode == "transmission":
+            mode: Mode = "transmission"
+        elif mode_guess.mode == "scattering":
+            mode = "scattering"
+        else:
+            mode = "transmission" if entity == "empty_beam" else "scattering"
+            ctx.warn(
+                "Could not confidently infer measurement mode; using heuristic fallback",
+                where=where,
+                key=str(converted_path),
+                guessed_mode=mode,
+                converter_output=None if report is None else str(report.output_file),
+            )
+
+        run_key = RunKey(
+            config_id=config_id,
+            entity=entity,
+            mode=mode,
+            sample_name=sample_name,
+        )
+        if run_key in ctx.runs:
+            ctx.warn(
+                "Duplicate run key detected; overwriting previous file",
+                where=where,
+                key=run_key.short(),
+                previous_path=str(ctx.runs[run_key]),
+                new_path=str(converted_path),
+            )
+        ctx.add_run(run_key, converted_path)
+        existing_run_paths.add(converted_path)
+
+    return ctx
 
 
 def _path_to_storage_string(path: Path, *, base_dir: Path) -> str:
@@ -996,10 +1155,6 @@ def initialize_workflow_context_from_raw_directory(
     instrument_name: str | None = None,
     overwrite: bool = False,
 ) -> WorkflowContext:
-    from scarlet.io.converters import convert_to_scarlet_nxsas_raw
-    from scarlet.io.mode_inference import guess_measurement_mode_from_nexus_image
-    from scarlet.workflow.configuration import compare_configurations, configuration_from_nexus
-
     input_dir = Path(input_dir).resolve()
     if output_dir is None:
         output_dir = input_dir / "processed"
@@ -1021,79 +1176,50 @@ def initialize_workflow_context_from_raw_directory(
         output_dir=output_dir,
     )
     ctx.set("converted_data_dir", output_dir)
+    return _ingest_raw_directory_into_workflow_context(
+        ctx,
+        input_dir=input_dir,
+        output_dir=output_dir,
+        instrument_name=instrument_name,
+        overwrite=overwrite,
+        where="initialize_workflow_context_from_raw_directory",
+    )
 
-    raw_files: list[Path] = []
-    for path in candidate_files:
-        if _is_hdf5_file(path):
-            raw_files.append(path)
-            continue
-        ctx.warn(
-            "Skipping non-HDF5 input file",
-            where="initialize_workflow_context_from_raw_directory",
-            key=str(path),
-        )
 
-    if not raw_files:
-        raise FileNotFoundError(f"No HDF5 input files found in {input_dir}")
+def update_workflow_context_from_raw_directory(
+    ctx: WorkflowContext,
+    *,
+    overwrite: bool = False,
+) -> WorkflowContext:
+    """
+    Refresh a WorkflowContext by scanning its raw-data directory for newly added files.
 
-    for raw_path in raw_files:
-        converted_path = output_dir / _flattened_nxsas_name(input_dir, raw_path)
-        report = convert_to_scarlet_nxsas_raw(
-            instrument_name,
-            raw_path,
-            converted_path,
-            overwrite=overwrite,
-        )
-        ctx.add_artifact(converted_path.name, converted_path, kind="nexus")
+    The function converts and registers any new raw HDF5 files found under
+    ``ctx.root_dir`` while preserving the existing workflow state. Existing runs are
+    left untouched unless ``overwrite=True`` is passed, in which case converted files
+    are regenerated and duplicate run keys are updated.
+    """
+    if not isinstance(ctx.root_dir, Path):
+        raise TypeError("WorkflowContext.root_dir must be a Path")
+    if not isinstance(ctx.output_dir, Path):
+        raise TypeError("WorkflowContext.output_dir must be a Path")
 
-        configuration, issues = configuration_from_nexus(converted_path)
-        for issue in issues:
-            ctx.warn(issue, where="configuration_from_nexus", key=str(converted_path))
+    input_dir = ctx.root_dir.resolve()
+    output_dir = ctx.output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ctx.root_dir = input_dir
+    ctx.output_dir = output_dir
+    if ctx.get("converted_data_dir") is None:
+        ctx.set("converted_data_dir", output_dir)
 
-        config_id: Optional[str] = None
-        for existing_config_id, existing_configuration in ctx.configurations.items():
-            same, _ = compare_configurations(configuration, existing_configuration)
-            if same:
-                config_id = existing_config_id
-                break
-        if config_id is None:
-            config_id = f"config_{len(ctx.configurations) + 1}"
-            ctx.configurations[config_id] = replace(configuration, config_id=config_id)
-
-        sample_name = _read_sample_name(converted_path)
-        entity = _classify_entity_from_sample_name(sample_name)
-        mode_guess = guess_measurement_mode_from_nexus_image(converted_path)
-        if mode_guess.mode == "transmission":
-            mode: Mode = "transmission"
-        elif mode_guess.mode == "scattering":
-            mode = "scattering"
-        else:
-            mode = "transmission" if entity == "empty_beam" else "scattering"
-            ctx.warn(
-                "Could not confidently infer measurement mode; using heuristic fallback",
-                where="initialize_workflow_context_from_raw_directory",
-                key=str(converted_path),
-                guessed_mode=mode,
-                converter_output=str(report.output_file),
-            )
-
-        run_key = RunKey(
-            config_id=config_id,
-            entity=entity,
-            mode=mode,
-            sample_name=sample_name,
-        )
-        if run_key in ctx.runs:
-            ctx.warn(
-                "Duplicate run key detected; overwriting previous file",
-                where="initialize_workflow_context_from_raw_directory",
-                key=run_key.short(),
-                previous_path=str(ctx.runs[run_key]),
-                new_path=str(converted_path),
-            )
-        ctx.add_run(run_key, converted_path)
-
-    return ctx
+    return _ingest_raw_directory_into_workflow_context(
+        ctx,
+        input_dir=input_dir,
+        output_dir=output_dir,
+        instrument_name=ctx.instrument_name,
+        overwrite=overwrite,
+        where="update_workflow_context_from_raw_directory",
+    )
 
 
 def write_runs_report_csv(
@@ -1685,7 +1811,8 @@ def update_reference_masks_from_workflow_context(
     *,
     search_dir: str | Path | None = None,
 ) -> WorkflowContext:
-    from scarlet.workflow.configuration import compare_configurations, configuration_from_nexus, insert_masks_in_refs_file
+    from scarlet.workflow.configuration import compare_configurations, configuration_from_nexus
+    from scarlet.workflow.reference import insert_masks_in_refs_file
 
     if search_dir is None:
         search_dir = ctx.output_dir
@@ -1725,9 +1852,38 @@ def update_reference_masks_from_workflow_context(
                     masks[int(match.group(1))] = np.asarray(dataset[()], dtype=np.uint8)
                 if not masks:
                     raise ValueError(f"No mask_detectorN datasets found in mask bundle: {path}")
-                return _read_text_dataset(entry, "config_id"), masks
+                return (
+                    _read_text_dataset(entry, "config_id")
+                    or _read_text_dataset(entry, "configuration/config_id"),
+                    masks,
+                )
         except OSError:
             return None
+
+    def _match_mask_configuration(mask_configuration: Any, candidate_configuration: Any) -> bool:
+        same, _diffs = compare_configurations(mask_configuration, candidate_configuration)
+        if same:
+            return True
+
+        mask_distance = getattr(mask_configuration, "sample_detector_distance", None)
+        candidate_distance = getattr(candidate_configuration, "sample_detector_distance", None)
+        if isinstance(mask_distance, list) == isinstance(candidate_distance, list):
+            return False
+
+        normalized_mask = replace(
+            mask_configuration,
+            sample_detector_distance=(
+                float(mask_distance[0]) if isinstance(mask_distance, list) else float(mask_distance)
+            ),
+        )
+        normalized_candidate = replace(
+            candidate_configuration,
+            sample_detector_distance=(
+                float(candidate_distance[0]) if isinstance(candidate_distance, list) else float(candidate_distance)
+            ),
+        )
+        same, _diffs = compare_configurations(normalized_mask, normalized_candidate)
+        return same
 
     target_config_ids = {
         *ctx.configurations.keys(),
@@ -1753,8 +1909,7 @@ def update_reference_masks_from_workflow_context(
                 candidate_configuration = ctx.configurations.get(candidate_config_id)
                 if candidate_configuration is None:
                     continue
-                same, _diffs = compare_configurations(mask_configuration, candidate_configuration)
-                if same:
+                if _match_mask_configuration(mask_configuration, candidate_configuration):
                     matched_config_id = candidate_config_id
                     break
 
@@ -1810,15 +1965,113 @@ def integrate_scattering_from_workflow_context(
     *,
     n_bins: int = 200,
     refs_entry_path: str = "/entry",
+    sample_name: Optional[str] = None,
+    config_id: Optional[str] = None,
+    detector_number: Optional[int] = None,
 ) -> WorkflowContext:
-    from scarlet.reduction import (
-        azimuthal_average,
-        compute_q_norm_map,
-        compute_q_resolution_circular,
-        normalize_by_monitor,
-        normalize_by_solid_angle,
-        subtract_scattering_references,
+    results = _run_reduction_pipeline_results_from_workflow_context(
+        ctx,
+        n_bins=n_bins,
+        refs_entry_path=refs_entry_path,
+        sample_name=sample_name,
+        config_id=config_id,
+        detector_number=detector_number,
     )
+
+    for result in results:
+        sample_name = result.run_key.sample_name or "sample"
+        config_id = result.run_key.config_id
+        detector_number = result.detector_number
+        integration = result.state.integration
+        if integration is None:
+            raise ValueError(f"Reduction pipeline did not produce integration for detector{detector_number}")
+
+        valid_bins = integration.counts > 0
+        q_values = integration.q[valid_bins]
+        intensity_values = integration.intensity[valid_bins]
+        intensity_error_values = (
+            np.full_like(q_values, np.nan)
+            if integration.intensity_error is None
+            else integration.intensity_error[valid_bins]
+        )
+        q_error_values = (
+            np.full_like(q_values, np.nan)
+            if integration.q_error is None
+            else integration.q_error[valid_bins]
+        )
+
+        sample_t = float(result.state.inputs.sample_transmission)
+        safe_sample_name = re.sub(r"[^A-Za-z0-9._-]+", "_", sample_name).strip("_") or "sample"
+        output_path = (ctx.output_dir / f"{safe_sample_name}_det{detector_number}_{config_id}.txt").resolve()
+        header = "\n".join(
+            (
+                f"sample_name: {sample_name}",
+                f"config_id: {config_id}",
+                f"detector: detector{detector_number}",
+                f"transmission: {sample_t:.6g}",
+                "columns: q i i_error q_error",
+            )
+        )
+        np.savetxt(
+            output_path,
+            np.column_stack((q_values, intensity_values, intensity_error_values, q_error_values)),
+            header=header,
+            comments="# ",
+        )
+        ctx.add_artifact(output_path.name, output_path, kind="text")
+
+    return ctx
+
+
+def run_reduction_pipeline_from_workflow_context(
+    ctx: WorkflowContext,
+    *,
+    n_bins: int = 200,
+    refs_entry_path: str = "/entry",
+    pipeline: Optional[Any] = None,
+    sample_name: Optional[str] = None,
+    config_id: Optional[str] = None,
+    detector_number: Optional[int] = None,
+) -> "ReductionState":
+    results = _run_reduction_pipeline_results_from_workflow_context(
+        ctx,
+        n_bins=n_bins,
+        refs_entry_path=refs_entry_path,
+        pipeline=pipeline,
+        sample_name=sample_name,
+        config_id=config_id,
+        detector_number=detector_number,
+    )
+    if len(results) != 1:
+        selection = []
+        if sample_name is not None:
+            selection.append(f"sample_name={sample_name!r}")
+        if config_id is not None:
+            selection.append(f"config_id={config_id!r}")
+        if detector_number is not None:
+            selection.append(f"detector_number={detector_number!r}")
+        detail = ", ".join(selection) if selection else "the current selection"
+        raise ValueError(
+            f"Expected exactly one reduction result for {detail}, got {len(results)}. "
+            "Filter further with config_id/detector_number or use integrate_scattering_from_workflow_context()."
+        )
+    return results[0].state
+
+
+def _run_reduction_pipeline_results_from_workflow_context(
+    ctx: WorkflowContext,
+    *,
+    n_bins: int = 200,
+    refs_entry_path: str = "/entry",
+    pipeline: Optional[Any] = None,
+    sample_name: Optional[str] = None,
+    config_id: Optional[str] = None,
+    detector_number: Optional[int] = None,
+) -> List[WorkflowReductionResult]:
+    from scarlet.reduction import (
+        normalize_by_monitor,
+    )
+    from scarlet.workflow.pipeline import PipelineData, ReductionInputs, ReductionPipeline
 
     if not ctx.runs:
         raise ValueError("WorkflowContext has no runs")
@@ -1842,6 +2095,15 @@ def integrate_scattering_from_workflow_context(
         if not np.isfinite(monitor_value) or monitor_value <= 0.0:
             raise ValueError(f"Monitor integral must be > 0 in {path}: {dataset_path}")
         return monitor_value
+
+    def _read_count_time_value(handle: h5py.File, entry_path: str, *, path: Path) -> float:
+        dataset_path = f"{entry_path}/control/count_time"
+        if dataset_path not in handle:
+            raise ValueError(f"Missing count_time in {path}: {dataset_path}")
+        count_time = float(np.asarray(handle[dataset_path][()]).reshape(()))
+        if not np.isfinite(count_time) or count_time <= 0.0:
+            raise ValueError(f"count_time must be > 0 in {path}: {dataset_path}")
+        return count_time
 
     def _available_detectors(path: Path) -> list[int]:
         path = Path(path).resolve()
@@ -1911,17 +2173,36 @@ def integrate_scattering_from_workflow_context(
         error = np.sqrt(np.clip(raw_data, 0.0, None)) / monitor_value
         return normalized, error
 
-    def _combine_masks(
-        base_mask: Optional[np.ndarray],
-        invalid_mask: np.ndarray,
-    ) -> np.ndarray:
-        invalid = np.asarray(invalid_mask, dtype=bool)
-        if base_mask is None:
-            return invalid.astype(np.uint8)
-        base = np.asarray(base_mask, dtype=bool)
-        if base.shape != invalid.shape:
-            raise ValueError(f"Mask shape mismatch: expected {invalid.shape}, got {base.shape}")
-        return np.logical_or(base, invalid).astype(np.uint8)
+    def _read_reference_monitor_and_count_time(
+        refs_file: h5py.File,
+        reference_name: str,
+    ) -> tuple[Optional[float], Optional[float]]:
+        reference_root = f"{refs_entry_path}/references/{reference_name}/entry"
+        if reference_root not in refs_file or not isinstance(refs_file[reference_root], h5py.Group):
+            return None, None
+        monitor_value = _read_monitor_value(refs_file, reference_root, path=Path(reference_name))
+        count_time = _read_count_time_value(refs_file, reference_root, path=Path(reference_name))
+        return monitor_value, count_time
+
+    def _read_reference_detector_deadtime(
+        refs_file: h5py.File,
+        reference_name: str,
+        detector_number: int,
+    ) -> Optional[float]:
+        detector_root = f"{refs_entry_path}/references/{reference_name}/entry/instrument/detector{detector_number}"
+        if detector_root not in refs_file or not isinstance(refs_file[detector_root], h5py.Group):
+            return None
+        for dataset_name in ("dead_time", "deadtime"):
+            dataset_path = f"{detector_root}/{dataset_name}"
+            if dataset_path not in refs_file:
+                continue
+            value = float(np.asarray(refs_file[dataset_path][()]).reshape(()))
+            if not np.isfinite(value):
+                return None
+            if value < 0.0:
+                raise ValueError(f"dead_time must be >= 0 in {reference_name}: {dataset_path}")
+            return value
+        return None
 
     def _read_beam_center_and_mask(
         refs_sub_path: Path,
@@ -1982,10 +2263,26 @@ def integrate_scattering_from_workflow_context(
     scattering_runs = [
         (key, path.resolve())
         for key, path in ctx.runs.items()
-        if key.entity == "sample" and key.mode == "scattering" and key.sample_name
+        if key.entity == "sample"
+        and key.mode == "scattering"
+        and key.sample_name
+        and (sample_name is None or key.sample_name == sample_name)
+        and (config_id is None or key.config_id == config_id)
     ]
     if not scattering_runs:
-        raise ValueError("WorkflowContext has no sample scattering runs")
+        if sample_name is None and config_id is None and detector_number is None:
+            raise ValueError("WorkflowContext has no sample scattering runs")
+        filters = []
+        if sample_name is not None:
+            filters.append(f"sample_name={sample_name!r}")
+        if config_id is not None:
+            filters.append(f"config_id={config_id!r}")
+        if detector_number is not None:
+            filters.append(f"detector_number={detector_number!r}")
+        raise ValueError(f"WorkflowContext has no scattering run for {', '.join(filters)}")
+
+    reduction_pipeline = ReductionPipeline.default() if pipeline is None else pipeline
+    results: List[WorkflowReductionResult] = []
 
     for key, path in scattering_runs:
         sample_name = key.sample_name or "sample"
@@ -2004,155 +2301,105 @@ def integrate_scattering_from_workflow_context(
             raise ValueError(f"Missing configuration for config_id={config_id}")
         wavelength = float(getattr(configuration, "wavelength"))
         sample_t = _sample_transmission(sample_name, config_id)
-        for detector_number in _available_detectors(path):
-            detector_distance = _scalar_detector_distance(configuration, detector_number)
-            sample_image, sample_error, pixel_size = _read_raw_detector_image_and_error(path, detector_number)
-            beam_center, mask = _read_beam_center_and_mask(refs_sub_path, detector_number)
+        for current_detector_number in _available_detectors(path):
+            if detector_number is not None and current_detector_number != int(detector_number):
+                continue
+            detector_distance = _scalar_detector_distance(configuration, current_detector_number)
+            sample_image, sample_error, pixel_size = _read_raw_detector_image_and_error(path, current_detector_number)
+            beam_center, mask = _read_beam_center_and_mask(refs_sub_path, current_detector_number)
 
             with h5py.File(refs_sub_path, "r") as refs_file:
-                dark_image, dark_error = _read_reference_detector_image_and_error(refs_file, "dark", detector_number)
-                empty_cell_image, empty_cell_error = _read_reference_detector_image_and_error(
+                dark_image, dark_error = _read_reference_detector_image_and_error(
+                    refs_file,
+                    "dark",
+                    current_detector_number,
+                )
+                empty_cell_image, _ = _read_reference_detector_image_and_error(
                     refs_file,
                     "empty_cell_scattering",
-                    detector_number,
+                    current_detector_number,
                 )
                 empty_beam_image, empty_beam_error = _read_reference_detector_image_and_error(
                     refs_file,
                     "empty_beam_scattering",
-                    detector_number,
+                    current_detector_number,
                 )
 
                 empty_cell_t = None
+                empty_cell = None
                 if empty_cell_image is not None:
                     empty_cell_t = _empty_cell_transmission_from_context(config_id)
                     if empty_cell_t is None:
                         empty_cell_t = _empty_cell_transmission_from_refs(refs_file)
                     if empty_cell_t is None:
                         raise ValueError(f"Missing empty-cell transmission for config_id={config_id}")
-
-            corrected = subtract_scattering_references(
-                sample_image,
-                sample_t,
-                dark=dark_image,
-                empty_cell=empty_cell_image,
-                empty_cell_transmission=empty_cell_t,
-                empty_beam=empty_beam_image,
-                empty_beam_transmission=1.0 if empty_beam_image is not None else None,
-                distance=detector_distance,
-                beam_center=beam_center,
-            )
-
-            corrected_variance = np.square(sample_error) / (sample_t * sample_t)
-            if dark_error is not None and empty_cell_image is None:
-                corrected_variance += np.square(dark_error) / (sample_t * sample_t)
-            elif dark_error is not None and empty_cell_image is not None and empty_cell_t is not None:
-                corrected_variance += np.square(dark_error) * np.square((1.0 / empty_cell_t) - (1.0 / sample_t))
-            if empty_cell_error is not None and empty_cell_t is not None:
-                corrected_variance += np.square(empty_cell_error) / (empty_cell_t * empty_cell_t)
-            corrected_error = np.sqrt(corrected_variance)
-
-            solid_angle_corrected = normalize_by_solid_angle(
-                corrected,
-                detector_distance=detector_distance,
-                beam_center=beam_center,
-                pixel_size=pixel_size,
-            )
-            solid_angle_correction = normalize_by_solid_angle(
-                np.ones_like(corrected, dtype=np.float64),
-                detector_distance=detector_distance,
-                beam_center=beam_center,
-                pixel_size=pixel_size,
-            )
-            solid_angle_error = corrected_error * solid_angle_correction
+                    empty_cell_monitor, empty_cell_count_time = _read_reference_monitor_and_count_time(
+                        refs_file,
+                        "empty_cell_scattering",
+                    )
+                    if empty_cell_monitor is None or empty_cell_count_time is None:
+                        raise ValueError(f"Missing empty-cell metadata for config_id={config_id}")
+                    empty_cell_deadtime = _read_reference_detector_deadtime(
+                        refs_file,
+                        "empty_cell_scattering",
+                        current_detector_number,
+                    )
+                    empty_cell = PipelineData(
+                        image=empty_cell_image,
+                        transmission=empty_cell_t,
+                        monitor=empty_cell_monitor,
+                        acquisition_time=empty_cell_count_time,
+                        deadtime=empty_cell_deadtime,
+                    )
 
             with h5py.File(refs_norm_path, "r") as refs_norm_file:
                 water_corrected_image, _ = _read_reference_detector_image_and_error(
                     refs_norm_file,
                     "water_corrected",
-                    detector_number,
+                    current_detector_number,
                 )
             if water_corrected_image is None:
                 raise ValueError(
-                    f"Missing water_corrected in refs_norm for config_id={config_id}, detector{detector_number}"
+                    f"Missing water_corrected in refs_norm for config_id={config_id}, detector{current_detector_number}"
                 )
-            if water_corrected_image.shape != solid_angle_corrected.shape:
-                raise ValueError(
-                    f"water_corrected shape mismatch for detector{detector_number}: "
-                    f"expected {solid_angle_corrected.shape}, got {water_corrected_image.shape}"
-                )
-            invalid_water_mask = ~np.isfinite(water_corrected_image) | (water_corrected_image <= 0.0)
-            solid_angle_corrected = solid_angle_corrected / water_corrected_image
-            solid_angle_error = solid_angle_error / np.abs(water_corrected_image)
-            mask = _combine_masks(mask, invalid_water_mask)
-
-            q_map = compute_q_norm_map(
-                corrected,
-                beam_center=beam_center,
-                detector_distance=detector_distance,
-                pixel_size=pixel_size,
-                wavelength=wavelength,
-            )
-
-            q_error_map = None
-            wavelength_spread = ctx.get("wavelength_spread")
-            collimation = getattr(configuration, "collimation", None)
-            if (
-                wavelength_spread is not None
-                and collimation is not None
-                and getattr(collimation.aperture1, "diameter", None) is not None
-                and getattr(collimation.aperture2, "diameter", None) is not None
-            ):
-                q_error_map = compute_q_resolution_circular(
-                    q_map,
-                    r1=float(collimation.aperture1.diameter),
-                    r2=float(collimation.aperture2.diameter),
-                    collimation_distance=float(collimation.collimation_distance),
-                    distance=detector_distance,
-                    wavelength_spread=float(wavelength_spread),
-                    wavelength=wavelength,
+            reduction = reduction_pipeline.run(
+                ReductionInputs(
+                    sample_image=sample_image,
+                    sample_error=sample_error,
+                    sample_transmission=sample_t,
+                    detector_distance=detector_distance,
+                    beam_center=beam_center,
                     pixel_size=pixel_size,
-                )
-
-            integration = azimuthal_average(
-                solid_angle_corrected,
-                q_map,
-                mask=mask,
-                intensity_error=solid_angle_error,
-                q_error=q_error_map,
-                n_bins=n_bins,
-            )
-
-            valid_bins = integration.counts > 0
-            q_values = integration.q[valid_bins]
-            intensity_values = integration.intensity[valid_bins]
-            intensity_error_values = (
-                np.full_like(q_values, np.nan)
-                if integration.intensity_error is None
-                else integration.intensity_error[valid_bins]
-            )
-            q_error_values = (
-                np.full_like(q_values, np.nan)
-                if integration.q_error is None
-                else integration.q_error[valid_bins]
-            )
-
-            safe_sample_name = re.sub(r"[^A-Za-z0-9._-]+", "_", sample_name).strip("_") or "sample"
-            output_path = (ctx.output_dir / f"{safe_sample_name}_det{detector_number}_{config_id}.txt").resolve()
-            header = "\n".join(
-                (
-                    f"sample_name: {sample_name}",
-                    f"config_id: {config_id}",
-                    f"detector: detector{detector_number}",
-                    f"transmission: {sample_t:.6g}",
-                    "columns: q i i_error q_error",
+                    wavelength=wavelength,
+                    n_bins=int(n_bins),
+                    dark_image=dark_image,
+                    dark_error=dark_error,
+                    empty_cell=empty_cell,
+                    empty_beam_image=empty_beam_image,
+                    empty_beam_error=empty_beam_error,
+                    water_corrected_image=water_corrected_image,
+                    mask=mask,
+                    wavelength_spread=ctx.get("wavelength_spread"),
+                    collimation=getattr(configuration, "collimation", None),
                 )
             )
-            np.savetxt(
-                output_path,
-                np.column_stack((q_values, intensity_values, intensity_error_values, q_error_values)),
-                header=header,
-                comments="# ",
+            results.append(
+                WorkflowReductionResult(
+                    run_key=key,
+                    detector_number=current_detector_number,
+                    source_path=path,
+                    state=reduction,
+                )
             )
-            ctx.add_artifact(output_path.name, output_path, kind="text")
-
-    return ctx
+    if not results:
+        if sample_name is None and config_id is None and detector_number is None:
+            raise ValueError("WorkflowContext has no matching scattering reductions")
+        filters = []
+        if sample_name is not None:
+            filters.append(f"sample_name={sample_name!r}")
+        if config_id is not None:
+            filters.append(f"config_id={config_id!r}")
+        if detector_number is not None:
+            filters.append(f"detector_number={detector_number!r}")
+        raise ValueError(f"WorkflowContext has no scattering reduction for {', '.join(filters)}")
+    return results

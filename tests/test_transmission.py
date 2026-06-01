@@ -169,7 +169,7 @@ class TestTransmission(unittest.TestCase):
 
             configuration = Configuration(
                 wavelength=6.0,
-                sample_detector_distance=4.2,
+                sample_detector_distance=[4.2, 2.1],
                 config_id="config_1",
                 collimation=Collimation(
                     aperture1=Aperture(type="slit", x_gap=0.002, y_gap=0.003),
@@ -233,7 +233,7 @@ class TestTransmission(unittest.TestCase):
 
             configuration = Configuration(
                 wavelength=6.0,
-                sample_detector_distance=4.2,
+                sample_detector_distance=[4.2, 2.1],
                 config_id="config_1",
                 collimation=Collimation(
                     aperture1=Aperture(type="slit", x_gap=0.002, y_gap=0.003),
@@ -298,7 +298,7 @@ class TestTransmission(unittest.TestCase):
 
             configuration = Configuration(
                 wavelength=6.0,
-                sample_detector_distance=4.2,
+                sample_detector_distance=[4.2, 2.1],
                 config_id="config_1",
                 collimation=Collimation(
                     aperture1=Aperture(type="slit", x_gap=0.002, y_gap=0.003),
@@ -372,7 +372,7 @@ class TestTransmission(unittest.TestCase):
 
             configuration = Configuration(
                 wavelength=6.0,
-                sample_detector_distance=4.2,
+                sample_detector_distance=[4.2, 2.1],
                 config_id="config_1",
                 collimation=Collimation(
                     aperture1=Aperture(type="slit", x_gap=0.002, y_gap=0.003),
@@ -397,12 +397,7 @@ class TestTransmission(unittest.TestCase):
             compute_reference_transmissions(refs_norm)
             written = write_corrected_water_scattering(refs_norm)
 
-            expected = normalize_by_solid_angle(
-                np.full((4, 4), 6.5, dtype=np.float64),
-                detector_distance=4.2,
-                beam_center=(1.5, 1.5),
-                pixel_size=(0.001, 0.001),
-            )
+            expected = np.full((4, 4), 6.5, dtype=np.float64)
             np.testing.assert_allclose(written[0], expected)
             with h5py.File(refs_norm, "r") as f:
                 np.testing.assert_allclose(
@@ -459,7 +454,7 @@ class TestTransmission(unittest.TestCase):
 
             configuration = Configuration(
                 wavelength=6.0,
-                sample_detector_distance=4.2,
+                sample_detector_distance=[4.2, 2.1],
                 config_id="config_1",
                 collimation=Collimation(
                     aperture1=Aperture(type="slit", x_gap=0.002, y_gap=0.003),
@@ -501,12 +496,7 @@ class TestTransmission(unittest.TestCase):
             written = write_corrected_water_scattering(refs_norm)
 
             self.assertIn(1, written)
-            expected = normalize_by_solid_angle(
-                np.full((136, 16), 13.0, dtype=np.float64),
-                detector_distance=4.2,
-                beam_center=(0.0, 0.0),
-                pixel_size=(0.001, 0.001),
-            )
+            expected = np.full((136, 16), 13.0, dtype=np.float64)
             np.testing.assert_allclose(written[1], expected)
 
 

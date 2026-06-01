@@ -84,7 +84,7 @@ def correct_detector_dead_time(
 
     The correction is applied on the count rate:
 
-    ``I_corrected = (I / acq_time) / (1 - (I / acq_time) * deadtime)``
+    ``I_corrected = (I) / (1 - (I / acq_time) * deadtime)``
 
     where ``I`` is the measured image in counts, ``acq_time`` the acquisition
     time in seconds, and ``deadtime`` the detector dead time in seconds.
@@ -103,7 +103,7 @@ def correct_detector_dead_time(
     if np.any(denominator <= 0.0):
         raise ValueError("dead-time correction is undefined when 1 - rate * deadtime <= 0")
 
-    return rate / denominator
+    return rate / denominator * acq_time
 
 
 def subtract_scattering_references(

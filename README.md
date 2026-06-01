@@ -25,6 +25,12 @@ From the project root:
 pip install -e .
 ```
 
+For notebooks:
+
+```bash
+pip install -e .[notebook]
+```
+
 For tests:
 
 ```bash
@@ -37,6 +43,16 @@ If the package is not installed in editable mode, tests can also be run with:
 ```bash
 PYTHONPATH=src pytest -q
 ```
+
+### GUI note
+
+The mask editor currently uses `tkinter`.
+
+- `tkinter` is not a pip dependency managed through `pyproject.toml`
+- it is usually provided by the Python installation or by a system package
+- on some Linux distributions you may need to install `python3-tk`
+
+For the most portable setup, the core package, CLI, and notebooks should be considered the primary interfaces; the `tkinter` GUI remains optional.
 
 ---
 

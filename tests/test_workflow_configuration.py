@@ -45,7 +45,7 @@ def _write_refs_sub_style_file(
     path: Path,
     *,
     wavelength_a: Optional[float] = 6.0,
-    sample_detector_distance_m: Optional[float] = 4.2,
+    sample_detector_distance_m: Optional[float | list[float]] = 4.2,
     config_id: Optional[str] = "cfg",
     notes: Optional[str] = "notes",
     collimation_distance_m: Optional[float] = 1.5,
@@ -90,6 +90,7 @@ def _write_instrument_style_file(
     *,
     wavelength_a: Optional[float] = 6.0,
     translation_xyz_m: Optional[tuple[float, float, float]] = (0.0, 0.0, 4.2),
+    extra_detector_translations_m: Optional[Mapping[int, tuple[float, float, float]]] = None,
     upstream_elements: Optional[list[tuple[str, float, str, Mapping[str, Any]]]] = None,
 ) -> None:
     """
@@ -114,6 +115,10 @@ def _write_instrument_style_file(
         if translation_xyz_m is not None:
             tr = det0.create_group("transformations")
             _ds(tr, "translation", np.array(translation_xyz_m, dtype=float))
+        for detector_number, translation in sorted((extra_detector_translations_m or {}).items()):
+            det = inst.create_group(f"detector{int(detector_number)}")
+            tr = det.create_group("transformations")
+            _ds(tr, "translation", np.array(translation, dtype=float))
 
         col = inst.create_group("collimation")
         elems = col.create_group("elements")
@@ -377,6 +382,47 @@ class TestConfigurationFromNexus(unittest.TestCase):
                 )
                 self.assertNotIn("/entry/mask/beamstop_mask_detector0", f)
 
+    def test_write_refs_norm_file_round_trips_multiple_detector_distances(self) -> None:
+        schema = load_schema("scarlet_refs_norm_v1.0.yaml")
+
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "refs_norm_multi.nxs"
+            wtr = Path(td) / "water_transmission.nxs"
+            wsc = Path(td) / "water_scattering.nxs"
+            ebt = Path(td) / "empty_beam_transmission.nxs"
+            _write_reference_source_file(wtr, title="water-transmission")
+            _write_reference_source_file(wsc, title="water-scattering")
+            _write_reference_source_file(ebt, title="ebt")
+
+            configuration = Configuration(
+                wavelength=6.0,
+                sample_detector_distance=[4.2, 1.8],
+                config_id="cfg-1",
+                collimation=Collimation(
+                    aperture1=Aperture(type="slit", x_gap=0.002, y_gap=0.003),
+                    aperture2=Aperture(type="pinhole", diameter=0.004),
+                    collimation_distance=1.5,
+                    last_aperture_to_sample_distance=0.5,
+                ),
+            )
+
+            write_refs_norm_file(
+                out,
+                configuration,
+                water_scattering=wsc,
+                water_transmission=wtr,
+                empty_beam_transmission=ebt,
+                transmission_roi_detector=0,
+                transmission_roi=(1, 10, 2, 11),
+            )
+
+            report = validate_nexus_file(out, schema)
+            self.assertTrue(report.ok, report.format_lines())
+
+            cfg, issues = configuration_from_nexus(out)
+            self.assertEqual(issues, [])
+            self.assertEqual(cfg, configuration)
+
     def test_write_refs_sub_file_matches_schema(self) -> None:
         schema = load_schema("scarlet_refs_sub_v1.0.yaml")
 
@@ -423,6 +469,41 @@ class TestConfigurationFromNexus(unittest.TestCase):
             with h5py.File(out, "r") as f:
                 self.assertEqual(f["/entry/references/empty_beam_transmission/entry/title"][()].decode(), "ebt")
                 self.assertEqual(f["/entry/meta/dark_source_file"][()].decode(), str(dark.resolve()))
+
+    def test_write_refs_sub_file_round_trips_multiple_detector_distances(self) -> None:
+        schema = load_schema("scarlet_refs_sub_v1.0.yaml")
+
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "refs_sub_multi.nxs"
+            ebt = Path(td) / "empty_beam_transmission.nxs"
+            _write_reference_source_file(ebt, title="ebt")
+
+            configuration = Configuration(
+                wavelength=6.0,
+                sample_detector_distance=[4.2, 1.8],
+                config_id="cfg-1",
+                collimation=Collimation(
+                    aperture1=Aperture(type="slit", x_gap=0.002, y_gap=0.003),
+                    aperture2=Aperture(type="pinhole", diameter=0.004),
+                    collimation_distance=1.5,
+                    last_aperture_to_sample_distance=0.5,
+                ),
+            )
+
+            write_refs_sub_file(
+                out,
+                configuration,
+                empty_beam_transmission=ebt,
+                transmission_roi_detector=0,
+                transmission_roi=(1, 10, 2, 11),
+            )
+
+            report = validate_nexus_file(out, schema)
+            self.assertTrue(report.ok, report.format_lines())
+
+            cfg, issues = configuration_from_nexus(out)
+            self.assertEqual(issues, [])
+            self.assertEqual(cfg, configuration)
 
     def test_write_refs_sub_file_copies_beam_centers_for_multiple_detectors(self) -> None:
         schema = load_schema("scarlet_refs_sub_v1.0.yaml")
@@ -933,6 +1014,21 @@ class TestConfigurationFromNexus(unittest.TestCase):
             self.assertEqual(cfg.collimation.aperture1.type, "slit")
             self.assertEqual(cfg.collimation.aperture2.type, "pinhole")
 
+    def test_instrument_style_infers_multiple_detector_distances(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "inst_multi.h5"
+            _write_instrument_style_file(
+                p,
+                extra_detector_translations_m={
+                    1: (0.0, 0.0, 1.8),
+                    2: (0.0, 0.0, 0.9),
+                },
+            )
+
+            cfg, issues = configuration_from_nexus(p)
+            self.assertEqual(issues, [])
+            self.assertEqual(cfg.sample_detector_distance, [4.2, 1.8, 0.9])
+
     def test_instrument_style_missing_upstream_apertures(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             p = Path(td) / "inst_missing.h5"
@@ -953,6 +1049,19 @@ class TestCompareConfigurations(unittest.TestCase):
             p2 = Path(td) / "b.h5"
             _write_refs_sub_style_file(p1, wavelength_a=6.0, sample_detector_distance_m=4.200)
             _write_refs_sub_style_file(p2, wavelength_a=6.05, sample_detector_distance_m=4.205)
+
+            a, _ = configuration_from_nexus(p1)
+            b, _ = configuration_from_nexus(p2)
+            same, diffs = compare_configurations(a, b)
+            self.assertTrue(same)
+            self.assertEqual(diffs, [])
+
+    def test_compare_from_files_same_with_multiple_detector_distances(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            p1 = Path(td) / "a_multi.h5"
+            p2 = Path(td) / "b_multi.h5"
+            _write_refs_sub_style_file(p1, sample_detector_distance_m=[4.2, 1.8])
+            _write_refs_sub_style_file(p2, sample_detector_distance_m=[4.205, 1.795])
 
             a, _ = configuration_from_nexus(p1)
             b, _ = configuration_from_nexus(p2)

@@ -16,7 +16,7 @@ class AzimuthalAverageResult:
     q_error: np.ndarray | None
     counts: np.ndarray
 
-def regiso(image, mask, x0, y0, x_pixel_size, y_pixel_size, bins=None, error=None):
+def radial_average(image, mask, x0, y0, x_pixel_size, y_pixel_size, bins=None, error=None):
     y, x = np.indices(image.shape, dtype='float')
     y = (y-y0)*y_pixel_size
     x = (x-x0)*x_pixel_size

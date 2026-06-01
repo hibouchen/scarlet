@@ -31,7 +31,7 @@ def update_detector0_beam_center_from_empty_beam_transmission(
             if isinstance(definition_raw, (bytes, bytearray))
             else str(definition_raw)
         )
-        if definition != "SCARLET_refs_sub":
+        if definition not in {"SCARLET_refs_sub", "SCARLET_refs_norm"}:
             raise ValueError(f"Unsupported refs bundle definition: {definition!r}")
 
         source_dataset_path = f"{entry_path}/meta/empty_beam_transmission_source_file"
@@ -109,7 +109,7 @@ def insert_beam_centers_in_refs_file(
             if isinstance(definition_raw, (bytes, bytearray))
             else str(definition_raw)
         )
-        if definition != "SCARLET_refs_sub":
+        if definition not in {"SCARLET_refs_sub", "SCARLET_refs_norm"}:
             raise ValueError(f"Unsupported refs bundle definition: {definition!r}")
 
         beam_center_group = entry.require_group("beam_center")
@@ -371,7 +371,6 @@ def write_corrected_water_scattering(
     *,
     entry_path: str = "/entry",
 ) -> dict[int, np.ndarray]:
-    from scarlet.reduction import normalize_by_solid_angle
 
     ref_norm_file = Path(ref_norm_file).resolve()
     corrected_by_detector: dict[int, np.ndarray] = {}
@@ -419,38 +418,13 @@ def write_corrected_water_scattering(
         if not detector_numbers:
             raise ValueError("refs_norm must contain at least one water_scattering detector image")
 
-        configuration_group = entry.get("configuration")
-        if not isinstance(configuration_group, h5py.Group) or "sample_detector_distance" not in configuration_group:
-            raise ValueError(f"Missing {entry_path}/configuration/sample_detector_distance")
-        detector_distance = float(np.asarray(configuration_group["sample_detector_distance"][()]).reshape(()))
-
         for detector_number in detector_numbers:
             corrected = compute_corrected_water_scattering(
                 ref_norm_file,
                 detector_number=detector_number,
                 entry_path=entry_path,
             )
-            detector_group = water_entry.get(f"instrument/detector{detector_number}")
-            if not isinstance(detector_group, h5py.Group):
-                raise ValueError(f"Missing water_scattering detector group: detector{detector_number}")
-            if "x_pixel_size" not in detector_group or "y_pixel_size" not in detector_group:
-                raise ValueError(f"Missing pixel size datasets in water_scattering detector{detector_number}")
-            if "beam_center_x" not in detector_group or "beam_center_y" not in detector_group:
-                raise ValueError(f"Missing beam center datasets in water_scattering detector{detector_number}")
-            pixel_size = (
-                float(np.asarray(detector_group["x_pixel_size"][()]).reshape(())),
-                float(np.asarray(detector_group["y_pixel_size"][()]).reshape(())),
-            )
-            beam_center = (
-                float(np.asarray(detector_group["beam_center_x"][()]).reshape(())),
-                float(np.asarray(detector_group["beam_center_y"][()]).reshape(())),
-            )
-            corrected_by_detector[detector_number] = normalize_by_solid_angle(
-                corrected,
-                detector_distance=detector_distance,
-                beam_center=beam_center,
-                pixel_size=pixel_size,
-            )
+            corrected_by_detector[detector_number] = corrected
 
         if "water_corrected" in references:
             del references["water_corrected"]
