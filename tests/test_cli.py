@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import h5py
 import numpy as np
@@ -46,6 +47,20 @@ class TestCli(unittest.TestCase):
             ])
             self.assertEqual(status, 0)
             self.assertTrue(output.exists())
+
+    def test_nxsas_gui_command_dispatches_viewer(self) -> None:
+        with mock.patch("scarlet.gui.run_nxsas_viewer") as run_nxsas_viewer:
+            status = main(["nxsas-gui", "tests/data/sam/raw_data"])
+
+        self.assertEqual(status, 0)
+        run_nxsas_viewer.assert_called_once_with(Path("tests/data/sam/raw_data"))
+
+    def test_viewer_command_dispatches_silx_viewer(self) -> None:
+        with mock.patch("scarlet.gui.run_viewer", return_value=0) as run_viewer:
+            status = main(["viewer", "tests/data/sam/raw_data", "--instrument", "sam"])
+
+        self.assertEqual(status, 0)
+        run_viewer.assert_called_once_with(Path("tests/data/sam/raw_data"), instrument="sam")
 
 
 if __name__ == "__main__":

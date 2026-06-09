@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Literal, cast
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Literal, Union, cast
 from datetime import datetime, timezone
 from collections import OrderedDict
 import csv
@@ -20,6 +20,7 @@ import h5py
 
 Level = Literal["INFO", "WARN", "ERROR"]
 Mode = Literal["scattering", "transmission"]
+RefsNormReference = Union[Path, str]
 
 # “entity” describes which physical run it is.
 # sample_name may also be used on non-sample entities to preserve manual labels.
@@ -107,7 +108,7 @@ class WorkflowReductionResult:
     """One reduction-pipeline execution derived from a workflow context."""
 
     run_key: RunKey
-    detector_number: int
+    detector_number: Optional[int]
     source_path: Path
     state: Any
 
@@ -148,7 +149,7 @@ class WorkflowContext:
 
     # --- refs_sub bundles per config
     refs_sub_files: Dict[str, Path] = field(default_factory=dict)  # config_id -> refs_sub .nxs
-    refs_norm_files: Dict[str, Path] = field(default_factory=dict)  # config_id -> refs_norm .nxs
+    refs_norm_files: Dict[str, RefsNormReference] = field(default_factory=dict)  # config_id -> refs_norm .nxs or source config_id
     masks_files: Dict[str, Path] = field(default_factory=dict)  # config_id -> masks .nxs
     # --- cached objects
     # store anything; structured cache accessors below are backed by this map
@@ -317,13 +318,54 @@ class WorkflowContext:
             raise KeyError(f"Missing refs_sub for config_id={config_id}")
         return self.refs_sub_files[config_id]
 
-    def set_refs_norm(self, config_id: str, file_path: Path) -> None:
+    def set_refs_norm(self, config_id: str, file_path: str | Path) -> None:
+        if isinstance(file_path, str) and self._looks_like_refs_norm_alias(file_path):
+            if config_id == file_path:
+                raise ValueError("refs_norm source config_id must be different from the target config_id")
+            self.refs_norm_files[config_id] = file_path
+            return
         self.refs_norm_files[config_id] = Path(file_path).resolve()
 
+    def _looks_like_refs_norm_alias(self, value: str) -> bool:
+        if value == "":
+            return False
+        if value in self.refs_norm_files or value in self.refs_sub_files or value in self.configurations:
+            return True
+        if any(key.config_id == value for key in self.runs):
+            return True
+        return "/" not in value and "\\" not in value and Path(value).suffix == ""
+
+    def is_refs_norm_alias(self, config_id: str) -> bool:
+        value = self.refs_norm_files.get(config_id)
+        return isinstance(value, str) and self._looks_like_refs_norm_alias(value)
+
+    def resolve_refs_norm_config_id(self, config_id: str) -> str:
+        seen: list[str] = []
+        current = config_id
+        while self.is_refs_norm_alias(current):
+            if current in seen:
+                chain = " -> ".join([*seen, current])
+                raise ValueError(f"Cyclic refs_norm configuration alias: {chain}")
+            seen.append(current)
+            current = cast(str, self.refs_norm_files[current])
+            if current in seen:
+                chain = " -> ".join([*seen, current])
+                raise ValueError(f"Cyclic refs_norm configuration alias: {chain}")
+        return current
+
     def get_refs_norm_path(self, config_id: str) -> Path:
-        if config_id not in self.refs_norm_files:
+        resolved_config_id = self.resolve_refs_norm_config_id(config_id)
+        if resolved_config_id not in self.refs_norm_files:
+            if resolved_config_id != config_id:
+                raise KeyError(
+                    f"Missing refs_norm for config_id={config_id} "
+                    f"(source config_id={resolved_config_id})"
+                )
             raise KeyError(f"Missing refs_norm for config_id={config_id}")
-        return self.refs_norm_files[config_id]
+        value = self.refs_norm_files[resolved_config_id]
+        if isinstance(value, str) and self._looks_like_refs_norm_alias(value):
+            raise KeyError(f"refs_norm alias for config_id={resolved_config_id} does not resolve to a file")
+        return Path(value).resolve()
 
     def set_masks_file(self, config_id: str, file_path: Path) -> None:
         self.masks_files[config_id] = Path(file_path).resolve()
@@ -365,7 +407,11 @@ class WorkflowContext:
             for config_id, path in self.refs_sub_files.items()
         }
         self.refs_norm_files = {
-            config_id: _rebase_path_if_under(path, old_output_dir, new_output_dir)
+            config_id: (
+                path
+                if isinstance(path, str) and self._looks_like_refs_norm_alias(path)
+                else _rebase_path_if_under(Path(path), old_output_dir, new_output_dir)
+            )
             for config_id, path in self.refs_norm_files.items()
         }
         self.masks_files = {
@@ -395,22 +441,20 @@ class WorkflowContext:
         refs_sub_path = self.refs_sub_files.get(config_id)
         if refs_sub_path is None:
             raise KeyError(f"Missing refs_sub for config_id={config_id}")
-        refs_norm_path = self.refs_norm_files.get(config_id)
-        if refs_norm_path is None:
-            raise KeyError(f"Missing refs_norm for config_id={config_id}")
-
         insert_beam_centers_in_refs_file(
             refs_sub_path,
             detector_number,
             beam_center_x,
             beam_center_y,
         )
-        insert_beam_centers_in_refs_file(
-            refs_norm_path,
-            detector_number,
-            beam_center_x,
-            beam_center_y,
-        )
+        if not self.is_refs_norm_alias(config_id):
+            refs_norm_path = self.get_refs_norm_path(config_id)
+            insert_beam_centers_in_refs_file(
+                refs_norm_path,
+                detector_number,
+                beam_center_x,
+                beam_center_y,
+            )
         return self
 
     def runs_table(self) -> TableView:
@@ -534,6 +578,63 @@ def _is_hdf5_file(path: Path) -> bool:
         return False
 
 
+_IGNORED_INPUT_DEFINITIONS = {
+    "NXsas_raw",
+    "SCARLET_masks",
+    "SCARLET_refs_sub",
+    "SCARLET_refs_norm",
+    "SCARLET_workflow_context",
+}
+
+
+def _pick_nexus_entry_path(handle: h5py.File) -> Optional[str]:
+    for candidate in ("/raw_data", "/entry0", "/entry", "/entry1"):
+        if candidate in handle and isinstance(handle[candidate], h5py.Group):
+            return candidate
+    for key in handle.keys():
+        candidate = f"/{key}"
+        obj = handle[candidate]
+        if not isinstance(obj, h5py.Group):
+            continue
+        nx_class = _read_text_value(obj.attrs.get("NX_class", ""))
+        if nx_class == "NXentry":
+            return candidate
+    return None
+
+
+def _classify_hdf5_input_candidate(path: Path) -> tuple[bool, Optional[str]]:
+    try:
+        with h5py.File(path, "r") as handle:
+            entry_path = _pick_nexus_entry_path(handle)
+            if entry_path is None:
+                return False, "Skipping HDF5 input file without NXentry"
+
+            definition_path = f"{entry_path}/definition"
+            if definition_path in handle:
+                try:
+                    definition = _read_text_dataset(handle[definition_path]).strip()
+                except Exception:
+                    definition = ""
+                if definition in _IGNORED_INPUT_DEFINITIONS:
+                    return False, f"Skipping non-raw HDF5 input file with definition {definition!r}"
+
+            entry = handle[entry_path]
+            assert isinstance(entry, h5py.Group)
+            if "instrument" in entry and isinstance(entry["instrument"], h5py.Group):
+                return True, None
+
+            for obj in entry.values():
+                if not isinstance(obj, h5py.Group):
+                    continue
+                nx_class = _read_text_value(obj.attrs.get("NX_class", ""))
+                if nx_class == "NXinstrument":
+                    return True, None
+
+            return False, "Skipping HDF5 input file without NXinstrument under entry"
+    except OSError:
+        return False, "Skipping unreadable HDF5 input file"
+
+
 def _next_generated_config_id(existing_config_ids: Iterable[str]) -> str:
     taken = set(existing_config_ids)
     index = 1
@@ -568,7 +669,15 @@ def _ingest_raw_directory_into_workflow_context(
     raw_files: list[Path] = []
     for path in candidate_files:
         if _is_hdf5_file(path):
-            raw_files.append(path)
+            is_raw_candidate, skip_reason = _classify_hdf5_input_candidate(path)
+            if is_raw_candidate:
+                raw_files.append(path)
+                continue
+            ctx.warn(
+                skip_reason or "Skipping unsupported HDF5 input file",
+                where=where,
+                key=str(path),
+            )
             continue
         ctx.warn(
             "Skipping non-HDF5 input file",
@@ -919,13 +1028,20 @@ def save_workflow_context(
         refs_group.attrs["NX_class"] = np.bytes_("NXcollection")
         for group_name, mapping in (
             ("refs_sub_files", workflow_context.refs_sub_files),
-            ("refs_norm_files", workflow_context.refs_norm_files),
             ("masks_files", workflow_context.masks_files),
         ):
             subgroup = refs_group.create_group(group_name)
             subgroup.attrs["NX_class"] = np.bytes_("NXcollection")
             for config_id, path in sorted(mapping.items()):
                 _write_scalar_dataset(subgroup, config_id, _path_to_storage_string(path, base_dir=base_dir))
+
+        refs_norm_group = refs_group.create_group("refs_norm_files")
+        refs_norm_group.attrs["NX_class"] = np.bytes_("NXcollection")
+        for config_id, value in sorted(workflow_context.refs_norm_files.items()):
+            if isinstance(value, str) and workflow_context._looks_like_refs_norm_alias(value):
+                _write_scalar_dataset(refs_norm_group, config_id, value)
+            else:
+                _write_scalar_dataset(refs_norm_group, config_id, _path_to_storage_string(Path(value), base_dir=base_dir))
 
         masks_group = entry.create_group("masks")
         masks_group.attrs["NX_class"] = np.bytes_("NXcollection")
@@ -1068,13 +1184,28 @@ def load_workflow_context(file_path: str | Path) -> WorkflowContext:
         refs_group = entry["references"]
         for attribute_name, group_name in (
             ("refs_sub_files", "refs_sub_files"),
-            ("refs_norm_files", "refs_norm_files"),
             ("masks_files", "masks_files"),
         ):
             mapping = cast(dict[str, Path], getattr(workflow_context, attribute_name))
             for key, dataset in refs_group[group_name].items():
                 if isinstance(dataset, h5py.Dataset):
                     mapping[key] = _resolve_stored_path(_read_text_dataset(dataset), base_dir=base_dir)
+
+        if "refs_norm_files" in refs_group:
+            for key, dataset in refs_group["refs_norm_files"].items():
+                if isinstance(dataset, h5py.Dataset):
+                    raw_value = _read_text_dataset(dataset)
+                    if workflow_context._looks_like_refs_norm_alias(raw_value):
+                        workflow_context.set_refs_norm(key, raw_value)
+                    else:
+                        workflow_context.refs_norm_files[key] = _resolve_stored_path(raw_value, base_dir=base_dir)
+
+        if "refs_norm_fallbacks" in refs_group:
+            for key, dataset in refs_group["refs_norm_fallbacks"].items():
+                if isinstance(dataset, h5py.Dataset):
+                    source_config_id = _read_text_dataset(dataset)
+                    if source_config_id:
+                        workflow_context.set_refs_norm(key, source_config_id)
 
         if "masks" in entry:
             for config_id, config_group in entry["masks"].items():
@@ -1412,8 +1543,14 @@ def generate_reference_files_from_workflow_context(ctx: WorkflowContext) -> Work
         raise ValueError("WorkflowContext has no runs")
 
     ctx.output_dir.mkdir(parents=True, exist_ok=True)
+    refs_norm_aliases = {
+        config_id: cast(str, value)
+        for config_id, value in ctx.refs_norm_files.items()
+        if isinstance(value, str) and ctx._looks_like_refs_norm_alias(value)
+    }
     ctx.refs_sub_files.clear()
     ctx.refs_norm_files.clear()
+    ctx.refs_norm_files.update(refs_norm_aliases)
 
     count_time_cache: dict[Path, float] = {}
     transmission_roi_detector = int(ctx.get("transmission_roi_detector", 0))
@@ -1526,16 +1663,17 @@ def generate_reference_files_from_workflow_context(ctx: WorkflowContext) -> Work
 
         water_scattering = local_water_scattering or global_water_scattering
         water_transmission = local_water_transmission or global_water_transmission
-        if water_scattering is None:
+        refs_norm_source_config_id = cast(str, ctx.refs_norm_files.get(config_id)) if ctx.is_refs_norm_alias(config_id) else None
+        if refs_norm_source_config_id is None and water_scattering is None:
             raise ValueError(f"Missing water scattering reference for {config_id}")
-        if water_transmission is None:
+        if refs_norm_source_config_id is None and water_transmission is None:
             raise ValueError(f"Missing water transmission reference for {config_id}")
 
         water_scattering_source_config_id = None
-        if water_scattering[0].config_id != config_id:
+        if water_scattering is not None and water_scattering[0].config_id != config_id:
             water_scattering_source_config_id = water_scattering[0].config_id
         water_transmission_source_config_id = None
-        if water_transmission[0].config_id != config_id:
+        if water_transmission is not None and water_transmission[0].config_id != config_id:
             water_transmission_source_config_id = water_transmission[0].config_id
 
         configuration = ctx.configurations.get(config_id)
@@ -1591,6 +1729,20 @@ def generate_reference_files_from_workflow_context(ctx: WorkflowContext) -> Work
         ctx.set_refs_sub(config_id, refs_sub_path)
         ctx.add_artifact(refs_sub_path.name, refs_sub_path, kind="nexus")
 
+        if refs_norm_source_config_id is not None:
+            ctx.info(
+                "Using refs_norm source config",
+                where="generate_reference_files_from_workflow_context",
+                config_id=config_id,
+                source_config_id=refs_norm_source_config_id,
+            )
+            continue
+
+        if water_scattering is None:
+            raise ValueError(f"Missing water scattering reference for {config_id}")
+        if water_transmission is None:
+            raise ValueError(f"Missing water transmission reference for {config_id}")
+
         refs_norm_path = write_refs_norm_file(
             ctx.output_dir / f"refs_norm_{config_id}.nxs",
             configuration,
@@ -1615,6 +1767,25 @@ def generate_reference_files_from_workflow_context(ctx: WorkflowContext) -> Work
         ).resolve()
         ctx.set_refs_norm(config_id, refs_norm_path)
         ctx.add_artifact(refs_norm_path.name, refs_norm_path, kind="nexus")
+
+    for config_id, source_config_id in sorted(
+        (config_id, cast(str, value))
+        for config_id, value in ctx.refs_norm_files.items()
+        if isinstance(value, str) and ctx._looks_like_refs_norm_alias(value)
+    ):
+        try:
+            source_path = ctx.get_refs_norm_path(config_id)
+        except KeyError as exc:
+            raise ValueError(
+                f"refs_norm source for {config_id} points to missing config_id={source_config_id}"
+            ) from exc
+        ctx.info(
+            "Resolved refs_norm source config",
+            where="generate_reference_files_from_workflow_context",
+            config_id=config_id,
+            source_config_id=source_config_id,
+            refs_norm_path=str(source_path),
+        )
 
     return ctx
 
@@ -1889,6 +2060,11 @@ def update_reference_masks_from_workflow_context(
         *ctx.configurations.keys(),
         *ctx.refs_sub_files.keys(),
         *ctx.refs_norm_files.keys(),
+        *(
+            cast(str, value)
+            for value in ctx.refs_norm_files.values()
+            if isinstance(value, str) and ctx._looks_like_refs_norm_alias(value)
+        ),
         *(key.config_id for key in ctx.runs),
     }
     selected_mask_files: dict[str, Path] = {}
@@ -1953,9 +2129,13 @@ def update_reference_masks_from_workflow_context(
         if refs_sub_path is not None and refs_sub_path.exists():
             insert_masks_in_refs_file(refs_sub_path, mask=mask_path)
 
-        refs_norm_path = ctx.refs_norm_files.get(config_id)
-        if refs_norm_path is not None and refs_norm_path.exists():
-            insert_masks_in_refs_file(refs_norm_path, mask=mask_path)
+        if not ctx.is_refs_norm_alias(config_id):
+            try:
+                refs_norm_path = ctx.get_refs_norm_path(config_id)
+            except KeyError:
+                refs_norm_path = None
+            if refs_norm_path is not None and refs_norm_path.exists():
+                insert_masks_in_refs_file(refs_norm_path, mask=mask_path)
 
     return ctx
 
@@ -1981,44 +2161,55 @@ def integrate_scattering_from_workflow_context(
     for result in results:
         sample_name = result.run_key.sample_name or "sample"
         config_id = result.run_key.config_id
-        detector_number = result.detector_number
-        integration = result.state.integration
-        if integration is None:
-            raise ValueError(f"Reduction pipeline did not produce integration for detector{detector_number}")
+        detector_numbers = sorted(result.state.detectors)
+        if result.detector_number is not None:
+            detector_numbers = [result.detector_number]
 
-        valid_bins = integration.counts > 0
-        q_values = integration.q[valid_bins]
-        intensity_values = integration.intensity[valid_bins]
-        intensity_error_values = (
-            np.full_like(q_values, np.nan)
-            if integration.intensity_error is None
-            else integration.intensity_error[valid_bins]
-        )
-        q_error_values = (
-            np.full_like(q_values, np.nan)
-            if integration.q_error is None
-            else integration.q_error[valid_bins]
-        )
+        for current_detector_number in detector_numbers:
+            detector = result.state.detectors.get(current_detector_number)
+            if detector is None or detector.x is None:
+                raise ValueError(
+                    f"Reduction pipeline did not produce azimuthal data for detector{current_detector_number}"
+                )
 
-        sample_t = float(result.state.inputs.sample_transmission)
-        safe_sample_name = re.sub(r"[^A-Za-z0-9._-]+", "_", sample_name).strip("_") or "sample"
-        output_path = (ctx.output_dir / f"{safe_sample_name}_det{detector_number}_{config_id}.txt").resolve()
-        header = "\n".join(
-            (
-                f"sample_name: {sample_name}",
-                f"config_id: {config_id}",
-                f"detector: detector{detector_number}",
-                f"transmission: {sample_t:.6g}",
-                "columns: q i i_error q_error",
+            q_all = np.asarray(detector.x, dtype=np.float64)
+            intensity_all = np.asarray(detector.data, dtype=np.float64)
+            valid_bins = np.isfinite(q_all) & np.isfinite(intensity_all)
+            q_values = q_all[valid_bins]
+            intensity_values = intensity_all[valid_bins]
+            intensity_error_values = (
+                np.full_like(q_values, np.nan)
+                if detector.data_error is None
+                else np.asarray(detector.data_error, dtype=np.float64)[valid_bins]
             )
-        )
-        np.savetxt(
-            output_path,
-            np.column_stack((q_values, intensity_values, intensity_error_values, q_error_values)),
-            header=header,
-            comments="# ",
-        )
-        ctx.add_artifact(output_path.name, output_path, kind="text")
+            if detector.x_error is None:
+                q_error_values = np.full_like(q_values, np.nan)
+            else:
+                q_error_array = np.asarray(detector.x_error, dtype=np.float64)
+                if q_error_array.ndim == 0:
+                    q_error_values = np.full_like(q_values, float(q_error_array))
+                else:
+                    q_error_values = q_error_array[valid_bins]
+
+            sample_t = float(result.state.inputs.sample_transmission)
+            safe_sample_name = re.sub(r"[^A-Za-z0-9._-]+", "_", sample_name).strip("_") or "sample"
+            output_path = (ctx.output_dir / f"{safe_sample_name}_det{current_detector_number}_{config_id}.txt").resolve()
+            header = "\n".join(
+                (
+                    f"sample_name: {sample_name}",
+                    f"config_id: {config_id}",
+                    f"detector: detector{current_detector_number}",
+                    f"transmission: {sample_t:.6g}",
+                    "columns: q i i_error q_error",
+                )
+            )
+            np.savetxt(
+                output_path,
+                np.column_stack((q_values, intensity_values, intensity_error_values, q_error_values)),
+                header=header,
+                comments="# ",
+            )
+            ctx.add_artifact(output_path.name, output_path, kind="text")
 
     return ctx
 
@@ -2068,10 +2259,7 @@ def _run_reduction_pipeline_results_from_workflow_context(
     config_id: Optional[str] = None,
     detector_number: Optional[int] = None,
 ) -> List[WorkflowReductionResult]:
-    from scarlet.reduction import (
-        normalize_by_monitor,
-    )
-    from scarlet.workflow.pipeline import PipelineData, ReductionInputs, ReductionPipeline
+    from scarlet.workflow.pipeline import ReductionInputs, ReductionPipeline
 
     if not ctx.runs:
         raise ValueError("WorkflowContext has no runs")
@@ -2080,172 +2268,6 @@ def _run_reduction_pipeline_results_from_workflow_context(
         raise ValueError(f"n_bins must be > 0, got {n_bins!r}")
 
     ctx.output_dir.mkdir(parents=True, exist_ok=True)
-
-    def _entry_path_from_file(handle: h5py.File, path: Path) -> str:
-        for entry_path in ("/raw_data", "/entry", "/entry0", "/entry1"):
-            if entry_path in handle:
-                return entry_path
-        raise ValueError(f"No entry group found in {path}")
-
-    def _read_monitor_value(handle: h5py.File, entry_path: str, *, path: Path) -> float:
-        dataset_path = f"{entry_path}/control/integral"
-        if dataset_path not in handle:
-            raise ValueError(f"Missing monitor integral in {path}: {dataset_path}")
-        monitor_value = float(np.asarray(handle[dataset_path][()]).reshape(()))
-        if not np.isfinite(monitor_value) or monitor_value <= 0.0:
-            raise ValueError(f"Monitor integral must be > 0 in {path}: {dataset_path}")
-        return monitor_value
-
-    def _read_count_time_value(handle: h5py.File, entry_path: str, *, path: Path) -> float:
-        dataset_path = f"{entry_path}/control/count_time"
-        if dataset_path not in handle:
-            raise ValueError(f"Missing count_time in {path}: {dataset_path}")
-        count_time = float(np.asarray(handle[dataset_path][()]).reshape(()))
-        if not np.isfinite(count_time) or count_time <= 0.0:
-            raise ValueError(f"count_time must be > 0 in {path}: {dataset_path}")
-        return count_time
-
-    def _available_detectors(path: Path) -> list[int]:
-        path = Path(path).resolve()
-        with h5py.File(path, "r") as handle:
-            entry_path = _entry_path_from_file(handle, path)
-            instrument_path = f"{entry_path}/instrument"
-            if instrument_path not in handle or not isinstance(handle[instrument_path], h5py.Group):
-                raise ValueError(f"Missing instrument group in {path}: {instrument_path}")
-            detector_numbers: list[int] = []
-            for name, group in handle[instrument_path].items():
-                if not isinstance(group, h5py.Group):
-                    continue
-                match = re.fullmatch(r"detector(\d+)", name)
-                if match is None:
-                    continue
-                if f"{instrument_path}/{name}/data" in handle:
-                    detector_numbers.append(int(match.group(1)))
-            if not detector_numbers:
-                raise ValueError(f"No detectorN/data datasets found in {path}")
-            return sorted(detector_numbers)
-
-    def _read_raw_detector_image_and_error(
-        path: Path,
-        detector_number: int,
-    ) -> tuple[np.ndarray, np.ndarray, tuple[float, float]]:
-        path = Path(path).resolve()
-        with h5py.File(path, "r") as handle:
-            entry_path = _entry_path_from_file(handle, path)
-            detector_path = f"{entry_path}/instrument/detector{detector_number}"
-            data_path = f"{detector_path}/data"
-            if data_path not in handle:
-                raise ValueError(f"Missing detector data in {path}: {data_path}")
-            x_pixel_size_path = f"{detector_path}/x_pixel_size"
-            y_pixel_size_path = f"{detector_path}/y_pixel_size"
-            if x_pixel_size_path not in handle or y_pixel_size_path not in handle:
-                raise ValueError(f"Missing pixel size datasets in {path}: {detector_path}")
-
-            raw_data = np.asarray(handle[data_path][()], dtype=np.float64)
-            if raw_data.ndim != 2:
-                raise ValueError(f"Detector data must be 2D in {path}, got shape {raw_data.shape}")
-            monitor_value = _read_monitor_value(handle, entry_path, path=path)
-            normalized = normalize_by_monitor(raw_data, monitor_value)
-            error = np.sqrt(np.clip(raw_data, 0.0, None)) / monitor_value
-            pixel_size = (
-                float(np.asarray(handle[x_pixel_size_path][()]).reshape(())),
-                float(np.asarray(handle[y_pixel_size_path][()]).reshape(())),
-            )
-            return normalized, error, pixel_size
-
-    def _read_reference_detector_image_and_error(
-        refs_file: h5py.File,
-        reference_name: str,
-        detector_number: int,
-    ) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        reference_root = f"{refs_entry_path}/references/{reference_name}/entry"
-        if reference_root not in refs_file or not isinstance(refs_file[reference_root], h5py.Group):
-            return None, None
-        data_path = f"{reference_root}/instrument/detector{detector_number}/data"
-        if data_path not in refs_file:
-            return None, None
-
-        raw_data = np.asarray(refs_file[data_path][()], dtype=np.float64)
-        if raw_data.ndim != 2:
-            raise ValueError(f"Reference detector data must be 2D, got shape {raw_data.shape}")
-        monitor_value = _read_monitor_value(refs_file, reference_root, path=Path(reference_name))
-        normalized = normalize_by_monitor(raw_data, monitor_value)
-        error = np.sqrt(np.clip(raw_data, 0.0, None)) / monitor_value
-        return normalized, error
-
-    def _read_reference_monitor_and_count_time(
-        refs_file: h5py.File,
-        reference_name: str,
-    ) -> tuple[Optional[float], Optional[float]]:
-        reference_root = f"{refs_entry_path}/references/{reference_name}/entry"
-        if reference_root not in refs_file or not isinstance(refs_file[reference_root], h5py.Group):
-            return None, None
-        monitor_value = _read_monitor_value(refs_file, reference_root, path=Path(reference_name))
-        count_time = _read_count_time_value(refs_file, reference_root, path=Path(reference_name))
-        return monitor_value, count_time
-
-    def _read_reference_detector_deadtime(
-        refs_file: h5py.File,
-        reference_name: str,
-        detector_number: int,
-    ) -> Optional[float]:
-        detector_root = f"{refs_entry_path}/references/{reference_name}/entry/instrument/detector{detector_number}"
-        if detector_root not in refs_file or not isinstance(refs_file[detector_root], h5py.Group):
-            return None
-        for dataset_name in ("dead_time", "deadtime"):
-            dataset_path = f"{detector_root}/{dataset_name}"
-            if dataset_path not in refs_file:
-                continue
-            value = float(np.asarray(refs_file[dataset_path][()]).reshape(()))
-            if not np.isfinite(value):
-                return None
-            if value < 0.0:
-                raise ValueError(f"dead_time must be >= 0 in {reference_name}: {dataset_path}")
-            return value
-        return None
-
-    def _read_beam_center_and_mask(
-        refs_sub_path: Path,
-        detector_number: int,
-    ) -> tuple[tuple[float, float], Optional[np.ndarray]]:
-        with h5py.File(refs_sub_path, "r") as refs_file:
-            beam_center_root = f"{refs_entry_path}/beam_center/detector{detector_number}"
-            beam_center_x_path = f"{beam_center_root}/beam_center_x"
-            beam_center_y_path = f"{beam_center_root}/beam_center_y"
-            if beam_center_x_path not in refs_file or beam_center_y_path not in refs_file:
-                raise ValueError(f"Missing beam center in refs_sub: {beam_center_root}")
-            beam_center = (
-                float(np.asarray(refs_file[beam_center_x_path][()]).reshape(())),
-                float(np.asarray(refs_file[beam_center_y_path][()]).reshape(())),
-            )
-            mask_path = f"{refs_entry_path}/mask/mask_detector{detector_number}"
-            mask = None
-            if mask_path in refs_file:
-                mask = np.asarray(refs_file[mask_path][()], dtype=np.uint8)
-            return beam_center, mask
-
-    def _scalar_detector_distance(configuration: Any, detector_number: int) -> float:
-        value = getattr(configuration, "sample_detector_distance", None)
-        if isinstance(value, list):
-            if len(value) == 1:
-                value = value[0]
-            elif detector_number < len(value):
-                value = value[detector_number]
-            else:
-                raise ValueError(f"Missing detector distance for detector{detector_number}")
-        distance = float(value)
-        if not np.isfinite(distance) or distance <= 0.0:
-            raise ValueError(f"Invalid sample_detector_distance: {value!r}")
-        return distance
-
-    def _empty_cell_transmission_from_context(config_id: str) -> Optional[float]:
-        for key, _ in ctx.iter_runs(config_id=config_id, entity="empty_cell"):
-            if key.sample_name is None:
-                continue
-            value = ctx.get_transmission(key.sample_name, config_id)
-            if value is not None:
-                return float(value)
-        return None
 
     def _empty_cell_transmission_from_refs(refs_file: h5py.File) -> Optional[float]:
         dataset_path = f"{refs_entry_path}/references/empty_cell_transmission/entry/sample/transmission"
@@ -2259,6 +2281,17 @@ def _run_reduction_pipeline_results_from_workflow_context(
         if value is None:
             raise ValueError(f"Missing transmission in workflow context for sample={sample_name!r}, config_id={config_id}")
         return float(value)
+
+    def _sample_transmission_file(sample_name: str, config_id: str) -> str:
+        for key, path in ctx.runs.items():
+            if (
+                key.entity == "sample"
+                and key.mode == "transmission"
+                and key.sample_name == sample_name
+                and key.config_id == config_id
+            ):
+                return str(path.resolve())
+        return ""
 
     scattering_runs = [
         (key, path.resolve())
@@ -2291,106 +2324,61 @@ def _run_reduction_pipeline_results_from_workflow_context(
         if refs_sub_path is None:
             raise ValueError(f"Missing refs_sub for config_id={config_id}")
         refs_sub_path = refs_sub_path.resolve()
-        refs_norm_path = ctx.refs_norm_files.get(config_id)
-        if refs_norm_path is None:
-            raise ValueError(f"Missing refs_norm for config_id={config_id}")
-        refs_norm_path = refs_norm_path.resolve()
+        try:
+            refs_norm_path = ctx.get_refs_norm_path(config_id).resolve()
+        except KeyError as exc:
+            raise ValueError(f"Missing refs_norm for config_id={config_id}") from exc
 
-        configuration = ctx.configurations.get(config_id)
-        if configuration is None:
-            raise ValueError(f"Missing configuration for config_id={config_id}")
-        wavelength = float(getattr(configuration, "wavelength"))
         sample_t = _sample_transmission(sample_name, config_id)
-        for current_detector_number in _available_detectors(path):
-            if detector_number is not None and current_detector_number != int(detector_number):
-                continue
-            detector_distance = _scalar_detector_distance(configuration, current_detector_number)
-            sample_image, sample_error, pixel_size = _read_raw_detector_image_and_error(path, current_detector_number)
-            beam_center, mask = _read_beam_center_and_mask(refs_sub_path, current_detector_number)
-
-            with h5py.File(refs_sub_path, "r") as refs_file:
-                dark_image, dark_error = _read_reference_detector_image_and_error(
-                    refs_file,
-                    "dark",
-                    current_detector_number,
-                )
-                empty_cell_image, _ = _read_reference_detector_image_and_error(
-                    refs_file,
-                    "empty_cell_scattering",
-                    current_detector_number,
-                )
-                empty_beam_image, empty_beam_error = _read_reference_detector_image_and_error(
-                    refs_file,
-                    "empty_beam_scattering",
-                    current_detector_number,
-                )
-
-                empty_cell_t = None
-                empty_cell = None
-                if empty_cell_image is not None:
-                    empty_cell_t = _empty_cell_transmission_from_context(config_id)
-                    if empty_cell_t is None:
-                        empty_cell_t = _empty_cell_transmission_from_refs(refs_file)
-                    if empty_cell_t is None:
-                        raise ValueError(f"Missing empty-cell transmission for config_id={config_id}")
-                    empty_cell_monitor, empty_cell_count_time = _read_reference_monitor_and_count_time(
-                        refs_file,
-                        "empty_cell_scattering",
-                    )
-                    if empty_cell_monitor is None or empty_cell_count_time is None:
-                        raise ValueError(f"Missing empty-cell metadata for config_id={config_id}")
-                    empty_cell_deadtime = _read_reference_detector_deadtime(
-                        refs_file,
-                        "empty_cell_scattering",
-                        current_detector_number,
-                    )
-                    empty_cell = PipelineData(
-                        image=empty_cell_image,
-                        transmission=empty_cell_t,
-                        monitor=empty_cell_monitor,
-                        acquisition_time=empty_cell_count_time,
-                        deadtime=empty_cell_deadtime,
-                    )
-
-            with h5py.File(refs_norm_path, "r") as refs_norm_file:
-                water_corrected_image, _ = _read_reference_detector_image_and_error(
-                    refs_norm_file,
-                    "water_corrected",
-                    current_detector_number,
-                )
-            if water_corrected_image is None:
-                raise ValueError(
-                    f"Missing water_corrected in refs_norm for config_id={config_id}, detector{current_detector_number}"
-                )
-            reduction = reduction_pipeline.run(
-                ReductionInputs(
-                    sample_image=sample_image,
-                    sample_error=sample_error,
-                    sample_transmission=sample_t,
-                    detector_distance=detector_distance,
-                    beam_center=beam_center,
-                    pixel_size=pixel_size,
-                    wavelength=wavelength,
-                    n_bins=int(n_bins),
-                    dark_image=dark_image,
-                    dark_error=dark_error,
-                    empty_cell=empty_cell,
-                    empty_beam_image=empty_beam_image,
-                    empty_beam_error=empty_beam_error,
-                    water_corrected_image=water_corrected_image,
-                    mask=mask,
-                    wavelength_spread=ctx.get("wavelength_spread"),
-                    collimation=getattr(configuration, "collimation", None),
-                )
+        reduction = reduction_pipeline.run(
+            ReductionInputs(
+                sample_file_scattering=str(path),
+                sample_file_transmission=_sample_transmission_file(sample_name, config_id),
+                sample_transmission=sample_t,
+                ref_sub_file=str(refs_sub_path),
+                ref_norm_file=str(refs_norm_path),
             )
+        )
+
+        if detector_number is None:
             results.append(
                 WorkflowReductionResult(
                     run_key=key,
-                    detector_number=current_detector_number,
+                    detector_number=None,
                     source_path=path,
                     state=reduction,
                 )
             )
+            continue
+
+        current_detector_number = int(detector_number)
+        if current_detector_number not in reduction.detectors:
+            continue
+        detector = reduction.detectors[current_detector_number]
+        water_corrected = reduction.water_corrected_detectors.get(current_detector_number)
+        detector_state = replace(
+            reduction,
+            detectors={current_detector_number: detector},
+            water_corrected_detectors=(
+                {}
+                if water_corrected is None
+                else {current_detector_number: water_corrected}
+            ),
+            data=detector.data,
+            data_error=detector.data_error,
+            x=detector.x,
+            x_error=detector.x_error,
+            y=detector.y,
+            y_error=detector.y_error,
+        )
+        results.append(
+            WorkflowReductionResult(
+                run_key=key,
+                detector_number=current_detector_number,
+                source_path=path,
+                state=detector_state,
+            )
+        )
     if not results:
         if sample_name is None and config_id is None and detector_number is None:
             raise ValueError("WorkflowContext has no matching scattering reductions")

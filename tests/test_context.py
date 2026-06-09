@@ -1149,6 +1149,80 @@ class TestWorkflowContextRunsReport(unittest.TestCase):
                 )
                 self.assertEqual(len(ctx.configurations), 1)
 
+    def test_update_workflow_context_from_raw_directory_skips_auxiliary_hdf5_files(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            raw_dir = root / "raw"
+            output_dir = root / "out"
+            raw_dir.mkdir()
+            output_dir.mkdir()
+
+            raw_path = raw_dir / "sample_1.h5"
+            mask_path = raw_dir / "test_gui_mask.nxs"
+            _write_minimal_raw_nexus_file(raw_path, sample_name="sample_a", count_time_s=10.0)
+
+            with h5py.File(mask_path, "w") as f:
+                entry = f.create_group("entry")
+                entry.attrs["NX_class"] = b"NXentry"
+                entry.create_dataset("definition", data=np.bytes_("SCARLET_masks"))
+
+            configuration = Configuration(
+                wavelength=6.0,
+                sample_detector_distance=4.2,
+                config_id="config_x",
+                collimation=Collimation(
+                    aperture1=Aperture(type="slit", x_gap=0.002, y_gap=0.003),
+                    aperture2=Aperture(type="pinhole", diameter=0.004),
+                    collimation_distance=1.5,
+                    last_aperture_to_sample_distance=0.5,
+                ),
+            )
+
+            def fake_convert(_instrument_name, input_path, output_path, overwrite=False):
+                del overwrite
+                output_path = Path(output_path)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_bytes(Path(input_path).read_bytes())
+                return SimpleNamespace(output_file=output_path)
+
+            with (
+                mock.patch("scarlet.io.converters.convert_to_scarlet_nxsas_raw", side_effect=fake_convert),
+                mock.patch(
+                    "scarlet.io.mode_inference.guess_measurement_mode_from_nexus_image",
+                    return_value=SimpleNamespace(mode="scattering"),
+                ),
+                mock.patch(
+                    "scarlet.workflow.configuration.configuration_from_nexus",
+                    return_value=(configuration, []),
+                ),
+                mock.patch(
+                    "scarlet.workflow.configuration.compare_configurations",
+                    return_value=(True, []),
+                ),
+            ):
+                ctx = WorkflowContext(
+                    instrument_name="sansllb",
+                    root_dir=raw_dir,
+                    output_dir=output_dir,
+                )
+
+                out = update_workflow_context_from_raw_directory(ctx)
+
+                self.assertIs(out, ctx)
+                self.assertEqual(len(ctx.runs), 1)
+                self.assertEqual(
+                    set(ctx.runs.values()),
+                    {(output_dir / "sample_1.nxs").resolve()},
+                )
+                self.assertTrue(
+                    any(
+                        issue.level == "WARN"
+                        and issue.key == str(mask_path)
+                        and "Skipping non-raw HDF5 input file" in issue.message
+                        for issue in ctx.issues
+                    )
+                )
+
     def test_save_and_load_workflow_context_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1221,6 +1295,26 @@ class TestWorkflowContextRunsReport(unittest.TestCase):
             self.assertAlmostEqual(loaded.timings["save"], 1.25)
             self.assertEqual(loaded.get("transmission_roi_detector"), 0)
             self.assertEqual(loaded.get("custom_flags"), {"resume": True, "label": "demo"})
+
+    def test_refs_norm_files_can_reference_another_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "out"
+            output_dir.mkdir()
+            refs_norm_path = output_dir / "refs_norm_config_1.nxs"
+            with h5py.File(refs_norm_path, "w"):
+                pass
+
+            ctx = WorkflowContext(output_dir=output_dir)
+            ctx.set_refs_norm("config_1", refs_norm_path)
+            ctx.set_refs_norm("config_2", "config_1")
+
+            self.assertTrue(ctx.is_refs_norm_alias("config_2"))
+            self.assertEqual(ctx.resolve_refs_norm_config_id("config_2"), "config_1")
+            self.assertEqual(ctx.get_refs_norm_path("config_2"), refs_norm_path.resolve())
+
+            loaded = load_workflow_context(save_workflow_context(ctx, output_dir / "workflow_context.nxs"))
+            self.assertEqual(loaded.refs_norm_files["config_2"], "config_1")
+            self.assertEqual(loaded.get_refs_norm_path("config_2"), refs_norm_path.resolve())
 
 
 if __name__ == "__main__":

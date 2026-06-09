@@ -16,7 +16,25 @@ class AzimuthalAverageResult:
     q_error: np.ndarray | None
     counts: np.ndarray
 
-def radial_average(image, mask, x0, y0, x_pixel_size, y_pixel_size, bins=None, error=None):
+def _compute_bin_edges(values: np.ndarray, n_bins: int, *, scale: str) -> np.ndarray:
+    if scale not in {"linear", "log"}:
+        raise ValueError(f"scale must be 'linear' or 'log', got {scale!r}")
+
+    if scale == "linear":
+        return np.histogram_bin_edges(values, bins=int(n_bins))
+
+    positive_values = values[values > 0.0]
+    if positive_values.size == 0:
+        raise ValueError("Logarithmic binning requires strictly positive values")
+    value_min = float(np.min(positive_values))
+    value_max = float(np.max(positive_values))
+    if value_max == value_min:
+        value_min *= 1.0 - 1e-12
+        value_max *= 1.0 + 1e-12
+    return np.geomspace(value_min, value_max, int(n_bins) + 1)
+
+
+def radial_average(image, mask, x0, y0, x_pixel_size, y_pixel_size, bins=None, error=None, *, scale: str = "linear"):
     y, x = np.indices(image.shape, dtype='float')
     y = (y-y0)*y_pixel_size
     x = (x-x0)*x_pixel_size
@@ -25,18 +43,31 @@ def radial_average(image, mask, x0, y0, x_pixel_size, y_pixel_size, bins=None, e
     # masked_data = np.ma.masked_invalid(masked_data)
     if bins is None:
         maxd = np.max(r_grid)
-        bins = len(np.arange(0, maxd))
-    edges = np.histogram_bin_edges(r_grid, bins=bins)
+        mind = np.min(r_grid)
+        bins = len(np.arange(mind, maxd))
+    if scale == "log":
+        positive = r_grid > 0.0
+        r_grid = r_grid[positive]
+        masked_data = masked_data[positive]
+        if error is not None:
+            masked_error = np.ma.masked_array(data=error, mask=mask, dtype='float').compressed()[positive]
+        else:
+            masked_error = None
+        if r_grid.size == 0:
+            raise ValueError("Logarithmic radial averaging requires strictly positive radii")
+    else:
+        masked_error = np.ma.masked_array(data=error, mask=mask, dtype='float').compressed() if error is not None else None
+    edges = _compute_bin_edges(r_grid, int(bins), scale=scale)
     # edges = np.arange(np.max(r_grid))
     indexes = np.digitize(r_grid, edges, right=False)
-    counts = np.bincount(indexes)[1:]
+    indexes = np.clip(indexes, 1, len(edges) - 1)
+    counts = np.bincount(indexes, minlength=len(edges))[1:]
     r_mean = np.bincount(indexes, weights=r_grid)[1:]/counts
     r_square = np.bincount(indexes, weights=r_grid**2)[1:]/counts
     intensity = np.bincount(indexes, weights=masked_data)[1:]/counts
     if error is None:
         di = np.sqrt(intensity*counts)/counts
     else:
-        masked_error = np.ma.masked_array(data=error, mask=mask, dtype='float').compressed()
         di = np.sqrt(np.bincount(indexes, weights=masked_error**2)[1:]) / counts
     # TODO: check error bar on r
     dr = np.sqrt(r_square-r_mean**2+1/12)  # 1/12 is the variance of one pixel
@@ -54,6 +85,7 @@ def azimuthal_average(
     intensity_error: Any | None = None,
     q_error: Any | None = None,
     n_bins: int = 200,
+    q_scale: str = "linear",
 ) -> AzimuthalAverageResult:
     """
     Compute a 1D azimuthal average I(q) from a detector image and a q-map.
@@ -92,12 +124,17 @@ def azimuthal_average(
     else:
         valid = np.ones(image_array.shape, dtype=bool)
 
+    if q_scale not in {"linear", "log"}:
+        raise ValueError(f"q_scale must be 'linear' or 'log', got {q_scale!r}")
+
     valid &= np.isfinite(image_array)
     valid &= np.isfinite(q_array)
     if intensity_error_array is not None:
         valid &= np.isfinite(intensity_error_array)
     if q_error_array is not None:
         valid &= np.isfinite(q_error_array)
+    if q_scale == "log":
+        valid &= q_array > 0.0
 
     if not np.any(valid):
         raise ValueError("No valid pixels available for azimuthal averaging")
@@ -106,15 +143,7 @@ def azimuthal_average(
 
     q_values = q_array[valid].ravel()
     image_values = image_array[valid].ravel()
-    q_min_value = float(np.min(q_values))
-    q_max_value = float(np.max(q_values))
-    if not np.isfinite(q_min_value) or not np.isfinite(q_max_value):
-        raise ValueError("Invalid q values for azimuthal averaging")
-    if q_max_value == q_min_value:
-        edge_padding = max(abs(q_min_value), 1.0) * 1e-12
-        q_min_value -= edge_padding
-        q_max_value += edge_padding
-    bin_edges = np.histogram_bin_edges(q_values, bins=int(n_bins))
+    bin_edges = _compute_bin_edges(q_values, int(n_bins), scale=q_scale)
     indexes = np.digitize(q_values, bin_edges, right=False)
     indexes = np.clip(indexes, 1, int(n_bins))
 

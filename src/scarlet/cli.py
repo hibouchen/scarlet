@@ -187,6 +187,7 @@ def _cmd_azimuthal_average(args: argparse.Namespace) -> int:
             n_bins=args.bins,
             q_min=args.q_min,
             q_max=args.q_max,
+            q_scale=args.q_scale,
         )
         write_azimuthal_average_csv(
             Path(args.output),
@@ -216,6 +217,34 @@ def _cmd_mask_gui(args: argparse.Namespace) -> int:
         print(str(e), file=sys.stderr)
         return 2
     return 0
+
+
+def _cmd_nxsas_gui(args: argparse.Namespace) -> int:
+    from scarlet.gui import run_nxsas_viewer
+
+    try:
+        run_nxsas_viewer(
+            None if args.directory is None else Path(args.directory),
+        )
+    except (FileNotFoundError, NotADirectoryError, ValueError, OSError) as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    return 0
+
+
+def _cmd_viewer(args: argparse.Namespace) -> int:
+    from scarlet.gui import run_viewer
+
+    try:
+        return int(
+            run_viewer(
+                None if args.directory is None else Path(args.directory),
+                instrument=args.instrument,
+            )
+        )
+    except (FileNotFoundError, NotADirectoryError, ValueError, OSError) as e:
+        print(str(e), file=sys.stderr)
+        return 2
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -346,6 +375,12 @@ def build_parser() -> argparse.ArgumentParser:
     avg.add_argument("--bins", type=int, default=200, help="Number of radial Q bins (default: 200)")
     avg.add_argument("--q-min", type=float, default=None, help="Minimum Q in A^-1 (default: auto)")
     avg.add_argument("--q-max", type=float, default=None, help="Maximum Q in A^-1 (default: auto)")
+    avg.add_argument(
+        "--q-scale",
+        choices=("linear", "log"),
+        default="linear",
+        help="Q binning scale used for azimuthal averaging (default: linear)",
+    )
     avg.add_argument("--overwrite", action="store_true", help="Overwrite existing output CSV")
     avg.set_defaults(func=_cmd_azimuthal_average)
 
@@ -353,6 +388,20 @@ def build_parser() -> argparse.ArgumentParser:
     gui.add_argument("file", nargs="?", help="Optional input NeXus/HDF5 file to load at startup")
     gui.add_argument("--output", default=None, help="Optional output NeXus/HDF5 mask bundle path")
     gui.set_defaults(func=_cmd_mask_gui)
+
+    nxsas_gui = sub.add_parser("nxsas-gui", help="Open the graphical NXsas file viewer")
+    nxsas_gui.add_argument("directory", nargs="?", help="Optional data folder loaded at startup")
+    nxsas_gui.set_defaults(func=_cmd_nxsas_gui)
+
+    viewer = sub.add_parser("viewer", help="Open the silx-based SCARLET viewer")
+    viewer.add_argument("directory", nargs="?", help="Optional data folder loaded at startup")
+    viewer.add_argument(
+        "--instrument",
+        choices=("sam", "sansllb"),
+        default="sansllb",
+        help="Instrument used to convert raw files before display (default: sansllb)",
+    )
+    viewer.set_defaults(func=_cmd_viewer)
 
     return p
 

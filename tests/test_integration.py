@@ -41,6 +41,23 @@ class TestIntegration(unittest.TestCase):
         np.testing.assert_allclose(result.intensity_error, np.array([np.sqrt(10.0) / 2.0, 4.0]))
         np.testing.assert_allclose(result.q_error, np.array([np.sqrt(0.0010) / 2.0, 0.04]))
 
+    def test_azimuthal_average_supports_log_q_binning(self) -> None:
+        image = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float64)
+        q_map = np.array([[0.11, 0.30], [0.50, 0.79]], dtype=np.float64)
+
+        result = azimuthal_average(image, q_map, n_bins=3, q_scale="log")
+
+        np.testing.assert_allclose(result.q, np.array([0.11, 0.30, 0.645]))
+        np.testing.assert_allclose(result.intensity, np.array([1.0, 2.0, 3.5]))
+        np.testing.assert_array_equal(result.counts, np.array([1, 1, 2]))
+
+    def test_azimuthal_average_log_q_binning_requires_positive_q(self) -> None:
+        image = np.array([[1.0, 2.0]], dtype=np.float64)
+        q_map = np.array([[0.0, -0.1]], dtype=np.float64)
+
+        with self.assertRaisesRegex(ValueError, "No valid pixels available"):
+            azimuthal_average(image, q_map, n_bins=2, q_scale="log")
+
 
 if __name__ == "__main__":
     unittest.main()

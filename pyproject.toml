@@ -15,9 +15,11 @@ dependencies = ["PyYAML>=6.0", "h5py>=3.10", "numpy>=1.26"]
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 notebook = ["jupyterlab>=4"]
+viewer = ["silx>=2.0", "PySide6>=6.7"]
 
 [project.scripts]
 scarlet = "scarlet.cli:main"
+viewer = "scarlet.gui.scarlet_viewer:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

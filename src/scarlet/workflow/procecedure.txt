@@ -11,3 +11,7 @@ Ensuite, les images soustraites sont normalisées par l'angle solide avec la fon
 On fait ensuite le regroupement azimutal des données grâce au module integration.py.
 
 Le résultats de l'intégration est un fichiers texte 4 colonnes (q,i,i_error, q_error) avec un header qui décrit le nom de l'échantillon, le nom de la config et la valeur de sa transmission.
+
+
+
+Je veux que les données converties au format nxsas_raw contienne des données détecteurs qui soient normalisée par le deadtime en utilisant la fonction correct_detector_deadtime. Applique cette transformation au champs datat0, data,1,... et aussi au champs data dasn les nxdetector. POur chaque champs NXdetector, ajoute un field deadtime_corrected=True

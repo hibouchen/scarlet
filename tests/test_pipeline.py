@@ -1,80 +1,291 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 
+import h5py
 import numpy as np
 
-from scarlet.reduction import normalize_by_solid_angle, subtract_scattering_references
-from scarlet.workflow.pipeline import PipelineData, ReductionInputs, ReductionPipeline
+from scarlet.reduction import normalize_by_solid_angle
+from scarlet.workflow.configuration import Aperture, Collimation, Configuration
+from scarlet.workflow.pipeline import (
+    ReductionInputs,
+    ReductionPipeline,
+    ReductionState,
+    as_reduction_step,
+    check_ref_sub_file,
+    compute_transmission_step,
+)
+from scarlet.workflow.reference import write_refs_sub_file
 
 
-class TestReductionPipeline(unittest.TestCase):
-    def test_empty_cell_error_is_derived_from_monitor_normalized_image(self) -> None:
-        empty_cell = PipelineData(
-            image=np.full((2, 2), 2.5, dtype=np.float64),
-            transmission=0.8,
-            monitor=10.0,
-            acquisition_time=10.0,
-            deadtime=0.1,
-        )
-        np.testing.assert_allclose(empty_cell.error, np.full((2, 2), 0.5, dtype=np.float64))
-        self.assertAlmostEqual(empty_cell.deadtime or 0.0, 0.1)
-        np.testing.assert_allclose(
-            empty_cell.deadtime_corrected_image,
-            np.full((2, 2), 10.0 / 3.0, dtype=np.float64),
-        )
-        np.testing.assert_allclose(
-            empty_cell.deadtime_corrected_error,
-            np.full((2, 2), 8.0 / 9.0, dtype=np.float64),
-        )
+def _write_raw_file(
+    path: Path,
+    *,
+    data: np.ndarray,
+    monitor_integral: float = 1.0,
+    beam_center: tuple[float, float] | None = None,
+    detector_distance: float | None = None,
+    extra_detectors: dict[int, np.ndarray] | None = None,
+    extra_beam_centers: dict[int, tuple[float, float]] | None = None,
+    extra_detector_distances: dict[int, float] | None = None,
+) -> None:
+    with h5py.File(path, "w") as f:
+        entry = f.create_group("raw_data")
+        entry.attrs["NX_class"] = b"NXentry"
+        control = entry.create_group("control")
+        control.attrs["NX_class"] = b"NXmonitor"
+        control.create_dataset("integral", data=float(monitor_integral))
+        instrument = entry.create_group("instrument")
+        instrument.attrs["NX_class"] = b"NXinstrument"
+        detector = instrument.create_group("detector0")
+        detector.attrs["NX_class"] = b"NXdetector"
+        data_array = np.asarray(data, dtype=np.float64)
+        detector.create_dataset("data", data=data_array)
+        detector.create_dataset("x_pixel_size", data=0.001)
+        detector.create_dataset("y_pixel_size", data=0.001)
+        if beam_center is None:
+            beam_center = ((data_array.shape[1] - 1) / 2.0, (data_array.shape[0] - 1) / 2.0)
+        detector.create_dataset("beam_center_x", data=float(beam_center[0]))
+        detector.create_dataset("beam_center_y", data=float(beam_center[1]))
+        if detector_distance is not None:
+            transformations = detector.create_group("transformations")
+            transformations.create_dataset("translation", data=np.array([0.0, 0.0, float(detector_distance)]))
+        for detector_number, detector_data in sorted((extra_detectors or {}).items()):
+            extra_detector = instrument.create_group(f"detector{int(detector_number)}")
+            extra_detector.attrs["NX_class"] = b"NXdetector"
+            extra_array = np.asarray(detector_data, dtype=np.float64)
+            extra_detector.create_dataset("data", data=extra_array)
+            extra_detector.create_dataset("x_pixel_size", data=0.001)
+            extra_detector.create_dataset("y_pixel_size", data=0.001)
+            extra_center = None if extra_beam_centers is None else extra_beam_centers.get(int(detector_number))
+            if extra_center is None:
+                extra_center = ((extra_array.shape[1] - 1) / 2.0, (extra_array.shape[0] - 1) / 2.0)
+            extra_detector.create_dataset("beam_center_x", data=float(extra_center[0]))
+            extra_detector.create_dataset("beam_center_y", data=float(extra_center[1]))
+            extra_distance = None if extra_detector_distances is None else extra_detector_distances.get(int(detector_number))
+            if extra_distance is not None:
+                transformations = extra_detector.create_group("transformations")
+                transformations.create_dataset("translation", data=np.array([0.0, 0.0, float(extra_distance)]))
 
-    def test_default_pipeline_declares_reduction_order(self) -> None:
+
+def _configuration() -> Configuration:
+    return Configuration(
+        wavelength=6.0,
+        sample_detector_distance=[4.2],
+        config_id="cfg",
+        collimation=Collimation(
+            aperture1=Aperture(type="slit", x_gap=0.002, y_gap=0.003),
+            aperture2=Aperture(type="pinhole", diameter=0.004),
+            collimation_distance=1.5,
+            last_aperture_to_sample_distance=0.5,
+        ),
+    )
+
+
+class TestPipelineBis(unittest.TestCase):
+    def test_default_pipeline_uses_decorated_step_names(self) -> None:
         pipeline = ReductionPipeline.default()
+
         self.assertEqual(
             pipeline.step_names,
             (
-                "subtract_references",
-                "normalize_by_water",
-                "normalize_by_solid_angle",
-                "compute_q",
-                "integrate_azimuthally",
+                "check reference subtraction file",
+                "compute transmission",
+                "subtract references",
             ),
         )
+        self.assertEqual(as_reduction_step(check_ref_sub_file).name, "check reference subtraction file")
 
-    def test_default_pipeline_applies_solid_angle_after_water_normalization(self) -> None:
-        sample = np.full((3, 3), 10.0, dtype=np.float64)
-        dark = np.full((3, 3), 2.0, dtype=np.float64)
-        water = np.full((3, 3), 4.0, dtype=np.float64)
-        inputs = ReductionInputs(
-            sample_image=sample,
-            sample_error=np.sqrt(sample),
-            sample_transmission=0.5,
-            detector_distance=2.0,
-            beam_center=(1.0, 1.0),
-            pixel_size=(0.001, 0.001),
-            wavelength=6.0,
-            n_bins=4,
-            dark_image=dark,
-            dark_error=np.sqrt(dark),
-            water_corrected_image=water,
-        )
+    def test_compute_transmission_step_replaces_frozen_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            sample_transmission = root / "sample_transmission.nxs"
+            empty_beam_transmission = root / "empty_beam_transmission.nxs"
+            refs_sub = root / "refs_sub.nxs"
 
-        state = ReductionPipeline.default().run(inputs)
+            _write_raw_file(sample_transmission, data=np.full((4, 4), 5.0, dtype=np.float64))
+            _write_raw_file(empty_beam_transmission, data=np.full((4, 4), 10.0, dtype=np.float64))
 
-        corrected = subtract_scattering_references(
-            sample,
-            0.5,
-            dark=dark,
-            distance=2.0,
-            beam_center=(1.0, 1.0),
-        )
-        expected = normalize_by_solid_angle(
-            corrected / water,
-            detector_distance=2.0,
-            beam_center=(1.0, 1.0),
-            pixel_size=(0.001, 0.001),
-        )
-        np.testing.assert_allclose(state.solid_angle_corrected, expected)
+            write_refs_sub_file(
+                refs_sub,
+                _configuration(),
+                empty_beam_transmission=empty_beam_transmission,
+                transmission_roi_detector=0,
+                transmission_roi=(1, 3, 1, 3),
+            )
+
+            state = ReductionState(
+                inputs=ReductionInputs(
+                    sample_file_scattering=str(sample_transmission),
+                    sample_file_transmission=str(sample_transmission),
+                    ref_sub_file=str(refs_sub),
+                )
+            )
+
+            updated = compute_transmission_step(state)
+
+            self.assertAlmostEqual(updated.inputs.sample_transmission or 0.0, 0.5)
+
+    def test_default_pipeline_subtracts_refs_sub_references(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            sample_scattering = root / "sample_scattering.nxs"
+            sample_transmission = root / "sample_transmission.nxs"
+            empty_beam_transmission = root / "empty_beam_transmission.nxs"
+            dark = root / "dark.nxs"
+            empty_cell_transmission = root / "empty_cell_transmission.nxs"
+            empty_cell_scattering = root / "empty_cell_scattering.nxs"
+            refs_sub = root / "refs_sub.nxs"
+
+            _write_raw_file(
+                sample_scattering,
+                data=np.full((4, 4), 10.0, dtype=np.float64),
+                beam_center=(1.5, 1.5),
+                detector_distance=2.1,
+            )
+            _write_raw_file(sample_transmission, data=np.full((4, 4), 5.0, dtype=np.float64))
+            _write_raw_file(empty_beam_transmission, data=np.full((4, 4), 10.0, dtype=np.float64))
+            _write_raw_file(dark, data=np.full((4, 4), 1.0, dtype=np.float64))
+            _write_raw_file(empty_cell_transmission, data=np.full((4, 4), 5.0, dtype=np.float64))
+            _write_raw_file(empty_cell_scattering, data=np.full((4, 4), 4.0, dtype=np.float64))
+
+            write_refs_sub_file(
+                refs_sub,
+                _configuration(),
+                empty_beam_transmission=empty_beam_transmission,
+                dark=dark,
+                empty_cell_transmission=empty_cell_transmission,
+                empty_cell_scattering=empty_cell_scattering,
+                transmission_roi_detector=0,
+                transmission_roi=(1, 3, 1, 3),
+                beam_centers={0: (0.25, 2.25)},
+            )
+
+            state = ReductionPipeline.default().run(
+                ReductionInputs(
+                    sample_file_scattering=str(sample_scattering),
+                    sample_file_transmission=str(sample_transmission),
+                    ref_sub_file=str(refs_sub),
+                )
+            )
+
+            expected = normalize_by_solid_angle(
+                np.full((4, 4), 12.0, dtype=np.float64),
+                detector_distance=4.2,
+                beam_center=(0.25, 2.25),
+                pixel_size=(0.001, 0.001),
+            )
+            solid_angle_correction = normalize_by_solid_angle(
+                np.ones((4, 4), dtype=np.float64),
+                detector_distance=4.2,
+                beam_center=(0.25, 2.25),
+                pixel_size=(0.001, 0.001),
+            )
+            np.testing.assert_allclose(state.data, expected)
+            np.testing.assert_allclose(
+                state.data_error,
+                np.full((4, 4), np.sqrt(56.0), dtype=np.float64) * solid_angle_correction,
+            )
+            self.assertEqual(sorted(state.detectors), [0])
+            self.assertEqual(
+                state.reductions_steps,
+                [
+                    "check reference subtraction file",
+                    "compute transmission",
+                    "subtract references",
+                ],
+            )
+            self.assertAlmostEqual(state.inputs.sample_transmission or 0.0, 0.5)
+
+    def test_default_pipeline_subtracts_references_for_all_sample_detectors(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            sample_scattering = root / "sample_scattering.nxs"
+            sample_transmission = root / "sample_transmission.nxs"
+            empty_beam_transmission = root / "empty_beam_transmission.nxs"
+            dark = root / "dark.nxs"
+            empty_cell_transmission = root / "empty_cell_transmission.nxs"
+            empty_cell_scattering = root / "empty_cell_scattering.nxs"
+            refs_sub = root / "refs_sub.nxs"
+
+            _write_raw_file(
+                sample_scattering,
+                data=np.full((4, 4), 10.0, dtype=np.float64),
+                extra_detectors={1: np.full((4, 4), 8.0, dtype=np.float64)},
+                beam_center=(1.5, 1.5),
+                detector_distance=2.1,
+                extra_beam_centers={1: (1.5, 1.5)},
+                extra_detector_distances={1: 2.1},
+            )
+            _write_raw_file(sample_transmission, data=np.full((4, 4), 5.0, dtype=np.float64))
+            _write_raw_file(
+                empty_beam_transmission,
+                data=np.full((4, 4), 10.0, dtype=np.float64),
+                extra_detectors={1: np.full((4, 4), 10.0, dtype=np.float64)},
+            )
+            _write_raw_file(
+                dark,
+                data=np.full((4, 4), 1.0, dtype=np.float64),
+                extra_detectors={1: np.full((4, 4), 1.0, dtype=np.float64)},
+            )
+            _write_raw_file(empty_cell_transmission, data=np.full((4, 4), 5.0, dtype=np.float64))
+            _write_raw_file(
+                empty_cell_scattering,
+                data=np.full((4, 4), 4.0, dtype=np.float64),
+                extra_detectors={1: np.full((4, 4), 3.0, dtype=np.float64)},
+            )
+
+            configuration = Configuration(
+                wavelength=6.0,
+                sample_detector_distance=[4.2, 3.1],
+                config_id="cfg",
+                collimation=Collimation(
+                    aperture1=Aperture(type="slit", x_gap=0.002, y_gap=0.003),
+                    aperture2=Aperture(type="pinhole", diameter=0.004),
+                    collimation_distance=1.5,
+                    last_aperture_to_sample_distance=0.5,
+                ),
+            )
+            write_refs_sub_file(
+                refs_sub,
+                configuration,
+                empty_beam_transmission=empty_beam_transmission,
+                dark=dark,
+                empty_cell_transmission=empty_cell_transmission,
+                empty_cell_scattering=empty_cell_scattering,
+                transmission_roi_detector=0,
+                transmission_roi=(1, 3, 1, 3),
+                beam_centers={0: (0.25, 2.25), 1: (1.75, 0.5)},
+            )
+
+            state = ReductionPipeline.default().run(
+                ReductionInputs(
+                    sample_file_scattering=str(sample_scattering),
+                    sample_file_transmission=str(sample_transmission),
+                    ref_sub_file=str(refs_sub),
+                )
+            )
+
+            self.assertEqual(sorted(state.detectors), [0, 1])
+            expected0 = normalize_by_solid_angle(
+                np.full((4, 4), 12.0, dtype=np.float64),
+                detector_distance=4.2,
+                beam_center=(0.25, 2.25),
+                pixel_size=(0.001, 0.001),
+            )
+            expected1 = normalize_by_solid_angle(
+                np.full((4, 4), 10.0, dtype=np.float64),
+                detector_distance=3.1,
+                beam_center=(1.75, 0.5),
+                pixel_size=(0.001, 0.001),
+            )
+            np.testing.assert_allclose(state.detectors[0].data, expected0)
+            np.testing.assert_allclose(state.detectors[1].data, expected1)
+            self.assertIsNotNone(state.detectors[0].data_error)
+            self.assertIsNotNone(state.detectors[1].data_error)
+            np.testing.assert_allclose(state.data, expected0)
 
 
 if __name__ == "__main__":

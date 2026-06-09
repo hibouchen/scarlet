@@ -30,6 +30,7 @@ from .context import (
 )
 
 from .reference import (
+    compute_reference_transmissions,
     compute_corrected_water_scattering,
     insert_beam_centers_in_refs_file,
     insert_masks_in_refs_file,
@@ -53,6 +54,7 @@ __all__ = [
     "WorkflowReductionResult",
     "WorkflowContext",
     "compare_configurations",
+    "compute_reference_transmissions",
     "compute_corrected_water_scattering",
     "configuration_from_nexus",
     "PipelineData",

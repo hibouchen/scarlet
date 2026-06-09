@@ -6,6 +6,7 @@ from typing import List, Optional
 import h5py
 import numpy as np
 
+from ._deadtime import correct_detector_data_for_deadtime
 from ._report import ConvertReport
 from ._hdf import (
     as_float_scalar as _as_float_scalar,
@@ -16,6 +17,7 @@ from ._hdf import (
     write_dataset as _write_dataset,
 )
 from ._units import MM_TO_M, mm_to_m as _mm_to_m
+
 
 def _sam_instrument_path(fin: h5py.File, entry: str) -> str:
     eg = fin[entry]
@@ -95,6 +97,14 @@ def _sam_monitor_integral(fin: h5py.File, entry: str) -> float:
     if monsum is not None:
         return _as_float_scalar(monsum)
 
+    return float("nan")
+
+
+def _sam_detector_dead_time(fin: h5py.File, inst_in: str) -> float:
+    for dataset_name in ("dead_time", "deadtime"):
+        value = _safe_get(fin, f"{inst_in}/detector/{dataset_name}")
+        if value is not None:
+            return _as_float_scalar(value)
     return float("nan")
 
 
@@ -210,6 +220,7 @@ def convert_sam_to_scarlet_nxsas_raw(
 
         # counts
         counts = _sam_read_detector_counts(fin, entry, warnings)
+        detector_dead_time = _sam_detector_dead_time(fin, inst_in)
 
         # Collimation distance in SAM is provided by /collimation/position.
         # Keep sourceDistance only as a fallback for older variants.
@@ -276,8 +287,9 @@ def convert_sam_to_scarlet_nxsas_raw(
             control_count_time = _safe_get(fin, f"{entry}/time")
             if control_count_time is None:
                 control_count_time = _safe_get(fin, f"{entry}/duration")
-            if control_count_time is not None:
-                _write_dataset(control_out, "count_time", _as_float_scalar(control_count_time))
+            acquisition_time = _as_float_scalar(control_count_time) if control_count_time is not None else None
+            if acquisition_time is not None:
+                _write_dataset(control_out, "count_time", acquisition_time)
 
             # instrument
             inst_out = _ensure_group(entry_out, "instrument", "NXinstrument")
@@ -345,14 +357,22 @@ def convert_sam_to_scarlet_nxsas_raw(
 
             # detector0
             det_out = _ensure_group(inst_out, "detector0", "NXdetector")
-            _write_dataset(det_out, "data", counts)
+            corrected_counts, deadtime_corrected = correct_detector_data_for_deadtime(
+                counts,
+                acquisition_time=acquisition_time,
+                dead_time=detector_dead_time,
+                detector_name="detector0",
+                warnings=warnings,
+            )
+            _write_dataset(det_out, "data", corrected_counts)
             _write_dataset(det_out, "x_pixel_size", x_pixel_size_m)
             _write_dataset(det_out, "y_pixel_size", y_pixel_size_m)
 
-            ny, nx = counts.shape[-2], counts.shape[-1]
+            ny, nx = corrected_counts.shape[-2], corrected_counts.shape[-1]
             _write_dataset(det_out, "beam_center_x", (float(nx) - 1.0) / 2.0)
             _write_dataset(det_out, "beam_center_y", (float(ny) - 1.0) / 2.0)
-            _write_dataset(det_out, "dead_time", float("nan"))
+            _write_dataset(det_out, "dead_time", detector_dead_time)
+            _write_dataset(det_out, "deadtime_corrected", deadtime_corrected)
 
             det_tr = _ensure_group(det_out, "transformations", "NXtransformations")
             _write_dataset(det_tr, "translation", np.array([0.0, 0.0, det_z_m], dtype=float))

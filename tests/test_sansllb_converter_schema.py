@@ -2,22 +2,91 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import tempfile
 import unittest
 
 try:
     import h5py  # noqa: F401
-    import numpy  # noqa: F401
+    import numpy
 except Exception:  # pragma: no cover
     h5py = None  # type: ignore[assignment]
 
 
 from scarlet.io.converters.sansllb import convert_sansllb_to_scarlet_nxsas_raw
+from scarlet.reduction import correct_detector_dead_time
 from scarlet.validation.schema_loader import load_schema
 from scarlet.validation.schema_validator import validate_nexus_file
 
 
 @unittest.skipIf(h5py is None, "h5py/numpy not available")
 class TestSansLlbConverterSchema(unittest.TestCase):
+    def test_sansllb_converter_deadtime_corrects_all_detector_views(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            input_path = Path(td) / "sansllb_input.hdf"
+            output_path = Path(td) / "sansllb_output.h5"
+            raw0 = numpy.array([[10.0, 20.0], [30.0, 40.0]], dtype=numpy.float64)
+            raw1 = numpy.array([[5.0, 15.0], [25.0, 35.0]], dtype=numpy.float64)
+
+            with h5py.File(input_path, "w") as fin:
+                entry = fin.create_group("entry0")
+                entry.attrs["NX_class"] = b"NXentry"
+
+                sample = entry.create_group("sample")
+                sample.attrs["NX_class"] = b"NXsample"
+                sample.create_dataset("name", data=numpy.bytes_("sample"))
+
+                control = entry.create_group("control")
+                control.attrs["NX_class"] = b"NXmonitor"
+                control.create_dataset("count_time", data=10.0)
+
+                monitor2 = entry.create_group("monitor2")
+                monitor2.attrs["NX_class"] = b"NXmonitor"
+                monitor2.create_dataset("integral", data=500.0)
+
+                instrument = entry.create_group("SANS-LLB")
+                instrument.attrs["NX_class"] = b"NXinstrument"
+
+                source = instrument.create_group("source")
+                incident_wavelength = source.create_dataset("incident_wavelength", data=0.6)
+                incident_wavelength.attrs["units"] = b"nm"
+
+                aperture = instrument.create_group("aperture")
+                x_gap = aperture.create_dataset("x_gap", data=0.01)
+                x_gap.attrs["units"] = b"m"
+                y_gap = aperture.create_dataset("y_gap", data=0.01)
+                y_gap.attrs["units"] = b"m"
+
+                central_detector = instrument.create_group("central_detector")
+                central_detector.attrs["NX_class"] = b"NXdetector"
+                central_detector.create_dataset("data", data=raw0)
+                central_detector.create_dataset("x_pixel_size", data=0.005)
+                central_detector.create_dataset("y_pixel_size", data=0.005)
+                central_detector.create_dataset("beam_center_x", data=0.5)
+                central_detector.create_dataset("beam_center_y", data=0.5)
+                central_detector.create_dataset("dead_time", data=1.0e-3)
+
+                left_detector = instrument.create_group("left_detector")
+                left_detector.attrs["NX_class"] = b"NXdetector"
+                left_detector.create_dataset("data", data=raw1)
+                left_detector.create_dataset("x_pixel_size", data=0.005)
+                left_detector.create_dataset("y_pixel_size", data=0.005)
+                left_detector.create_dataset("beam_center_x", data=0.5)
+                left_detector.create_dataset("beam_center_y", data=0.5)
+                left_detector.create_dataset("deadtime", data=2.0e-3)
+
+            convert_sansllb_to_scarlet_nxsas_raw(input_path, output_path, overwrite=True)
+
+            expected0 = correct_detector_dead_time(raw0, acq_time=10.0, deadtime=1.0e-3)
+            expected1 = correct_detector_dead_time(raw1, acq_time=10.0, deadtime=2.0e-3)
+
+            with h5py.File(output_path, "r") as fout:
+                numpy.testing.assert_allclose(fout["/raw_data/instrument/detector0/data"][()], expected0)
+                numpy.testing.assert_allclose(fout["/raw_data/data0/counts"][()], expected0)
+                numpy.testing.assert_allclose(fout["/raw_data/instrument/detector1/data"][()], expected1)
+                numpy.testing.assert_allclose(fout["/raw_data/data1/counts"][()], expected1)
+                self.assertTrue(bool(fout["/raw_data/instrument/detector0/deadtime_corrected"][()]))
+                self.assertTrue(bool(fout["/raw_data/instrument/detector1/deadtime_corrected"][()]))
+
     def test_sansllb_sample_validates_with_schema(self) -> None:
         raw_data = Path(__file__).resolve().parent / "data" / "sansllb" / "raw_data"
         sample = raw_data / "sans-llb2025n002339.hdf"

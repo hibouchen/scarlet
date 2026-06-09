@@ -6,6 +6,7 @@ from typing import List, Optional
 import h5py
 import numpy as np
 
+from ._deadtime import correct_detector_data_for_deadtime
 from ._report import ConvertReport
 from ._hdf import (
     as_float_scalar as _as_float_scalar,
@@ -512,6 +513,11 @@ def convert_sansllb_to_scarlet_nxsas_raw(
         # SANS-LLB uses monitor2 as the acquisition preset source.
         control_in = _select_monitor_group(fin, [f"{entry}/monitor2", f"{entry}/control"])
         monitor_sources = _collect_monitor_sources(fin, entry)
+        acquisition_time = None
+        if f"{entry}/control/count_time" in fin:
+            acquisition_time = _as_float_scalar(fin[f"{entry}/control/count_time"][()])
+        elif control_in is not None and f"{control_in}/count_time" in fin:
+            acquisition_time = _as_float_scalar(fin[f"{control_in}/count_time"][()])
 
         # --- Read key values ---
         wavelength_ds = _safe_get_dataset(fin, f"{inst_in}/source/incident_wavelength")
@@ -629,7 +635,22 @@ def convert_sansllb_to_scarlet_nxsas_raw(
 
                 # required by SCARLET
                 data = det_in["data"][()]
-                _write_dataset(det_out, "data", data)
+                if "dead_time" in det_in:
+                    dead_time = det_in["dead_time"][()]
+                elif "deadtime" in det_in:
+                    dead_time = det_in["deadtime"][()]
+                else:
+                    dead_time = float("nan")
+                if dead_time is None:
+                    dead_time = float("nan")
+                corrected_data, deadtime_corrected = correct_detector_data_for_deadtime(
+                    data,
+                    acquisition_time=acquisition_time,
+                    dead_time=_as_float_scalar(dead_time),
+                    detector_name=det_name,
+                    warnings=warnings,
+                )
+                _write_dataset(det_out, "data", corrected_data)
 
                 xpix_m = _length_dataset_to_m(_safe_get_dataset(fin, f"{inst_in}/{det_name}/x_pixel_size"))
                 ypix_m = _length_dataset_to_m(_safe_get_dataset(fin, f"{inst_in}/{det_name}/y_pixel_size"))
@@ -648,8 +669,8 @@ def convert_sansllb_to_scarlet_nxsas_raw(
                     _write_dataset(det_out, "beam_center_x", _as_float_scalar(det_in["beam_center_x"][()]))
                 else:
                     bx = float("nan")
-                    if hasattr(data, "shape") and len(getattr(data, "shape", ())) >= 2:
-                        bx = (float(data.shape[-1]) - 1.0) / 2.0
+                    if hasattr(corrected_data, "shape") and len(getattr(corrected_data, "shape", ())) >= 2:
+                        bx = (float(corrected_data.shape[-1]) - 1.0) / 2.0
                     warnings.append(f"{det_name}: missing beam_center_x; writing {bx}")
                     _write_dataset(det_out, "beam_center_x", bx)
 
@@ -659,20 +680,13 @@ def convert_sansllb_to_scarlet_nxsas_raw(
                     _write_dataset(det_out, "beam_center_y", _as_float_scalar(det_in["beam_center_y"][()]))
                 else:
                     by = float("nan")
-                    if hasattr(data, "shape") and len(getattr(data, "shape", ())) >= 2:
-                        by = (float(data.shape[-2]) - 1.0) / 2.0
+                    if hasattr(corrected_data, "shape") and len(getattr(corrected_data, "shape", ())) >= 2:
+                        by = (float(corrected_data.shape[-2]) - 1.0) / 2.0
                     warnings.append(f"{det_name}: missing beam_center_y; writing {by}")
                     _write_dataset(det_out, "beam_center_y", by)
 
-                if "dead_time" in det_in:
-                    dead_time = det_in["dead_time"][()]
-                elif "deadtime" in det_in:
-                    dead_time = det_in["deadtime"][()]
-                else:
-                    dead_time = float("nan")
-                if dead_time is None:
-                    dead_time = float("nan")
                 _write_dataset(det_out, "dead_time", _as_float_scalar(dead_time))
+                _write_dataset(det_out, "deadtime_corrected", deadtime_corrected)
 
                 # optional fields (copy if present)
                 for opt in (
