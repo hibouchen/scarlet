@@ -21,6 +21,7 @@ from ._units import MM_TO_M, length_dataset_to_m as _length_dataset_to_m, mm_or_
 
 
 NM_TO_ANGSTROM = 10.0
+_VALID_MONITOR_MODES = {"monitor", "timer"}
 
 
 def _sansllb_detector_view_name(detector_name: str) -> Optional[str]:
@@ -114,6 +115,39 @@ def _wavelength_error_from_spread(wavelength: float, spread: float) -> float:
     return s
 
 
+def _count_time_to_scalar(value) -> float:
+    """Collapse scalar-like or vector count-time values to one exposure duration."""
+    return _monitor_value_to_scalar(value)
+
+
+def _monitor_value_to_scalar(value) -> float:
+    """Collapse scalar-like or vector monitor values to one accumulated value."""
+    if value is None:
+        return float("nan")
+    if isinstance(value, np.ndarray):
+        arr = np.asarray(value, dtype=np.float64)
+        if arr.size == 0:
+            return float("nan")
+        if arr.size == 1:
+            return float(arr.reshape(()))
+        finite = arr[np.isfinite(arr)]
+        if finite.size == 0:
+            return float("nan")
+        return float(np.sum(finite))
+    return _as_float_scalar(value)
+
+
+def _normalize_monitor_mode(value, *, fallback: str = "monitor") -> str:
+    """Normalize monitor mode to a schema-valid value."""
+    mode = _as_str(value).strip().lower() if value is not None else ""
+    if mode in _VALID_MONITOR_MODES:
+        return mode
+    fallback_mode = _as_str(fallback).strip().lower()
+    if fallback_mode in _VALID_MONITOR_MODES:
+        return fallback_mode
+    return "monitor"
+
+
 def _select_monitor_group(fin: h5py.File, candidates: List[str]) -> Optional[str]:
     """Return the first existing NXmonitor group among the given absolute paths."""
     for cand in candidates:
@@ -171,7 +205,7 @@ def _write_control_monitor(
         control_out = _ensure_group(entry_out, "control", "NXmonitor")
         _write_dataset(control_out, "mode", "monitor", as_string=True)
         if "integral" in control_src:
-            preset = _as_float_scalar(control_src["integral"][()])
+            preset = _monitor_value_to_scalar(control_src["integral"][()])
             _write_dataset(control_out, "preset", preset)
             _write_dataset(control_out, "integral", preset)
         else:
@@ -180,7 +214,7 @@ def _write_control_monitor(
             _write_dataset(control_out, "integral", float("nan"))
 
         if f"{entry}/control/count_time" in fin:
-            _write_dataset(control_out, "count_time", _as_float_scalar(fin[f"{entry}/control/count_time"][()]))
+            _write_dataset(control_out, "count_time", _count_time_to_scalar(fin[f"{entry}/control/count_time"][()]))
         return
 
     warnings.append("Missing /monitor2 and /control in input; writing NaN /entry/control.")
@@ -203,27 +237,31 @@ def _write_instrument_monitors(
         notes.append("No monitor groups found in input; instrument monitors omitted.")
         return
 
-    control_mode = _as_str(fin[f"{entry}/control/mode"][0]) if f"{entry}/control/mode" in fin else "monitor"
-    control_preset = _as_float_scalar(fin[f"{entry}/control/preset"][()]) if f"{entry}/control/preset" in fin else float("nan")
-    control_count_time = _as_float_scalar(fin[f"{entry}/control/count_time"][()]) if f"{entry}/control/count_time" in fin else None
+    control_mode = (
+        _normalize_monitor_mode(fin[f"{entry}/control/mode"][0])
+        if f"{entry}/control/mode" in fin
+        else "monitor"
+    )
+    control_preset = _monitor_value_to_scalar(fin[f"{entry}/control/preset"][()]) if f"{entry}/control/preset" in fin else float("nan")
+    control_count_time = _count_time_to_scalar(fin[f"{entry}/control/count_time"][()]) if f"{entry}/control/count_time" in fin else None
 
     for monitor_idx, monitor_path in monitor_sources:
         mon_in = fin[monitor_path]
         mon_out = _ensure_group(inst_out, f"monitor{monitor_idx}", "NXmonitor")
 
-        mode = _as_str(mon_in["mode"][0]) if "mode" in mon_in else control_mode
+        mode = _normalize_monitor_mode(mon_in["mode"][0], fallback=control_mode) if "mode" in mon_in else control_mode
         _write_dataset(mon_out, "mode", mode, as_string=True)
 
-        preset = _as_float_scalar(mon_in["preset"][()]) if "preset" in mon_in else control_preset
+        preset = _monitor_value_to_scalar(mon_in["preset"][()]) if "preset" in mon_in else control_preset
         _write_dataset(mon_out, "preset", preset)
 
         if "integral" in mon_in:
-            _write_dataset(mon_out, "integral", _as_float_scalar(mon_in["integral"][()]))
+            _write_dataset(mon_out, "integral", _monitor_value_to_scalar(mon_in["integral"][()]))
 
         if "data" in mon_in:
             _write_dataset(mon_out, "data", mon_in["data"][()])
 
-        count_time = _as_float_scalar(mon_in["count_time"][()]) if "count_time" in mon_in else control_count_time
+        count_time = _count_time_to_scalar(mon_in["count_time"][()]) if "count_time" in mon_in else control_count_time
         if count_time is not None:
             _write_dataset(mon_out, "count_time", count_time)
 
@@ -515,9 +553,9 @@ def convert_sansllb_to_scarlet_nxsas_raw(
         monitor_sources = _collect_monitor_sources(fin, entry)
         acquisition_time = None
         if f"{entry}/control/count_time" in fin:
-            acquisition_time = _as_float_scalar(fin[f"{entry}/control/count_time"][()])
+            acquisition_time = _count_time_to_scalar(fin[f"{entry}/control/count_time"][()])
         elif control_in is not None and f"{control_in}/count_time" in fin:
-            acquisition_time = _as_float_scalar(fin[f"{control_in}/count_time"][()])
+            acquisition_time = _count_time_to_scalar(fin[f"{control_in}/count_time"][()])
 
         # --- Read key values ---
         wavelength_ds = _safe_get_dataset(fin, f"{inst_in}/source/incident_wavelength")

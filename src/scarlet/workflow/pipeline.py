@@ -95,11 +95,34 @@ class ReductionPipeline:
     def default(cls) -> "ReductionPipeline":
         return cls(
             steps=(
+                as_reduction_step(check_inputs),
                 as_reduction_step(check_ref_sub_file),
                 as_reduction_step(check_ref_norm_file),
                 as_reduction_step(compute_transmission_step),
                 as_reduction_step(subtract_references_step),
                 as_reduction_step(normalize_by_water_step),
+                as_reduction_step(azimutal_averaging_step),
+            )
+        )
+    
+    @classmethod
+    def without_water_correction(cls) -> "ReductionPipeline":
+        return cls(
+            steps=(
+                as_reduction_step(check_inputs),
+                as_reduction_step(check_ref_sub_file),
+                as_reduction_step(compute_transmission_step),
+                as_reduction_step(subtract_references_step),
+                as_reduction_step(azimutal_averaging_step),
+            )
+        )
+    
+    @classmethod
+    def only_azimuthal_averaging(cls) -> "ReductionPipeline":
+        return cls(
+            steps=(
+                as_reduction_step(check_inputs),
+                as_reduction_step(check_ref_sub_file),
                 as_reduction_step(azimutal_averaging_step),
             )
         )
@@ -114,6 +137,20 @@ class ReductionPipeline:
             state = step.fn(state)
             state.reductions_steps.append(step.name)
         return state
+    
+@reduction_step("check inputs")
+def check_inputs(state: ReductionState) -> ReductionState:
+    if not state.inputs.sample_file_scattering:
+        raise ValueError("sample_file_scattering is required")
+    if not state.inputs.sample_file_transmission:
+        state.inputs = replace(
+            state.inputs,
+            sample_file_transmission=state.inputs.sample_file_scattering,
+        )
+    return _set_state_detectors(
+        state,
+        _load_sample_detectors(state.inputs.sample_file_scattering),
+    )
 
 
 @reduction_step("check reference subtraction file")
@@ -121,7 +158,31 @@ def check_ref_sub_file(state: ReductionState) -> ReductionState:
     if not state.inputs.ref_sub_file:
         raise ValueError("ref_sub_file is required for reference subtraction")
     compute_reference_transmissions(state.inputs.ref_sub_file)
-    return state
+    if not state.detectors:
+        state = _set_state_detectors(
+            state,
+            _load_sample_detectors(state.inputs.sample_file_scattering),
+        )
+
+    masked_detectors: dict[int, PipelineData] = {}
+    for detector_number, detector in sorted(state.detectors.items()):
+        merged_mask = _combine_masks(
+            detector.mask,
+            _read_reference_mask(
+                state.inputs.ref_sub_file,
+                detector_number=detector_number,
+            ),
+        )
+        masked_detectors[detector_number] = PipelineData(
+            data=detector.data,
+            data_error=detector.data_error,
+            x=detector.x,
+            x_error=detector.x_error,
+            y=detector.y,
+            y_error=detector.y_error,
+            mask=merged_mask,
+        )
+    return _set_state_detectors(state, masked_detectors)
 
 
 @reduction_step("check reference normalization file")
@@ -140,8 +201,9 @@ def compute_transmission_step(state: ReductionState) -> ReductionState:
         return state
     eb_tr_path = read_empty_beam_transmission_source_file(state.inputs.ref_sub_file)
     roi, detnum = get_roi(state.inputs.ref_sub_file)
+    transmission_source = state.inputs.sample_file_transmission or state.inputs.sample_file_scattering
     transmission = compute_transmission(
-        state.inputs.sample_file_transmission,
+        transmission_source,
         eb_tr_path,
         roi,
         detector_number=detnum,
@@ -155,10 +217,11 @@ def subtract_references_step(state: ReductionState) -> ReductionState:
     if state.inputs.sample_transmission is None:
         raise ValueError("sample_transmission must be defined before subtracting references")
 
-    sample_detectors = read_all_detectors(
-        state.inputs.sample_file_scattering,
-        normalize_by_monitor=True,
-    )
+    if not state.detectors:
+        state = _set_state_detectors(
+            state,
+            _load_sample_detectors(state.inputs.sample_file_scattering),
+        )
     empty_cell_transmission = _read_reference_transmission(
         state.inputs.ref_sub_file,
         "empty_cell_scattering",
@@ -170,16 +233,21 @@ def subtract_references_step(state: ReductionState) -> ReductionState:
         )
 
     corrected_detectors: dict[int, PipelineData] = {}
-    for detector_number, sample_detector in sorted(sample_detectors.items()):
+    for detector_number, sample_detector in sorted(state.detectors.items()):
         dark = _read_reference_detector_data(state.inputs.ref_sub_file, "dark", detector_number=detector_number)
         empty_cell = _read_reference_detector_data(
             state.inputs.ref_sub_file,
             "empty_cell_scattering",
             detector_number=detector_number,
         )
-        mask = _read_reference_mask(
-            state.inputs.ref_sub_file,
-            detector_number=detector_number,
+        if sample_detector.data_error is None:
+            raise ValueError(f"sample detector error is required for detector{detector_number} reference subtraction")
+        mask = _combine_masks(
+            sample_detector.mask,
+            _read_reference_mask(
+                state.inputs.ref_sub_file,
+                detector_number=detector_number,
+            ),
         )
 
         if empty_cell is not None and empty_cell_transmission is None:
@@ -198,7 +266,7 @@ def subtract_references_step(state: ReductionState) -> ReductionState:
                 f"expected {corrected.shape}, got {mask.shape}"
             )
 
-        corrected_variance = np.square(sample_detector.error) / (state.inputs.sample_transmission ** 2)
+        corrected_variance = np.square(sample_detector.data_error) / (state.inputs.sample_transmission ** 2)
         if dark is not None and empty_cell is None:
             corrected_variance += np.square(dark.data_error) / (state.inputs.sample_transmission ** 2)
         elif dark is not None and empty_cell is not None:
@@ -238,17 +306,7 @@ def subtract_references_step(state: ReductionState) -> ReductionState:
             mask=mask,
         )
 
-    state.detectors = corrected_detectors
-    primary_detector_number = 0 if 0 in corrected_detectors else next(iter(corrected_detectors), None)
-    if primary_detector_number is not None:
-        primary = corrected_detectors[primary_detector_number]
-        state.data = primary.data
-        state.data_error = primary.data_error
-        state.x = primary.x
-        state.x_error = primary.x_error
-        state.y = primary.y
-        state.y_error = primary.y_error
-    return state
+    return _set_state_detectors(state, corrected_detectors)
 
 
 @reduction_step("flatfield correction")
@@ -305,17 +363,7 @@ def normalize_by_water_step(state: ReductionState) -> ReductionState:
             mask=merged_mask,
         )
 
-    state.detectors = normalized_detectors
-    primary_detector_number = 0 if 0 in normalized_detectors else next(iter(normalized_detectors), None)
-    if primary_detector_number is not None:
-        primary = normalized_detectors[primary_detector_number]
-        state.data = primary.data
-        state.data_error = primary.data_error
-        state.x = primary.x
-        state.x_error = primary.x_error
-        state.y = primary.y
-        state.y_error = primary.y_error
-    return state
+    return _set_state_detectors(state, normalized_detectors)
 
 
 @reduction_step("azimuthal averaging")
@@ -361,16 +409,50 @@ def azimutal_averaging_step(state: ReductionState) -> ReductionState:
             mask=None,
         )
 
-    state.detectors = integrated_detectors
-    primary_detector_number = 0 if 0 in integrated_detectors else next(iter(integrated_detectors), None)
-    if primary_detector_number is not None:
-        primary = integrated_detectors[primary_detector_number]
-        state.data = primary.data
-        state.data_error = primary.data_error
-        state.x = primary.x
-        state.x_error = primary.x_error
-        state.y = primary.y
-        state.y_error = primary.y_error
+    return _set_state_detectors(state, integrated_detectors)
+
+
+def _load_sample_detectors(sample_file_scattering: str | Path) -> dict[int, PipelineData]:
+    sample_detectors = read_all_detectors(
+        sample_file_scattering,
+        normalize_by_monitor=True,
+    )
+    return {
+        detector_number: PipelineData(
+            data=sample_detector.data,
+            data_error=sample_detector.error,
+            x=None,
+            x_error=None,
+            y=None,
+            y_error=None,
+            mask=None,
+        )
+        for detector_number, sample_detector in sorted(sample_detectors.items())
+    }
+
+
+def _set_state_detectors(
+    state: ReductionState,
+    detectors: dict[int, PipelineData],
+) -> ReductionState:
+    state.detectors = detectors
+    primary_detector_number = 0 if 0 in detectors else next(iter(detectors), None)
+    if primary_detector_number is None:
+        state.data = None
+        state.data_error = None
+        state.x = None
+        state.x_error = None
+        state.y = None
+        state.y_error = None
+        return state
+
+    primary = detectors[primary_detector_number]
+    state.data = primary.data
+    state.data_error = primary.data_error
+    state.x = primary.x
+    state.x_error = primary.x_error
+    state.y = primary.y
+    state.y_error = primary.y_error
     return state
 
 

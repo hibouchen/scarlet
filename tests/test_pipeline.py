@@ -14,8 +14,10 @@ from scarlet.workflow.pipeline import (
     ReductionPipeline,
     ReductionState,
     as_reduction_step,
+    check_inputs,
     check_ref_sub_file,
     compute_transmission_step,
+    subtract_references_step,
 )
 from scarlet.workflow.reference import write_refs_sub_file
 
@@ -91,9 +93,13 @@ class TestPipelineBis(unittest.TestCase):
         self.assertEqual(
             pipeline.step_names,
             (
+                "check inputs",
                 "check reference subtraction file",
+                "check reference normalization file",
                 "compute transmission",
                 "subtract references",
+                "flatfield correction",
+                "azimuthal averaging",
             ),
         )
         self.assertEqual(as_reduction_step(check_ref_sub_file).name, "check reference subtraction file")
@@ -128,7 +134,64 @@ class TestPipelineBis(unittest.TestCase):
 
             self.assertAlmostEqual(updated.inputs.sample_transmission or 0.0, 0.5)
 
-    def test_default_pipeline_subtracts_refs_sub_references(self) -> None:
+    def test_check_inputs_initializes_sample_detectors_and_falls_back_to_scattering_file(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            sample_scattering = root / "sample_scattering.nxs"
+            _write_raw_file(sample_scattering, data=np.full((4, 4), 8.0, dtype=np.float64), monitor_integral=4.0)
+
+            state = ReductionState(
+                inputs=ReductionInputs(
+                    sample_file_scattering=str(sample_scattering),
+                    sample_file_transmission="",
+                )
+            )
+
+            updated = check_inputs(state)
+
+            self.assertEqual(updated.inputs.sample_file_transmission, str(sample_scattering))
+            self.assertEqual(sorted(updated.detectors), [0])
+            np.testing.assert_allclose(updated.detectors[0].data, np.full((4, 4), 2.0, dtype=np.float64))
+            np.testing.assert_allclose(updated.detectors[0].data_error, np.full((4, 4), np.sqrt(8.0) / 4.0))
+            self.assertIsNone(updated.detectors[0].mask)
+            np.testing.assert_allclose(updated.data, updated.detectors[0].data)
+
+    def test_check_ref_sub_file_merges_reference_masks_into_state_detectors(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            sample_scattering = root / "sample_scattering.nxs"
+            empty_beam_transmission = root / "empty_beam_transmission.nxs"
+            refs_sub = root / "refs_sub.nxs"
+            sample_data = np.arange(16, dtype=np.float64).reshape(4, 4)
+
+            _write_raw_file(sample_scattering, data=sample_data, monitor_integral=2.0)
+            _write_raw_file(empty_beam_transmission, data=np.full((4, 4), 10.0, dtype=np.float64))
+
+            write_refs_sub_file(
+                refs_sub,
+                _configuration(),
+                empty_beam_transmission=empty_beam_transmission,
+                transmission_roi_detector=0,
+                transmission_roi=(1, 3, 1, 3),
+                masks={0: np.array([[0, 1, 0, 0], [0, 0, 0, 0], [1, 0, 0, 0], [0, 0, 0, 1]], dtype=np.uint8)},
+            )
+
+            state = check_inputs(
+                ReductionState(
+                    inputs=ReductionInputs(
+                        sample_file_scattering=str(sample_scattering),
+                        sample_file_transmission="",
+                        ref_sub_file=str(refs_sub),
+                    )
+                )
+            )
+            updated = check_ref_sub_file(state)
+
+            expected_mask = np.array([[0, 1, 0, 0], [0, 0, 0, 0], [1, 0, 0, 0], [0, 0, 0, 1]], dtype=np.uint8)
+            np.testing.assert_array_equal(updated.detectors[0].mask, expected_mask)
+            np.testing.assert_allclose(updated.detectors[0].data, sample_data / 2.0)
+
+    def test_without_water_correction_pipeline_subtracts_refs_sub_references(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             sample_scattering = root / "sample_scattering.nxs"
@@ -163,7 +226,16 @@ class TestPipelineBis(unittest.TestCase):
                 beam_centers={0: (0.25, 2.25)},
             )
 
-            state = ReductionPipeline.default().run(
+            pipeline = ReductionPipeline(
+                steps=(
+                    as_reduction_step(check_inputs),
+                    as_reduction_step(check_ref_sub_file),
+                    as_reduction_step(compute_transmission_step),
+                    as_reduction_step(subtract_references_step),
+                )
+            )
+
+            state = pipeline.run(
                 ReductionInputs(
                     sample_file_scattering=str(sample_scattering),
                     sample_file_transmission=str(sample_transmission),
@@ -192,6 +264,7 @@ class TestPipelineBis(unittest.TestCase):
             self.assertEqual(
                 state.reductions_steps,
                 [
+                    "check inputs",
                     "check reference subtraction file",
                     "compute transmission",
                     "subtract references",
@@ -199,7 +272,44 @@ class TestPipelineBis(unittest.TestCase):
             )
             self.assertAlmostEqual(state.inputs.sample_transmission or 0.0, 0.5)
 
-    def test_default_pipeline_subtracts_references_for_all_sample_detectors(self) -> None:
+    def test_only_azimuthal_averaging_pipeline_skips_transmission_and_ref_norm(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            sample_scattering = root / "sample_scattering.nxs"
+            empty_beam_transmission = root / "empty_beam_transmission.nxs"
+            refs_sub = root / "refs_sub.nxs"
+
+            sample_data = np.zeros((4, 4), dtype=np.float64)
+            sample_data[1:3, 1:3] = 10.0
+            _write_raw_file(sample_scattering, data=sample_data, monitor_integral=2.0, detector_distance=2.1)
+            _write_raw_file(empty_beam_transmission, data=np.full((4, 4), 10.0, dtype=np.float64))
+
+            write_refs_sub_file(
+                refs_sub,
+                _configuration(),
+                empty_beam_transmission=empty_beam_transmission,
+                transmission_roi_detector=0,
+                transmission_roi=(1, 3, 1, 3),
+                beam_centers={0: (1.5, 1.5)},
+                masks={0: np.array([[0, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]], dtype=np.uint8)},
+            )
+
+            state = ReductionPipeline.only_azimuthal_averaging().run(
+                ReductionInputs(
+                    sample_file_scattering=str(sample_scattering),
+                    sample_file_transmission="",
+                    ref_sub_file=str(refs_sub),
+                    ref_norm_file="",
+                )
+            )
+
+            self.assertEqual(state.reductions_steps, ["check inputs", "check reference subtraction file", "azimuthal averaging"])
+            self.assertEqual(sorted(state.detectors), [0])
+            self.assertIsNotNone(state.x)
+            self.assertEqual(state.data.ndim, 1)
+            self.assertTrue(np.any(np.isfinite(state.data)))
+
+    def test_without_water_correction_pipeline_subtracts_references_for_all_sample_detectors(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             sample_scattering = root / "sample_scattering.nxs"
@@ -260,7 +370,16 @@ class TestPipelineBis(unittest.TestCase):
                 beam_centers={0: (0.25, 2.25), 1: (1.75, 0.5)},
             )
 
-            state = ReductionPipeline.default().run(
+            pipeline = ReductionPipeline(
+                steps=(
+                    as_reduction_step(check_inputs),
+                    as_reduction_step(check_ref_sub_file),
+                    as_reduction_step(compute_transmission_step),
+                    as_reduction_step(subtract_references_step),
+                )
+            )
+
+            state = pipeline.run(
                 ReductionInputs(
                     sample_file_scattering=str(sample_scattering),
                     sample_file_transmission=str(sample_transmission),

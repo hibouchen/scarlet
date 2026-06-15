@@ -56,6 +56,20 @@ class TestSansLlbConverterSchema(unittest.TestCase):
                 y_gap = aperture.create_dataset("y_gap", data=0.01)
                 y_gap.attrs["units"] = b"m"
 
+                collimator = instrument.create_group("collimator")
+                collimator_length = collimator.create_dataset("length", data=1.0)
+                collimator_length.attrs["units"] = b"m"
+                collimator_distance = collimator.create_dataset("distance", data=0.2)
+                collimator_distance.attrs["units"] = b"m"
+                for slit_name, distance in (("slit0", 1.2), ("slit1", 0.2)):
+                    slit = collimator.create_group(slit_name)
+                    slit_x_gap = slit.create_dataset("x_gap", data=0.01)
+                    slit_x_gap.attrs["units"] = b"m"
+                    slit_y_gap = slit.create_dataset("y_gap", data=0.01)
+                    slit_y_gap.attrs["units"] = b"m"
+                    slit_distance = slit.create_dataset("distance", data=distance)
+                    slit_distance.attrs["units"] = b"m"
+
                 central_detector = instrument.create_group("central_detector")
                 central_detector.attrs["NX_class"] = b"NXdetector"
                 central_detector.create_dataset("data", data=raw0)
@@ -86,6 +100,91 @@ class TestSansLlbConverterSchema(unittest.TestCase):
                 numpy.testing.assert_allclose(fout["/raw_data/data1/counts"][()], expected1)
                 self.assertTrue(bool(fout["/raw_data/instrument/detector0/deadtime_corrected"][()]))
                 self.assertTrue(bool(fout["/raw_data/instrument/detector1/deadtime_corrected"][()]))
+
+    def test_sansllb_converter_accepts_vector_count_time_and_empty_monitor_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            input_path = Path(td) / "sansllb_input_vector_count_time.hdf"
+            output_path = Path(td) / "sansllb_output_vector_count_time.h5"
+            raw0 = numpy.array([[10.0, 20.0], [30.0, 40.0]], dtype=numpy.float64)
+            count_times = numpy.array([2.0, 3.5, 4.5], dtype=numpy.float64)
+
+            with h5py.File(input_path, "w") as fin:
+                entry = fin.create_group("entry0")
+                entry.attrs["NX_class"] = b"NXentry"
+
+                sample = entry.create_group("sample")
+                sample.attrs["NX_class"] = b"NXsample"
+                sample.create_dataset("name", data=numpy.bytes_("sample"))
+
+                control = entry.create_group("control")
+                control.attrs["NX_class"] = b"NXmonitor"
+                control.create_dataset("count_time", data=count_times)
+                control.create_dataset("mode", data=numpy.array([numpy.bytes_("")]))
+
+                for monitor_name, integral in (
+                    ("monitor0", numpy.array([100.0, 101.0, 102.0], dtype=numpy.float64)),
+                    ("monitor1", numpy.array([200.0, 201.0, 202.0], dtype=numpy.float64)),
+                    ("monitor2", numpy.array([300.0, 301.0, 302.0], dtype=numpy.float64)),
+                ):
+                    monitor = entry.create_group(monitor_name)
+                    monitor.attrs["NX_class"] = b"NXmonitor"
+                    monitor.create_dataset("mode", data=numpy.array([numpy.bytes_("")]))
+                    monitor.create_dataset("integral", data=integral)
+
+                instrument = entry.create_group("SANS-LLB")
+                instrument.attrs["NX_class"] = b"NXinstrument"
+
+                source = instrument.create_group("source")
+                incident_wavelength = source.create_dataset("incident_wavelength", data=0.6)
+                incident_wavelength.attrs["units"] = b"nm"
+
+                aperture = instrument.create_group("aperture")
+                x_gap = aperture.create_dataset("x_gap", data=0.01)
+                x_gap.attrs["units"] = b"m"
+                y_gap = aperture.create_dataset("y_gap", data=0.01)
+                y_gap.attrs["units"] = b"m"
+
+                collimator = instrument.create_group("collimator")
+                collimator_length = collimator.create_dataset("length", data=1.0)
+                collimator_length.attrs["units"] = b"m"
+                collimator_distance = collimator.create_dataset("distance", data=0.2)
+                collimator_distance.attrs["units"] = b"m"
+                for slit_name, distance in (("slit0", 1.2), ("slit1", 0.2)):
+                    slit = collimator.create_group(slit_name)
+                    slit_x_gap = slit.create_dataset("x_gap", data=0.01)
+                    slit_x_gap.attrs["units"] = b"m"
+                    slit_y_gap = slit.create_dataset("y_gap", data=0.01)
+                    slit_y_gap.attrs["units"] = b"m"
+                    slit_distance = slit.create_dataset("distance", data=distance)
+                    slit_distance.attrs["units"] = b"m"
+
+                central_detector = instrument.create_group("central_detector")
+                central_detector.attrs["NX_class"] = b"NXdetector"
+                central_detector.create_dataset("data", data=raw0)
+                central_detector.create_dataset("x_pixel_size", data=0.005)
+                central_detector.create_dataset("y_pixel_size", data=0.005)
+                central_detector.create_dataset("beam_center_x", data=0.5)
+                central_detector.create_dataset("beam_center_y", data=0.5)
+                central_detector.create_dataset("dead_time", data=1.0e-3)
+
+            convert_sansllb_to_scarlet_nxsas_raw(input_path, output_path, overwrite=True)
+
+            expected0 = correct_detector_dead_time(raw0, acq_time=float(count_times.sum()), deadtime=1.0e-3)
+            schema = load_schema("scarlet_nxsas_raw_v1.3_mono.yaml")
+            report = validate_nexus_file(output_path, schema)
+
+            self.assertTrue(report.ok, "\n".join(report.format_lines()))
+            with h5py.File(output_path, "r") as fout:
+                numpy.testing.assert_allclose(fout["/raw_data/instrument/detector0/data"][()], expected0)
+                self.assertAlmostEqual(float(fout["/raw_data/control/preset"][()]), 903.0)
+                self.assertAlmostEqual(float(fout["/raw_data/control/integral"][()]), 903.0)
+                self.assertAlmostEqual(float(fout["/raw_data/control/count_time"][()]), float(count_times.sum()))
+                self.assertEqual(fout["/raw_data/instrument/monitor0/mode"][()].decode(), "monitor")
+                self.assertEqual(fout["/raw_data/instrument/monitor1/mode"][()].decode(), "monitor")
+                self.assertEqual(fout["/raw_data/instrument/monitor2/mode"][()].decode(), "monitor")
+                self.assertAlmostEqual(float(fout["/raw_data/instrument/monitor0/integral"][()]), 303.0)
+                self.assertAlmostEqual(float(fout["/raw_data/instrument/monitor1/integral"][()]), 603.0)
+                self.assertAlmostEqual(float(fout["/raw_data/instrument/monitor2/integral"][()]), 903.0)
 
     def test_sansllb_sample_validates_with_schema(self) -> None:
         raw_data = Path(__file__).resolve().parent / "data" / "sansllb" / "raw_data"
