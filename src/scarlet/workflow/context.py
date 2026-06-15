@@ -40,8 +40,10 @@ class RunKey:
     entity: Entity
     mode: Mode
     sample_name: Optional[str] = None  # required for entity=="sample", optional otherwise
+    transmission: Optional[float] = field(default=None, compare=False)  # metadata, not part of run identity
 
     def short(self) -> str:
+        """Return a compact stable identifier for logs and dictionary keys."""
         s = f"{self.config_id}:{self.entity}:{self.mode}"
         if self.sample_name:
             s += f":{self.sample_name}"
@@ -59,6 +61,7 @@ class Artifact:
 
 @dataclass
 class LogMessage:
+    """Structured log entry recorded during workflow execution."""
     level: Level
     message: str
     where: Optional[str] = None      # step name or component
@@ -68,6 +71,7 @@ class LogMessage:
 
 @dataclass
 class Issue:
+    """Structured warning or error attached to workflow processing."""
     level: Literal["WARN", "ERROR"]
     message: str
     where: Optional[str] = None
@@ -83,6 +87,7 @@ class TableView:
     rows: List[Dict[str, str]]
 
     def _repr_html_(self) -> str:
+        """Render the table as HTML for rich notebook display."""
         header = "".join(f"<th>{escape(column)}</th>" for column in self.columns)
         body_rows = []
         for row in self.rows:
@@ -97,6 +102,7 @@ class TableView:
         )
 
     def __repr__(self) -> str:
+        """Render the table as a CSV-like plain-text representation."""
         lines = [",".join(self.columns)]
         for row in self.rows:
             lines.append(",".join(row.get(column, "") for column in self.columns))
@@ -168,6 +174,7 @@ class WorkflowContext:
     _h5_cache_size: int = field(default=8, init=False, repr=False)
 
     def _store_dict(self, key: str) -> Dict[Any, Any]:
+        """Return a dict-backed store entry, creating it on first access."""
         existing = self.store.get(key)
         if existing is None:
             existing = {}
@@ -178,18 +185,22 @@ class WorkflowContext:
 
     @property
     def frames(self) -> Dict[Tuple[RunKey, int], np.ndarray]:
+        """Frame cache keyed by run and detector number."""
         return cast(Dict[Tuple[RunKey, int], np.ndarray], self._store_dict("frames"))
 
     @property
     def frame_errors(self) -> Dict[Tuple[RunKey, int], np.ndarray]:
+        """Per-frame uncertainty cache keyed by run and detector number."""
         return cast(Dict[Tuple[RunKey, int], np.ndarray], self._store_dict("frame_errors"))
 
     @property
     def masks(self) -> Dict[Tuple[str, int], np.ndarray]:
+        """Detector masks keyed by configuration id and detector number."""
         return cast(Dict[Tuple[str, int], np.ndarray], self._store_dict("masks"))
 
     @property
     def transmissions(self) -> Dict[Tuple[str, str], float]:
+        """Sample transmissions keyed by sample name and configuration id."""
         return cast(Dict[Tuple[str, str], float], self._store_dict("transmissions"))
 
     # -----------------------------
@@ -197,20 +208,25 @@ class WorkflowContext:
     # -----------------------------
 
     def log(self, level: Level, message: str, *, where: Optional[str] = None, **meta: Any) -> None:
+        """Append a log message to the workflow history."""
         self.logs.append(LogMessage(level=level, message=message, where=where, meta=dict(meta)))
 
     def info(self, message: str, *, where: Optional[str] = None, **meta: Any) -> None:
+        """Record an informational message."""
         self.log("INFO", message, where=where, **meta)
 
     def warn(self, message: str, *, where: Optional[str] = None, key: Optional[str] = None, **meta: Any) -> None:
+        """Record a warning in both the issue list and the log."""
         self.issues.append(Issue(level="WARN", message=message, where=where, key=key, meta=dict(meta)))
         self.log("WARN", message, where=where, key=key, **meta)
 
     def error(self, message: str, *, where: Optional[str] = None, key: Optional[str] = None, **meta: Any) -> None:
+        """Record an error in both the issue list and the log."""
         self.issues.append(Issue(level="ERROR", message=message, where=where, key=key, meta=dict(meta)))
         self.log("ERROR", message, where=where, key=key, **meta)
 
     def has_errors(self) -> bool:
+        """Return True when at least one error has been recorded."""
         return any(i.level == "ERROR" for i in self.issues)
 
     # -----------------------------
@@ -218,12 +234,15 @@ class WorkflowContext:
     # -----------------------------
 
     def set(self, key: str, value: Any) -> None:
+        """Store an arbitrary value in the generic workflow store."""
         self.store[key] = value
 
     def get(self, key: str, default: Any = None) -> Any:
+        """Read a value from the generic workflow store."""
         return self.store.get(key, default)
 
     def require(self, key: str) -> Any:
+        """Read a required store value and raise if it is missing."""
         if key not in self.store:
             raise KeyError(f"Missing required context key: {key}")
         return self.store[key]
@@ -233,6 +252,7 @@ class WorkflowContext:
     # -----------------------------
 
     def add_artifact(self, name: str, path: Path, *, kind: str = "file") -> None:
+        """Register a generated artifact for traceability."""
         self.artifacts.append(Artifact(name=name, path=Path(path).resolve(), kind=kind))
 
     # -----------------------------
@@ -264,6 +284,7 @@ class WorkflowContext:
         return f
 
     def close_all_h5(self) -> None:
+        """Close and clear all cached HDF5 handles."""
         for _, f in list(self._h5_cache.items()):
             try:
                 f.close()
@@ -276,14 +297,17 @@ class WorkflowContext:
     # -----------------------------
 
     def add_run(self, key: RunKey, file_path: Path) -> None:
+        """Register a raw or converted run file under its logical key."""
         self.runs[key] = Path(file_path).resolve()
 
     def get_run_path(self, key: RunKey) -> Path:
+        """Return the file path for a registered run."""
         if key not in self.runs:
             raise KeyError(f"Run not registered: {key.short()}")
         return self.runs[key]
 
     def iter_runs(self, *, config_id: Optional[str] = None, entity: Optional[Entity] = None) -> Iterable[Tuple[RunKey, Path]]:
+        """Iterate over registered runs, optionally filtered by configuration and entity."""
         for k, p in self.runs.items():
             if config_id is not None and k.config_id != config_id:
                 continue
@@ -296,14 +320,17 @@ class WorkflowContext:
     # -----------------------------
 
     def set_frame(self, key: RunKey, detector: int, data: np.ndarray, errors: Optional[np.ndarray] = None) -> None:
+        """Cache a detector frame and its optional uncertainty array."""
         self.frames[(key, detector)] = data
         if errors is not None:
             self.frame_errors[(key, detector)] = errors
 
     def get_frame(self, key: RunKey, detector: int) -> np.ndarray:
+        """Return a cached detector frame."""
         return self.frames[(key, detector)]
 
     def get_frame_errors(self, key: RunKey, detector: int) -> Optional[np.ndarray]:
+        """Return cached frame uncertainties when available."""
         return self.frame_errors.get((key, detector))
 
     # -----------------------------
@@ -311,14 +338,17 @@ class WorkflowContext:
     # -----------------------------
 
     def set_refs_sub(self, config_id: str, file_path: Path) -> None:
+        """Register the refs_sub file for a configuration."""
         self.refs_sub_files[config_id] = Path(file_path).resolve()
 
     def get_refs_sub_path(self, config_id: str) -> Path:
+        """Return the refs_sub file path for a configuration."""
         if config_id not in self.refs_sub_files:
             raise KeyError(f"Missing refs_sub for config_id={config_id}")
         return self.refs_sub_files[config_id]
 
     def set_refs_norm(self, config_id: str, file_path: str | Path) -> None:
+        """Register a refs_norm file or an alias to another configuration."""
         if isinstance(file_path, str) and self._looks_like_refs_norm_alias(file_path):
             if config_id == file_path:
                 raise ValueError("refs_norm source config_id must be different from the target config_id")
@@ -327,6 +357,7 @@ class WorkflowContext:
         self.refs_norm_files[config_id] = Path(file_path).resolve()
 
     def _looks_like_refs_norm_alias(self, value: str) -> bool:
+        """Heuristically detect whether a refs_norm value is a config alias, not a path."""
         if value == "":
             return False
         if value in self.refs_norm_files or value in self.refs_sub_files or value in self.configurations:
@@ -336,10 +367,12 @@ class WorkflowContext:
         return "/" not in value and "\\" not in value and Path(value).suffix == ""
 
     def is_refs_norm_alias(self, config_id: str) -> bool:
+        """Return True when refs_norm for a config points to another config id."""
         value = self.refs_norm_files.get(config_id)
         return isinstance(value, str) and self._looks_like_refs_norm_alias(value)
 
     def resolve_refs_norm_config_id(self, config_id: str) -> str:
+        """Follow refs_norm aliases until a concrete source configuration is reached."""
         seen: list[str] = []
         current = config_id
         while self.is_refs_norm_alias(current):
@@ -354,6 +387,7 @@ class WorkflowContext:
         return current
 
     def get_refs_norm_path(self, config_id: str) -> Path:
+        """Resolve and return the concrete refs_norm file path for a configuration."""
         resolved_config_id = self.resolve_refs_norm_config_id(config_id)
         if resolved_config_id not in self.refs_norm_files:
             if resolved_config_id != config_id:
@@ -368,23 +402,29 @@ class WorkflowContext:
         return Path(value).resolve()
 
     def set_masks_file(self, config_id: str, file_path: Path) -> None:
+        """Register the mask bundle file associated with a configuration."""
         self.masks_files[config_id] = Path(file_path).resolve()
 
     def get_masks_file_path(self, config_id: str) -> Path:
+        """Return the mask bundle file path for a configuration."""
         if config_id not in self.masks_files:
             raise KeyError(f"Missing masks file for config_id={config_id}")
         return self.masks_files[config_id]
 
     def set_mask(self, config_id: str, detector: int, mask: np.ndarray) -> None:
+        """Cache one detector mask for a configuration."""
         self.masks[(config_id, detector)] = mask
 
     def get_mask(self, config_id: str, detector: int) -> Optional[np.ndarray]:
+        """Return a cached detector mask when available."""
         return self.masks.get((config_id, detector))
 
     def set_transmission(self, sample_id: str, config_id: str, value: float) -> None:
+        """Cache a sample transmission value."""
         self.transmissions[(sample_id, config_id)] = value
 
     def get_transmission(self, sample_id: str, config_id: str) -> Optional[float]:
+        """Return a cached sample transmission value."""
         return self.transmissions.get((sample_id, config_id))
 
     def update_root_dir(self, root_dir: Path) -> WorkflowContext:
@@ -460,7 +500,7 @@ class WorkflowContext:
     def runs_table(self) -> TableView:
         """Return a notebook-friendly table view of runs using the runs_report.csv columns."""
         return TableView(
-            columns=("sample_name", "config_id", "mode", "entity", "file_path"),
+            columns=("sample_name", "config_id", "mode", "entity", "transmission", "file_path"),
             rows=_runs_report_rows(self),
         )
 
@@ -496,6 +536,7 @@ class WorkflowContext:
 
 
 def _write_scalar_dataset(parent: h5py.Group, name: str, value: Any) -> None:
+    """Create a scalar dataset, encoding text values in a NeXus-friendly way."""
     if isinstance(value, Path):
         value = str(value)
     if isinstance(value, str):
@@ -505,17 +546,20 @@ def _write_scalar_dataset(parent: h5py.Group, name: str, value: Any) -> None:
 
 
 def _replace_scalar_dataset(parent: h5py.Group, name: str, value: Any) -> None:
+    """Replace an existing scalar dataset while preserving the simple write API."""
     if name in parent:
         del parent[name]
     _write_scalar_dataset(parent, name, value)
 
 
 def _read_text_dataset(dataset: h5py.Dataset) -> str:
+    """Read a scalar text dataset and normalize its value to str."""
     value = dataset[()]
     return _read_text_value(value)
 
 
 def _read_text_value(value: Any) -> str:
+    """Convert HDF5 scalar-like text values to Python strings."""
     if isinstance(value, np.ndarray) and value.size == 1:
         value = value.reshape(()).item()
     if isinstance(value, (bytes, bytearray, np.bytes_)):
@@ -524,6 +568,7 @@ def _read_text_value(value: Any) -> str:
 
 
 def _rebase_path_if_under(path: Path, old_base: Path, new_base: Path) -> Path:
+    """Rebase a path onto a new root when it is located under the old root."""
     resolved_path = Path(path).resolve()
     try:
         relative_path = resolved_path.relative_to(old_base)
@@ -533,6 +578,7 @@ def _rebase_path_if_under(path: Path, old_base: Path, new_base: Path) -> Path:
 
 
 def _read_sample_name(path: Path) -> str:
+    """Extract the sample name from a raw or converted NeXus file."""
     with h5py.File(path, "r") as h5:
         for entry_path in ("/raw_data", "/entry", "/entry0", "/entry1"):
             if entry_path not in h5:
@@ -547,6 +593,7 @@ def _read_sample_name(path: Path) -> str:
 
 
 def _classify_entity_from_sample_name(sample_name: str) -> Entity:
+    """Infer the workflow entity type from the sample name."""
     normalized = re.sub(r"[^a-z0-9]+", "", sample_name.strip().lower())
     if "emptybeam" in normalized:
         return "empty_beam"
@@ -558,12 +605,14 @@ def _classify_entity_from_sample_name(sample_name: str) -> Entity:
 
 
 def _flattened_nxsas_name(input_dir: Path, raw_path: Path) -> str:
+    """Build a stable flattened output filename from an input file path."""
     relative = raw_path.relative_to(input_dir)
     stem = relative.with_suffix("").as_posix().replace("/", "__")
     return f"{stem}.nxs"
 
 
 def _is_relative_to(path: Path, other: Path) -> bool:
+    """Return True when a path is located under another path."""
     try:
         path.relative_to(other)
         return True
@@ -572,6 +621,7 @@ def _is_relative_to(path: Path, other: Path) -> bool:
 
 
 def _is_hdf5_file(path: Path) -> bool:
+    """Return True when a path points to a readable HDF5 file."""
     try:
         return h5py.is_hdf5(path)
     except Exception:
@@ -588,6 +638,7 @@ _IGNORED_INPUT_DEFINITIONS = {
 
 
 def _pick_nexus_entry_path(handle: h5py.File) -> Optional[str]:
+    """Return the most likely NXentry-like root group in a NeXus file."""
     for candidate in ("/raw_data", "/entry0", "/entry", "/entry1"):
         if candidate in handle and isinstance(handle[candidate], h5py.Group):
             return candidate
@@ -602,7 +653,48 @@ def _pick_nexus_entry_path(handle: h5py.File) -> Optional[str]:
     return None
 
 
+def _detector_data_dimensionality_issue(entry: h5py.Group, *, entry_path: str) -> Optional[str]:
+    """Return a warning message when detector data under an entry are not strictly 2D."""
+    instrument_group: Optional[h5py.Group] = None
+    if "instrument" in entry and isinstance(entry["instrument"], h5py.Group):
+        instrument_group = entry["instrument"]
+    else:
+        for obj in entry.values():
+            if not isinstance(obj, h5py.Group):
+                continue
+            nx_class = _read_text_value(obj.attrs.get("NX_class", ""))
+            if nx_class == "NXinstrument":
+                instrument_group = obj
+                break
+
+    if instrument_group is None:
+        return "Skipping HDF5 input file without NXinstrument under entry"
+
+    found_detector_data = False
+    for detector_name, detector_group in instrument_group.items():
+        if not isinstance(detector_group, h5py.Group):
+            continue
+        nx_class = _read_text_value(detector_group.attrs.get("NX_class", ""))
+        if nx_class != "NXdetector" or "data" not in detector_group:
+            continue
+        data = detector_group["data"]
+        if not isinstance(data, h5py.Dataset):
+            continue
+        found_detector_data = True
+        if len(data.shape) != 2:
+            dataset_path = f"{entry_path}/{instrument_group.name.split('/')[-1]}/{detector_name}/data"
+            return (
+                "Skipping HDF5 input file with non-2D detector data "
+                f"at {dataset_path} (shape={tuple(data.shape)!r})"
+            )
+
+    if not found_detector_data:
+        return "Skipping HDF5 input file without detector data under NXinstrument"
+    return None
+
+
 def _classify_hdf5_input_candidate(path: Path) -> tuple[bool, Optional[str]]:
+    """Tell whether an HDF5 file looks like a raw acquisition usable as input."""
     try:
         with h5py.File(path, "r") as handle:
             entry_path = _pick_nexus_entry_path(handle)
@@ -620,22 +712,16 @@ def _classify_hdf5_input_candidate(path: Path) -> tuple[bool, Optional[str]]:
 
             entry = handle[entry_path]
             assert isinstance(entry, h5py.Group)
-            if "instrument" in entry and isinstance(entry["instrument"], h5py.Group):
-                return True, None
-
-            for obj in entry.values():
-                if not isinstance(obj, h5py.Group):
-                    continue
-                nx_class = _read_text_value(obj.attrs.get("NX_class", ""))
-                if nx_class == "NXinstrument":
-                    return True, None
-
-            return False, "Skipping HDF5 input file without NXinstrument under entry"
+            dimensionality_issue = _detector_data_dimensionality_issue(entry, entry_path=entry_path)
+            if dimensionality_issue is not None:
+                return False, dimensionality_issue
+            return True, None
     except OSError:
         return False, "Skipping unreadable HDF5 input file"
 
 
 def _next_generated_config_id(existing_config_ids: Iterable[str]) -> str:
+    """Generate the next available synthetic configuration identifier."""
     taken = set(existing_config_ids)
     index = 1
     while True:
@@ -654,6 +740,7 @@ def _ingest_raw_directory_into_workflow_context(
     overwrite: bool,
     where: str,
 ) -> WorkflowContext:
+    """Convert raw files from a directory and merge them into a workflow context."""
     from scarlet.io.converters import convert_to_scarlet_nxsas_raw
     from scarlet.io.mode_inference import guess_measurement_mode_from_nexus_image
     from scarlet.workflow.configuration import compare_configurations, configuration_from_nexus
@@ -762,6 +849,7 @@ def _ingest_raw_directory_into_workflow_context(
 
 
 def _path_to_storage_string(path: Path, *, base_dir: Path) -> str:
+    """Serialize a path relative to a storage base directory when possible."""
     path = Path(path).resolve()
     try:
         return str(path.relative_to(base_dir))
@@ -770,6 +858,7 @@ def _path_to_storage_string(path: Path, *, base_dir: Path) -> str:
 
 
 def _resolve_stored_path(raw_path: str, *, base_dir: Path) -> Path:
+    """Resolve a stored path string against the file storage base directory."""
     path = Path(raw_path)
     if path.is_absolute():
         return path.resolve()
@@ -777,6 +866,7 @@ def _resolve_stored_path(raw_path: str, *, base_dir: Path) -> Path:
 
 
 def _to_json_compatible(value: Any) -> Any:
+    """Convert store metadata to a JSON-serializable representation."""
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     if isinstance(value, Path):
@@ -796,6 +886,7 @@ def _to_json_compatible(value: Any) -> Any:
 
 
 def _from_json_compatible(value: Any) -> Any:
+    """Reconstruct Python values previously normalized for JSON storage."""
     if isinstance(value, list):
         return [_from_json_compatible(item) for item in value]
     if isinstance(value, dict):
@@ -809,6 +900,7 @@ def _from_json_compatible(value: Any) -> Any:
 
 
 def _serialize_configuration(parent: h5py.Group, configuration: Any) -> None:
+    """Write a configuration object into an HDF5 group."""
     _write_scalar_dataset(parent, "wavelength", float(configuration.wavelength))
     sample_detector_distance = configuration.sample_detector_distance
     if isinstance(sample_detector_distance, list):
@@ -843,6 +935,7 @@ def _serialize_configuration(parent: h5py.Group, configuration: Any) -> None:
 
 
 def _deserialize_configuration(group: h5py.Group) -> Any:
+    """Read a configuration object from an HDF5 group."""
     from scarlet.workflow.configuration import Aperture, Collimation, Configuration
 
     sample_detector_distance_ds = group["sample_detector_distance"][()]
@@ -881,6 +974,7 @@ def _deserialize_configuration(group: h5py.Group) -> Any:
 
 
 def _runs_report_rows(workflow_context: WorkflowContext) -> List[Dict[str, str]]:
+    """Build sorted rows for the runs report and notebook table views."""
     rows: List[Tuple[int, Dict[str, str]]] = []
     for key, path in workflow_context.runs.items():
         stat = path.stat()
@@ -895,6 +989,7 @@ def _runs_report_rows(workflow_context: WorkflowContext) -> List[Dict[str, str]]
                     "config_id": key.config_id,
                     "mode": key.mode,
                     "entity": key.entity,
+                    "transmission": _format_value(key.transmission),
                     "file_path": str(path),
                 },
             )
@@ -907,6 +1002,7 @@ def _runs_report_rows(workflow_context: WorkflowContext) -> List[Dict[str, str]]
             item[1]["config_id"],
             item[1]["mode"],
             item[1]["entity"],
+            item[1]["transmission"],
             item[1]["file_path"],
         )
     )
@@ -914,6 +1010,7 @@ def _runs_report_rows(workflow_context: WorkflowContext) -> List[Dict[str, str]]
 
 
 def _format_value(value: Any) -> str:
+    """Format scalar or list values for lightweight tabular display."""
     if value is None:
         return ""
     if isinstance(value, list):
@@ -923,7 +1020,21 @@ def _format_value(value: Any) -> str:
     return str(value)
 
 
+def _parse_optional_float(value: str, *, row_order: Optional[int] = None) -> Optional[float]:
+    """Parse an optional floating-point string from persisted workflow metadata."""
+    text = value.strip()
+    if text == "":
+        return None
+    try:
+        return float(text)
+    except ValueError as exc:
+        if row_order is None:
+            raise ValueError(f"Invalid transmission value: {value!r}") from exc
+        raise ValueError(f"Row {row_order}: invalid transmission value {value!r}") from exc
+
+
 def _configurations_rows(workflow_context: WorkflowContext) -> List[Dict[str, str]]:
+    """Build flattened configuration rows for notebook-friendly display."""
     rows: List[Dict[str, str]] = []
     for config_id, cfg in sorted(workflow_context.configurations.items()):
         collimation = getattr(cfg, "collimation", None)
@@ -954,6 +1065,7 @@ def _configurations_rows(workflow_context: WorkflowContext) -> List[Dict[str, st
 
 
 def _transmissions_rows(workflow_context: WorkflowContext) -> List[Dict[str, str]]:
+    """Build sorted transmission rows for notebook-friendly display."""
     rows: List[Dict[str, str]] = []
     for (sample_name, config_id), value in sorted(
         workflow_context.transmissions.items(),
@@ -1009,6 +1121,7 @@ def save_workflow_context(
         runs_group.create_dataset("config_id", data=np.asarray([row["config_id"] for row in rows], dtype=dt))
         runs_group.create_dataset("mode", data=np.asarray([row["mode"] for row in rows], dtype=dt))
         runs_group.create_dataset("entity", data=np.asarray([row["entity"] for row in rows], dtype=dt))
+        runs_group.create_dataset("transmission", data=np.asarray([row["transmission"] for row in rows], dtype=dt))
         runs_group.create_dataset(
             "file_path",
             data=np.asarray(
@@ -1164,14 +1277,27 @@ def load_workflow_context(file_path: str | Path) -> WorkflowContext:
         config_ids = [_read_text_value(runs_group["config_id"][i]) for i in range(len(runs_group["config_id"]))]
         modes = [_read_text_value(runs_group["mode"][i]) for i in range(len(runs_group["mode"]))]
         entities = [_read_text_value(runs_group["entity"][i]) for i in range(len(runs_group["entity"]))]
+        run_transmissions = (
+            [_read_text_value(runs_group["transmission"][i]) for i in range(len(runs_group["transmission"]))]
+            if "transmission" in runs_group
+            else [""] * len(sample_names)
+        )
         file_paths = [_read_text_value(runs_group["file_path"][i]) for i in range(len(runs_group["file_path"]))]
-        for sample_name, config_id, mode, entity, raw_path in zip(sample_names, config_ids, modes, entities, file_paths):
+        for sample_name, config_id, mode, entity, run_transmission, raw_path in zip(
+            sample_names,
+            config_ids,
+            modes,
+            entities,
+            run_transmissions,
+            file_paths,
+        ):
             workflow_context.add_run(
                 RunKey(
                     config_id=config_id,
                     entity=cast(Entity, entity),
                     mode=cast(Mode, mode),
                     sample_name=sample_name or None,
+                    transmission=_parse_optional_float(run_transmission),
                 ),
                 _resolve_stored_path(raw_path, base_dir=base_dir),
             )
@@ -1286,6 +1412,7 @@ def initialize_workflow_context_from_raw_directory(
     instrument_name: str | None = None,
     overwrite: bool = False,
 ) -> WorkflowContext:
+    """Create a fresh workflow context by scanning and converting a raw-data directory."""
     input_dir = Path(input_dir).resolve()
     if output_dir is None:
         output_dir = input_dir / "processed"
@@ -1359,6 +1486,7 @@ def write_runs_report_csv(
     *,
     overwrite: bool = False,
 ) -> Path:
+    """Write the editable CSV summary used to review and adjust registered runs."""
     if not workflow_context.runs:
         raise ValueError("WorkflowContext has no runs")
 
@@ -1373,13 +1501,14 @@ def write_runs_report_csv(
 
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(("sample_name", "config_id", "mode", "entity", "file_path"))
+        writer.writerow(("sample_name", "config_id", "mode", "entity", "transmission", "file_path"))
         writer.writerows(
             (
                 row["sample_name"],
                 row["config_id"],
                 row["mode"],
                 row["entity"],
+                row["transmission"],
                 row["file_path"],
             )
             for row in _runs_report_rows(workflow_context)
@@ -1401,6 +1530,7 @@ def update_workflow_context_from_runs_report_csv(
     - change ``sample_name``
     - change ``mode``
     - change ``entity``
+    - set or clear ``transmission``
     - remove rows entirely
 
     The function rebuilds ``ctx.runs`` from the CSV rows that remain, refreshes
@@ -1419,6 +1549,7 @@ def update_workflow_context_from_runs_report_csv(
         raise FileNotFoundError(f"Runs report CSV not found: {csv_path}")
 
     def _resolve_report_path(raw_path: str) -> Path:
+        """Resolve a CSV file path relative to the report location when needed."""
         path = Path(raw_path.strip())
         if path.is_absolute():
             return path.resolve()
@@ -1447,9 +1578,10 @@ def update_workflow_context_from_runs_report_csv(
         mode = (row.get("mode") or "").strip().lower()
         entity = (row.get("entity") or "").strip().lower()
         sample_name_raw = (row.get("sample_name") or "").strip()
+        transmission_raw = (row.get("transmission") or "").strip()
         file_path_raw = (row.get("file_path") or "").strip()
 
-        if not any((config_id, mode, entity, sample_name_raw, file_path_raw)):
+        if not any((config_id, mode, entity, sample_name_raw, transmission_raw, file_path_raw)):
             continue
         if not config_id:
             raise ValueError(f"Row {row_order}: config_id must not be empty")
@@ -1467,6 +1599,7 @@ def update_workflow_context_from_runs_report_csv(
             raise FileNotFoundError(f"Row {row_order}: data file not found: {file_path}")
 
         sample_name = sample_name_raw or None
+        transmission = _parse_optional_float(transmission_raw, row_order=row_order)
         if entity == "sample" and sample_name is None:
             raise ValueError(f"Row {row_order}: sample entity requires a non-empty sample_name")
 
@@ -1475,6 +1608,7 @@ def update_workflow_context_from_runs_report_csv(
             entity=cast(Entity, entity),
             mode=cast(Mode, mode),
             sample_name=sample_name,
+            transmission=transmission,
         )
         if run_key in rebuilt_runs:
             workflow_context.warn(
@@ -1523,15 +1657,18 @@ def update_workflow_context_from_runs_report_csv(
 
 
 def _normalize_sample_name(name: str) -> str:
+    """Normalize a sample name for heuristic comparisons."""
     return re.sub(r"[^a-z0-9]+", "", name.strip().lower())
 
 
 def _is_water_sample_name(name: str) -> bool:
+    """Return True when a sample name looks like a water reference."""
     sample_norm = _normalize_sample_name(name)
     return sample_norm in {"h2o", "d2o"} or "water" in sample_norm
 
 
 def generate_reference_files_from_workflow_context(ctx: WorkflowContext) -> WorkflowContext:
+    """Generate refs_sub and refs_norm bundles from the runs registered in the context."""
     from scarlet.workflow.configuration import (
         _transmission_roi_from_file,
         configuration_from_nexus,
@@ -1557,12 +1694,14 @@ def generate_reference_files_from_workflow_context(ctx: WorkflowContext) -> Work
     transmission_roi_half_size = int(ctx.get("transmission_roi_half_size", 1))
 
     def _entry_path_from_file(handle: h5py.File, path: Path) -> str:
+        """Locate the primary entry group inside a raw or converted NeXus file."""
         for entry_path in ("/raw_data", "/entry", "/entry0", "/entry1"):
             if entry_path in handle:
                 return entry_path
         raise ValueError(f"No entry group found in {path}")
 
     def _count_time(path: Path) -> float:
+        """Read and cache the count time used to rank competing reference runs."""
         path = Path(path).resolve()
         cached = count_time_cache.get(path)
         if cached is not None:
@@ -1595,6 +1734,7 @@ def generate_reference_files_from_workflow_context(ctx: WorkflowContext) -> Work
         predicate,
         mode: Optional[Mode] = None,
     ) -> Optional[tuple[RunKey, Path]]:
+        """Pick the longest-counting run matching the requested predicate."""
         candidates = [
             (key, path)
             for key, path in runs
@@ -1795,6 +1935,7 @@ def update_transmissions_from_workflow_context(
     *,
     refs_entry_path: str = "/entry",
 ) -> WorkflowContext:
+    """Compute or reuse sample transmissions from workflow runs and reference files."""
     from scarlet.reduction.transmission import compute_transmission
 
     if not ctx.runs:
@@ -1815,12 +1956,14 @@ def update_transmissions_from_workflow_context(
     count_time_cache: dict[Path, float] = {}
 
     def _entry_path_from_file(handle: h5py.File, path: Path) -> str:
+        """Locate the primary entry group inside a raw or converted NeXus file."""
         for entry_path in ("/raw_data", "/entry", "/entry0", "/entry1"):
             if entry_path in handle:
                 return entry_path
         raise ValueError(f"No entry group found in {path}")
 
     def _count_time(path: Path) -> float:
+        """Read and cache the count time used to pick the best transmission run."""
         path = Path(path).resolve()
         cached = count_time_cache.get(path)
         if cached is not None:
@@ -1846,6 +1989,7 @@ def update_transmissions_from_workflow_context(
         return value
 
     def _best_sample_transmission_run(config_id: str, sample_name: str) -> Optional[tuple[RunKey, Path]]:
+        """Select the best transmission run for one sample/configuration pair."""
         candidates = [
             (key, path)
             for key, path in all_runs
@@ -1857,6 +2001,7 @@ def update_transmissions_from_workflow_context(
         return max(candidates, key=lambda item: _count_time(item[1]), default=None)
 
     def _configuration_wavelength(config_id: str, refs_sub_path: Path) -> float:
+        """Read the wavelength from the cached configuration or the refs_sub file."""
         configuration = ctx.configurations.get(config_id)
         if configuration is not None:
             try:
@@ -1871,6 +2016,7 @@ def update_transmissions_from_workflow_context(
             return float(np.asarray(refs_file[dataset_path][()]).reshape(()))
 
     def _read_text_dataset(group: h5py.Group, dataset_path: str) -> Optional[str]:
+        """Read an optional scalar text dataset from a group."""
         if dataset_path not in group:
             return None
         raw = group[dataset_path][()]
@@ -1982,6 +2128,7 @@ def update_reference_masks_from_workflow_context(
     *,
     search_dir: str | Path | None = None,
 ) -> WorkflowContext:
+    """Attach mask bundles to configurations and inject them into reference files."""
     from scarlet.workflow.configuration import compare_configurations, configuration_from_nexus
     from scarlet.workflow.reference import insert_masks_in_refs_file
 
@@ -1994,6 +2141,7 @@ def update_reference_masks_from_workflow_context(
         raise NotADirectoryError(f"Mask search path is not a directory: {search_dir}")
 
     def _read_text_dataset(group: h5py.Group, dataset_path: str) -> Optional[str]:
+        """Read an optional scalar text dataset from a group."""
         if dataset_path not in group:
             return None
         raw = group[dataset_path][()]
@@ -2002,6 +2150,7 @@ def update_reference_masks_from_workflow_context(
         return str(raw)
 
     def _load_mask_bundle(path: Path) -> Optional[tuple[Optional[str], dict[int, np.ndarray]]]:
+        """Load one SCARLET mask bundle and return its config id plus detector masks."""
         try:
             with h5py.File(path, "r") as f:
                 if "/entry" not in f or not isinstance(f["/entry"], h5py.Group):
@@ -2032,6 +2181,7 @@ def update_reference_masks_from_workflow_context(
             return None
 
     def _match_mask_configuration(mask_configuration: Any, candidate_configuration: Any) -> bool:
+        """Compare mask and candidate configurations with distance normalization fallback."""
         same, _diffs = compare_configurations(mask_configuration, candidate_configuration)
         if same:
             return True
@@ -2149,6 +2299,7 @@ def integrate_scattering_from_workflow_context(
     config_id: Optional[str] = None,
     detector_number: Optional[int] = None,
 ) -> WorkflowContext:
+    """Run reductions and export integrated scattering curves as text artifacts."""
     results = _run_reduction_pipeline_results_from_workflow_context(
         ctx,
         n_bins=n_bins,
@@ -2224,6 +2375,7 @@ def run_reduction_pipeline_from_workflow_context(
     config_id: Optional[str] = None,
     detector_number: Optional[int] = None,
 ) -> "ReductionState":
+    """Run one reduction selected from the workflow context and return its state."""
     results = _run_reduction_pipeline_results_from_workflow_context(
         ctx,
         n_bins=n_bins,
@@ -2259,6 +2411,7 @@ def _run_reduction_pipeline_results_from_workflow_context(
     config_id: Optional[str] = None,
     detector_number: Optional[int] = None,
 ) -> List[WorkflowReductionResult]:
+    """Run the reduction pipeline for matching sample scattering runs."""
     from scarlet.workflow.pipeline import ReductionInputs, ReductionPipeline
 
     if not ctx.runs:
@@ -2270,6 +2423,7 @@ def _run_reduction_pipeline_results_from_workflow_context(
     ctx.output_dir.mkdir(parents=True, exist_ok=True)
 
     def _empty_cell_transmission_from_refs(refs_file: h5py.File) -> Optional[float]:
+        """Read the empty-cell transmission value embedded in a refs file."""
         dataset_path = f"{refs_entry_path}/references/empty_cell_transmission/entry/sample/transmission"
         if dataset_path not in refs_file:
             return None
@@ -2277,12 +2431,14 @@ def _run_reduction_pipeline_results_from_workflow_context(
         return value if np.isfinite(value) and value > 0.0 else None
 
     def _sample_transmission(sample_name: str, config_id: str) -> float:
+        """Return the cached transmission for a given sample/configuration pair."""
         value = ctx.get_transmission(sample_name, config_id)
         if value is None:
             raise ValueError(f"Missing transmission in workflow context for sample={sample_name!r}, config_id={config_id}")
         return float(value)
 
     def _sample_transmission_file(sample_name: str, config_id: str) -> str:
+        """Return the transmission file path used for a sample/configuration pair."""
         for key, path in ctx.runs.items():
             if (
                 key.entity == "sample"

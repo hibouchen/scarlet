@@ -16,6 +16,7 @@ from scarlet.workflow.context import (
     WorkflowContext,
     generate_reference_files_from_workflow_context,
     integrate_scattering_from_workflow_context,
+    initialize_workflow_context_from_raw_directory,
     load_workflow_context,
     run_reduction_pipeline_from_workflow_context,
     save_workflow_context,
@@ -144,6 +145,7 @@ class TestWorkflowContextRunsReport(unittest.TestCase):
                     "config_id": "config_2",
                     "mode": "transmission",
                     "entity": "sample",
+                    "transmission": "0.82",
                     "file_path": sample_row["file_path"],
                 }
             ]
@@ -151,7 +153,7 @@ class TestWorkflowContextRunsReport(unittest.TestCase):
             with csv_path.open("w", newline="", encoding="utf-8") as handle:
                 writer = csv.DictWriter(
                     handle,
-                    fieldnames=["sample_name", "config_id", "mode", "entity", "file_path"],
+                    fieldnames=["sample_name", "config_id", "mode", "entity", "transmission", "file_path"],
                 )
                 writer.writeheader()
                 writer.writerows(edited_rows)
@@ -164,6 +166,7 @@ class TestWorkflowContextRunsReport(unittest.TestCase):
             self.assertEqual(run_key.entity, "sample")
             self.assertEqual(run_key.mode, "transmission")
             self.assertEqual(run_key.sample_name, "water")
+            self.assertAlmostEqual(run_key.transmission or 0.0, 0.82)
             self.assertEqual(run_path, sample_path.resolve())
 
             self.assertEqual(set(ctx.configurations), {"config_2"})
@@ -225,13 +228,14 @@ class TestWorkflowContextRunsReport(unittest.TestCase):
 
             self.assertEqual(
                 table.columns,
-                ("sample_name", "config_id", "mode", "entity", "file_path"),
+                ("sample_name", "config_id", "mode", "entity", "transmission", "file_path"),
             )
             self.assertEqual(len(table.rows), 2)
             self.assertEqual(table.rows[0]["sample_name"], "sample_a")
             self.assertEqual(table.rows[0]["config_id"], "config_1")
             self.assertEqual(table.rows[0]["mode"], "scattering")
             self.assertEqual(table.rows[0]["entity"], "sample")
+            self.assertEqual(table.rows[0]["transmission"], "")
             self.assertEqual(table.rows[0]["file_path"], str(sample_path.resolve()))
             self.assertIn("<table>", table._repr_html_())
 
@@ -1223,6 +1227,82 @@ class TestWorkflowContextRunsReport(unittest.TestCase):
                     )
                 )
 
+    def test_initialize_workflow_context_from_raw_directory_skips_non_2d_detector_data(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            raw_dir = root / "raw"
+            output_dir = root / "out"
+            raw_dir.mkdir()
+
+            raw_path = raw_dir / "sample_stack.h5"
+            valid_path = raw_dir / "sample_2d.h5"
+            with h5py.File(raw_path, "w") as f:
+                entry = f.create_group("entry")
+                entry.attrs["NX_class"] = b"NXentry"
+                sample = entry.create_group("sample")
+                sample.attrs["NX_class"] = b"NXsample"
+                sample.create_dataset("name", data=np.bytes_("sample_a"))
+                instrument = entry.create_group("instrument")
+                instrument.attrs["NX_class"] = b"NXinstrument"
+                detector = instrument.create_group("detector0")
+                detector.attrs["NX_class"] = b"NXdetector"
+                detector.create_dataset("data", data=np.zeros((3, 7, 7), dtype=np.float64))
+
+            _write_minimal_raw_nexus_file(valid_path, sample_name="sample_b", count_time_s=10.0)
+
+            configuration = Configuration(
+                wavelength=6.0,
+                sample_detector_distance=4.2,
+                config_id="config_x",
+                collimation=Collimation(
+                    aperture1=Aperture(type="slit", x_gap=0.002, y_gap=0.003),
+                    aperture2=Aperture(type="pinhole", diameter=0.004),
+                    collimation_distance=1.5,
+                    last_aperture_to_sample_distance=0.5,
+                ),
+            )
+
+            def fake_convert(_instrument_name, input_path, output_path, overwrite=False):
+                del overwrite
+                output_path = Path(output_path)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_bytes(Path(input_path).read_bytes())
+                return SimpleNamespace(output_file=output_path)
+
+            with (
+                mock.patch("scarlet.io.converters.convert_to_scarlet_nxsas_raw", side_effect=fake_convert) as convert_mock,
+                mock.patch(
+                    "scarlet.io.mode_inference.guess_measurement_mode_from_nexus_image",
+                    return_value=SimpleNamespace(mode="scattering"),
+                ),
+                mock.patch(
+                    "scarlet.workflow.configuration.configuration_from_nexus",
+                    return_value=(configuration, []),
+                ),
+                mock.patch(
+                    "scarlet.workflow.configuration.compare_configurations",
+                    return_value=(True, []),
+                ),
+            ):
+                ctx = initialize_workflow_context_from_raw_directory(
+                    raw_dir,
+                    output_dir=output_dir,
+                    instrument_name="sansllb",
+                )
+
+            convert_mock.assert_called_once()
+            self.assertEqual(len(ctx.runs), 1)
+            self.assertEqual(set(ctx.runs.values()), {(output_dir / "sample_2d.nxs").resolve()})
+            self.assertEqual(len(ctx.configurations), 1)
+            self.assertTrue(
+                any(
+                    issue.level == "WARN"
+                    and issue.key == str(raw_path)
+                    and "Skipping HDF5 input file with non-2D detector data" in issue.message
+                    for issue in ctx.issues
+                )
+            )
+
     def test_save_and_load_workflow_context_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1242,7 +1322,7 @@ class TestWorkflowContextRunsReport(unittest.TestCase):
                 output_dir=output_dir,
             )
             ctx.add_run(
-                RunKey(config_id="config_1", entity="sample", mode="scattering", sample_name="sample_a"),
+                RunKey(config_id="config_1", entity="sample", mode="scattering", sample_name="sample_a", transmission=0.87),
                 sample_path,
             )
             ctx.add_run(
@@ -1282,6 +1362,15 @@ class TestWorkflowContextRunsReport(unittest.TestCase):
             self.assertEqual(loaded.root_dir, root.resolve())
             self.assertEqual(loaded.output_dir, output_dir.resolve())
             self.assertEqual(len(loaded.runs), 2)
+            loaded_run_transmissions = {
+                (run_key.config_id, run_key.entity, run_key.mode, run_key.sample_name): run_key.transmission
+                for run_key in loaded.runs
+            }
+            self.assertAlmostEqual(
+                loaded_run_transmissions[("config_1", "sample", "scattering", "sample_a")] or 0.0,
+                0.87,
+            )
+            self.assertIsNone(loaded_run_transmissions[("config_1", "dark", "scattering", "B4C")])
             self.assertEqual(set(loaded.configurations), {"config_1"})
             self.assertEqual(loaded.configurations["config_1"].config_id, "config_1")
             self.assertEqual(loaded.get_refs_sub_path("config_1"), (output_dir / "refs_sub_config_1.nxs").resolve())
