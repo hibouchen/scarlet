@@ -1,81 +1,89 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
-from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Literal, Union, cast
-from datetime import datetime, timezone
-from collections import OrderedDict
 import csv
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from html import escape
-import json
+from pathlib import Path
 import re
+from typing import Any, Dict, Iterable, Iterator, Literal, Mapping, Optional, cast
 
-import numpy as np
 import h5py
+import numpy as np
+
+from scarlet.reduction.transmission import (
+    compute_beam_center,
+    compute_transmission,
+    compute_transmission_roi,
+)
 
 
-# -----------------------------
-# Small typed helpers
-# -----------------------------
-
+# Log levels used by the workflow during execution.
 Level = Literal["INFO", "WARN", "ERROR"]
+# Run acquisition modes.
 Mode = Literal["scattering", "transmission"]
-RefsNormReference = Union[Path, str]
-
-# “entity” describes which physical run it is.
-# sample_name may also be used on non-sample entities to preserve manual labels.
-Entity = Literal[
-    "sample",
-    "empty_beam",
-    "empty_cell",
-    "dark",
-    "refs_sub",   # file refs_<config>.nxs
-]
+# Logical run categories handled by the workflow.
+Entity = Literal["sample", "empty_beam", "empty_cell", "dark", "water"]
+# One detector center is stored as (x, y).
+BeamCenter = tuple[float, float]
+# One configuration can store one beam center per detector number.
+DetectorBeamCenters = Dict[int, BeamCenter]
+# Transmission ROI stored as (x0, x1, y0, y1).
+TransmissionRoi = tuple[int, int, int, int]
+# Reference files stored by acquisition mode.
+ReferenceFilesByMode = Dict[Mode, Path]
+# Sample transmission values indexed by sample name and configuration id.
+TransmissionValues = Dict[tuple[str, str], float]
 
 
 @dataclass(frozen=True)
 class RunKey:
-    """Key used to identify a run in the workflow."""
+    """Logical identifier for one workflow run."""
+
     config_id: str
     entity: Entity
     mode: Mode
-    sample_name: Optional[str] = None  # required for entity=="sample", optional otherwise
-    transmission: Optional[float] = field(default=None, compare=False)  # metadata, not part of run identity
+    sample_name: Optional[str] = None
+    duplicate_index: int = field(default=0, repr=False)
 
     def short(self) -> str:
-        """Return a compact stable identifier for logs and dictionary keys."""
-        s = f"{self.config_id}:{self.entity}:{self.mode}"
+        value = f"{self.config_id}:{self.entity}:{self.mode}"
         if self.sample_name:
-            s += f":{self.sample_name}"
-        return s
+            value += f":{self.sample_name}"
+        if self.duplicate_index > 0:
+            value += f"#{self.duplicate_index + 1}"
+        return value
 
 
 @dataclass(frozen=True)
 class Artifact:
-    """A file produced by the workflow (for reporting / reproducibility)."""
+    """File created during workflow execution."""
+
     name: str
     path: Path
-    kind: str  # e.g. "nexus", "text", "plot", "csv"
+    kind: str = "file"
     created_utc: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 @dataclass
 class LogMessage:
-    """Structured log entry recorded during workflow execution."""
+    """Structured log entry."""
+
     level: Level
     message: str
-    where: Optional[str] = None      # step name or component
+    where: Optional[str] = None
     when_utc: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     meta: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class Issue:
-    """Structured warning or error attached to workflow processing."""
+    """Structured workflow warning or error."""
+
     level: Literal["WARN", "ERROR"]
     message: str
     where: Optional[str] = None
-    key: Optional[str] = None        # optional: a RunKey.short() or dataset path
+    key: Optional[str] = None
     when_utc: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     meta: Dict[str, Any] = field(default_factory=dict)
 
@@ -83,8 +91,9 @@ class Issue:
 @dataclass(frozen=True)
 class TableView:
     """Notebook-friendly tabular view with HTML rendering in Jupyter."""
-    columns: Tuple[str, ...]
-    rows: List[Dict[str, str]]
+
+    columns: tuple[str, ...]
+    rows: list[dict[str, str]]
 
     def _repr_html_(self) -> str:
         """Render the table as HTML for rich notebook display."""
@@ -109,453 +118,582 @@ class TableView:
         return "\n".join(lines)
 
 
-@dataclass(frozen=True)
-class WorkflowReductionResult:
-    """One reduction-pipeline execution derived from a workflow context."""
-
-    run_key: RunKey
-    detector_number: Optional[int]
-    source_path: Path
-    state: Any
-
-
-# -----------------------------
-# WorkflowContext
-# -----------------------------
-
 @dataclass
 class WorkflowContext:
     """
-    Central state container for SCARLET workflows.
+    Lightweight workflow state container.
 
-    Principles:
-    - Workflow orchestration reads/writes to ctx.
-    - Raw physics operations should live in scarlet/reduction/ and be called by steps.
-    - ctx must support multi-sample + multi-config + per-config refs_sub bundles.
+    The workflow context intentionally starts small. Add behavior only when it
+    is clearly needed by the next workflow step.
     """
 
-    # --- identification / paths
     experiment_id: str = "experiment"
     instrument_name: str = "unknown"
     root_dir: Path = field(default_factory=lambda: Path(".").resolve())
     output_dir: Path = field(default_factory=lambda: Path("./out").resolve())
 
-    # --- schemas to validate files (optional, but handy)
-    schema_raw: str = "scarlet_nxsas_raw_v1.3_mono.yaml"
-    schema_refs_sub: str = "scarlet_refs_sub_v1.0.yaml"
-    schema_refs_norm: str = "scarlet_refs_norm_v1.0.yaml"
-    schema_masks: str = "scarlet_masks_v1.0.yaml"
-
-    # --- run registry (filled by your experiment YAML loader or by code)
+    # Core workflow registry: one logical run key maps to one file on disk.
     runs: Dict[RunKey, Path] = field(default_factory=dict)
-
-    # --- derived configurations (filled by reading runs)
-    # key: config_id -> configuration object (from workflow/configuration.py)
+    # Derived metadata can be attached here as the v3 API grows.
     configurations: Dict[str, Any] = field(default_factory=dict)
-
-    # --- refs_sub bundles per config
-    refs_sub_files: Dict[str, Path] = field(default_factory=dict)  # config_id -> refs_sub .nxs
-    refs_norm_files: Dict[str, RefsNormReference] = field(default_factory=dict)  # config_id -> refs_norm .nxs or source config_id
-    masks_files: Dict[str, Path] = field(default_factory=dict)  # config_id -> masks .nxs
-    # --- cached objects
-    # store anything; structured cache accessors below are backed by this map
+    # Beam centers indexed by configuration id, then detector number.
+    beam_centers: Dict[str, DetectorBeamCenters] = field(default_factory=dict)
+    # Transmission ROI indexed by configuration id.
+    rois: Dict[str, TransmissionRoi] = field(default_factory=dict)
+    # Scattering dark files indexed by configuration id.
+    dark: Dict[str, Path] = field(default_factory=dict)
+    # Empty-beam files indexed by configuration id, then by acquisition mode.
+    empty_beam: Dict[str, ReferenceFilesByMode] = field(default_factory=dict)
+    # Empty-cell files indexed by configuration id, then by acquisition mode.
+    empty_cell: Dict[str, ReferenceFilesByMode] = field(default_factory=dict)
+    # Computed sample transmissions indexed by sample name and configuration id.
+    transmissions: TransmissionValues = field(default_factory=dict)
+    # Free-form storage for intermediate pipeline state.
     store: Dict[str, Any] = field(default_factory=dict)
 
-    # --- logging / issues / artefacts
-    logs: List[LogMessage] = field(default_factory=list)
-    issues: List[Issue] = field(default_factory=list)
-    artifacts: List[Artifact] = field(default_factory=list)
+    # Execution traceability.
+    logs: list[LogMessage] = field(default_factory=list)
+    issues: list[Issue] = field(default_factory=list)
+    artifacts: list[Artifact] = field(default_factory=list)
+    timings: Dict[str, float] = field(default_factory=dict)
 
-    # --- timings
-    timings: Dict[str, float] = field(default_factory=dict)  # step_name -> seconds
+    def _resolve_path(self, file_path: Path) -> Path:
+        """Normalize a file path before storing it in the context."""
+        return Path(file_path).resolve()
 
-    # --- internal HDF5 file cache (avoid reopening many times)
-    _h5_cache: "OrderedDict[Path, h5py.File]" = field(default_factory=OrderedDict, init=False, repr=False)
-    _h5_cache_size: int = field(default=8, init=False, repr=False)
+    def _sync_reference_store(self, key: RunKey, file_path: Path) -> None:
+        """Mirror reference runs into the dedicated reference attributes."""
+        if key.entity == "dark" and key.mode == "scattering":
+            self.set_dark(key.config_id, file_path)
+            return
+        if key.entity == "empty_beam":
+            self.set_empty_beam(key.config_id, key.mode, file_path)
+            return
+        if key.entity == "empty_cell":
+            self.set_empty_cell(key.config_id, key.mode, file_path)
 
-    def _store_dict(self, key: str) -> Dict[Any, Any]:
-        """Return a dict-backed store entry, creating it on first access."""
-        existing = self.store.get(key)
-        if existing is None:
-            existing = {}
-            self.store[key] = existing
-        if not isinstance(existing, dict):
-            raise TypeError(f"Context store entry '{key}' must be a dict, got {type(existing).__name__}")
-        return existing
+    def _allocate_run_key(self, key: RunKey) -> RunKey:
+        """Return a unique run key, preserving duplicate logical runs."""
+        candidate = key
+        duplicate_index = key.duplicate_index
+        while candidate in self.runs:
+            duplicate_index += 1
+            candidate = replace(key, duplicate_index=duplicate_index)
+        return candidate
 
-    @property
-    def frames(self) -> Dict[Tuple[RunKey, int], np.ndarray]:
-        """Frame cache keyed by run and detector number."""
-        return cast(Dict[Tuple[RunKey, int], np.ndarray], self._store_dict("frames"))
-
-    @property
-    def frame_errors(self) -> Dict[Tuple[RunKey, int], np.ndarray]:
-        """Per-frame uncertainty cache keyed by run and detector number."""
-        return cast(Dict[Tuple[RunKey, int], np.ndarray], self._store_dict("frame_errors"))
-
-    @property
-    def masks(self) -> Dict[Tuple[str, int], np.ndarray]:
-        """Detector masks keyed by configuration id and detector number."""
-        return cast(Dict[Tuple[str, int], np.ndarray], self._store_dict("masks"))
-
-    @property
-    def transmissions(self) -> Dict[Tuple[str, str], float]:
-        """Sample transmissions keyed by sample name and configuration id."""
-        return cast(Dict[Tuple[str, str], float], self._store_dict("transmissions"))
-
-    # -----------------------------
-    # Logging / issues
-    # -----------------------------
-
-    def log(self, level: Level, message: str, *, where: Optional[str] = None, **meta: Any) -> None:
-        """Append a log message to the workflow history."""
-        self.logs.append(LogMessage(level=level, message=message, where=where, meta=dict(meta)))
-
-    def info(self, message: str, *, where: Optional[str] = None, **meta: Any) -> None:
-        """Record an informational message."""
-        self.log("INFO", message, where=where, **meta)
-
-    def warn(self, message: str, *, where: Optional[str] = None, key: Optional[str] = None, **meta: Any) -> None:
-        """Record a warning in both the issue list and the log."""
-        self.issues.append(Issue(level="WARN", message=message, where=where, key=key, meta=dict(meta)))
-        self.log("WARN", message, where=where, key=key, **meta)
-
-    def error(self, message: str, *, where: Optional[str] = None, key: Optional[str] = None, **meta: Any) -> None:
-        """Record an error in both the issue list and the log."""
-        self.issues.append(Issue(level="ERROR", message=message, where=where, key=key, meta=dict(meta)))
-        self.log("ERROR", message, where=where, key=key, **meta)
-
-    def has_errors(self) -> bool:
-        """Return True when at least one error has been recorded."""
-        return any(i.level == "ERROR" for i in self.issues)
-
-    # -----------------------------
-    # Store helpers
-    # -----------------------------
-
-    def set(self, key: str, value: Any) -> None:
-        """Store an arbitrary value in the generic workflow store."""
-        self.store[key] = value
-
-    def get(self, key: str, default: Any = None) -> Any:
-        """Read a value from the generic workflow store."""
-        return self.store.get(key, default)
-
-    def require(self, key: str) -> Any:
-        """Read a required store value and raise if it is missing."""
-        if key not in self.store:
-            raise KeyError(f"Missing required context key: {key}")
-        return self.store[key]
-
-    # -----------------------------
-    # Artefacts
-    # -----------------------------
-
-    def add_artifact(self, name: str, path: Path, *, kind: str = "file") -> None:
-        """Register a generated artifact for traceability."""
-        self.artifacts.append(Artifact(name=name, path=Path(path).resolve(), kind=kind))
-
-    # -----------------------------
-    # HDF5 caching
-    # -----------------------------
-
-    def open_h5(self, path: Path) -> h5py.File:
-        """
-        Open an HDF5/NeXus file with a small LRU cache.
-        Important: call ctx.close_all_h5() at the end of a pipeline run.
-        """
-        path = Path(path).resolve()
-
-        if path in self._h5_cache:
-            f = self._h5_cache.pop(path)
-            self._h5_cache[path] = f
-            return f
-
-        # evict oldest if needed
-        while len(self._h5_cache) >= self._h5_cache_size:
-            old_path, old_file = self._h5_cache.popitem(last=False)
-            try:
-                old_file.close()
-            except Exception:
-                pass
-
-        f = h5py.File(path, "r")
-        self._h5_cache[path] = f
-        return f
-
-    def close_all_h5(self) -> None:
-        """Close and clear all cached HDF5 handles."""
-        for _, f in list(self._h5_cache.items()):
-            try:
-                f.close()
-            except Exception:
-                pass
-        self._h5_cache.clear()
-
-    # -----------------------------
-    # Run registry helpers
-    # -----------------------------
-
-    def add_run(self, key: RunKey, file_path: Path) -> None:
-        """Register a raw or converted run file under its logical key."""
-        self.runs[key] = Path(file_path).resolve()
+    def add_run(self, key: RunKey, file_path: Path) -> RunKey:
+        """Register a run file under its logical key and preserve duplicates."""
+        resolved_path = self._resolve_path(file_path)
+        stored_key = self._allocate_run_key(key)
+        self.runs[stored_key] = resolved_path
+        self._sync_reference_store(stored_key, resolved_path)
+        return stored_key
 
     def get_run_path(self, key: RunKey) -> Path:
-        """Return the file path for a registered run."""
-        if key not in self.runs:
-            raise KeyError(f"Run not registered: {key.short()}")
-        return self.runs[key]
+        """Return the registered path for a run key."""
+        try:
+            return self.runs[key]
+        except KeyError as exc:
+            raise KeyError(f"Run not registered: {key.short()}") from exc
 
-    def iter_runs(self, *, config_id: Optional[str] = None, entity: Optional[Entity] = None) -> Iterable[Tuple[RunKey, Path]]:
-        """Iterate over registered runs, optionally filtered by configuration and entity."""
-        for k, p in self.runs.items():
-            if config_id is not None and k.config_id != config_id:
-                continue
-            if entity is not None and k.entity != entity:
-                continue
-            yield k, p
-
-    # -----------------------------
-    # Frame cache helpers
-    # -----------------------------
-
-    def set_frame(self, key: RunKey, detector: int, data: np.ndarray, errors: Optional[np.ndarray] = None) -> None:
-        """Cache a detector frame and its optional uncertainty array."""
-        self.frames[(key, detector)] = data
-        if errors is not None:
-            self.frame_errors[(key, detector)] = errors
-
-    def get_frame(self, key: RunKey, detector: int) -> np.ndarray:
-        """Return a cached detector frame."""
-        return self.frames[(key, detector)]
-
-    def get_frame_errors(self, key: RunKey, detector: int) -> Optional[np.ndarray]:
-        """Return cached frame uncertainties when available."""
-        return self.frame_errors.get((key, detector))
-
-    # -----------------------------
-    # Refs_sub helpers
-    # -----------------------------
-
-    def set_refs_sub(self, config_id: str, file_path: Path) -> None:
-        """Register the refs_sub file for a configuration."""
-        self.refs_sub_files[config_id] = Path(file_path).resolve()
-
-    def get_refs_sub_path(self, config_id: str) -> Path:
-        """Return the refs_sub file path for a configuration."""
-        if config_id not in self.refs_sub_files:
-            raise KeyError(f"Missing refs_sub for config_id={config_id}")
-        return self.refs_sub_files[config_id]
-
-    def set_refs_norm(self, config_id: str, file_path: str | Path) -> None:
-        """Register a refs_norm file or an alias to another configuration."""
-        if isinstance(file_path, str) and self._looks_like_refs_norm_alias(file_path):
-            if config_id == file_path:
-                raise ValueError("refs_norm source config_id must be different from the target config_id")
-            self.refs_norm_files[config_id] = file_path
-            return
-        self.refs_norm_files[config_id] = Path(file_path).resolve()
-
-    def _looks_like_refs_norm_alias(self, value: str) -> bool:
-        """Heuristically detect whether a refs_norm value is a config alias, not a path."""
-        if value == "":
-            return False
-        if value in self.refs_norm_files or value in self.refs_sub_files or value in self.configurations:
-            return True
-        if any(key.config_id == value for key in self.runs):
-            return True
-        return "/" not in value and "\\" not in value and Path(value).suffix == ""
-
-    def is_refs_norm_alias(self, config_id: str) -> bool:
-        """Return True when refs_norm for a config points to another config id."""
-        value = self.refs_norm_files.get(config_id)
-        return isinstance(value, str) and self._looks_like_refs_norm_alias(value)
-
-    def resolve_refs_norm_config_id(self, config_id: str) -> str:
-        """Follow refs_norm aliases until a concrete source configuration is reached."""
-        seen: list[str] = []
-        current = config_id
-        while self.is_refs_norm_alias(current):
-            if current in seen:
-                chain = " -> ".join([*seen, current])
-                raise ValueError(f"Cyclic refs_norm configuration alias: {chain}")
-            seen.append(current)
-            current = cast(str, self.refs_norm_files[current])
-            if current in seen:
-                chain = " -> ".join([*seen, current])
-                raise ValueError(f"Cyclic refs_norm configuration alias: {chain}")
-        return current
-
-    def get_refs_norm_path(self, config_id: str) -> Path:
-        """Resolve and return the concrete refs_norm file path for a configuration."""
-        resolved_config_id = self.resolve_refs_norm_config_id(config_id)
-        if resolved_config_id not in self.refs_norm_files:
-            if resolved_config_id != config_id:
-                raise KeyError(
-                    f"Missing refs_norm for config_id={config_id} "
-                    f"(source config_id={resolved_config_id})"
-                )
-            raise KeyError(f"Missing refs_norm for config_id={config_id}")
-        value = self.refs_norm_files[resolved_config_id]
-        if isinstance(value, str) and self._looks_like_refs_norm_alias(value):
-            raise KeyError(f"refs_norm alias for config_id={resolved_config_id} does not resolve to a file")
-        return Path(value).resolve()
-
-    def set_masks_file(self, config_id: str, file_path: Path) -> None:
-        """Register the mask bundle file associated with a configuration."""
-        self.masks_files[config_id] = Path(file_path).resolve()
-
-    def get_masks_file_path(self, config_id: str) -> Path:
-        """Return the mask bundle file path for a configuration."""
-        if config_id not in self.masks_files:
-            raise KeyError(f"Missing masks file for config_id={config_id}")
-        return self.masks_files[config_id]
-
-    def set_mask(self, config_id: str, detector: int, mask: np.ndarray) -> None:
-        """Cache one detector mask for a configuration."""
-        self.masks[(config_id, detector)] = mask
-
-    def get_mask(self, config_id: str, detector: int) -> Optional[np.ndarray]:
-        """Return a cached detector mask when available."""
-        return self.masks.get((config_id, detector))
-
-    def set_transmission(self, sample_id: str, config_id: str, value: float) -> None:
-        """Cache a sample transmission value."""
-        self.transmissions[(sample_id, config_id)] = value
-
-    def get_transmission(self, sample_id: str, config_id: str) -> Optional[float]:
-        """Return a cached sample transmission value."""
-        return self.transmissions.get((sample_id, config_id))
-
-    def update_root_dir(self, root_dir: Path) -> WorkflowContext:
-        """Update the raw data root directory and rebase registered run paths."""
-        old_root_dir = self.root_dir.resolve()
-        new_root_dir = Path(root_dir).resolve()
-        self.runs = {
-            key: _rebase_path_if_under(path, old_root_dir, new_root_dir)
-            for key, path in self.runs.items()
-        }
-        self.root_dir = new_root_dir
-        return self
-
-    def update_output_dir(self, output_dir: Path) -> WorkflowContext:
-        """Update the output directory and rebase generated file paths."""
-        old_output_dir = self.output_dir.resolve()
-        new_output_dir = Path(output_dir).resolve()
-        self.refs_sub_files = {
-            config_id: _rebase_path_if_under(path, old_output_dir, new_output_dir)
-            for config_id, path in self.refs_sub_files.items()
-        }
-        self.refs_norm_files = {
-            config_id: (
-                path
-                if isinstance(path, str) and self._looks_like_refs_norm_alias(path)
-                else _rebase_path_if_under(Path(path), old_output_dir, new_output_dir)
-            )
-            for config_id, path in self.refs_norm_files.items()
-        }
-        self.masks_files = {
-            config_id: _rebase_path_if_under(path, old_output_dir, new_output_dir)
-            for config_id, path in self.masks_files.items()
-        }
-        self.artifacts = [
-            replace(artifact, path=_rebase_path_if_under(artifact.path, old_output_dir, new_output_dir))
-            for artifact in self.artifacts
-        ]
-        runs_report_csv = self.store.get("runs_report_csv")
-        if isinstance(runs_report_csv, Path):
-            self.store["runs_report_csv"] = _rebase_path_if_under(runs_report_csv, old_output_dir, new_output_dir)
-        self.output_dir = new_output_dir
-        return self
-
-    def update_beam_center(
+    def iter_runs(
         self,
-        config_id: str,
-        detector_number: int,
-        beam_center_x: float,
-        beam_center_y: float,
-    ) -> WorkflowContext:
-        """Update the beam center for one detector in both refs_sub and refs_norm."""
-        from scarlet.workflow.reference import insert_beam_centers_in_refs_file
-
-        refs_sub_path = self.refs_sub_files.get(config_id)
-        if refs_sub_path is None:
-            raise KeyError(f"Missing refs_sub for config_id={config_id}")
-        insert_beam_centers_in_refs_file(
-            refs_sub_path,
-            detector_number,
-            beam_center_x,
-            beam_center_y,
-        )
-        if not self.is_refs_norm_alias(config_id):
-            refs_norm_path = self.get_refs_norm_path(config_id)
-            insert_beam_centers_in_refs_file(
-                refs_norm_path,
-                detector_number,
-                beam_center_x,
-                beam_center_y,
-            )
-        return self
+        *,
+        config_id: Optional[str] = None,
+        entity: Optional[Entity] = None,
+        mode: Optional[Mode] = None,
+        sample_name: Optional[str] = None,
+    ) -> Iterator[tuple[RunKey, Path]]:
+        """Iterate over runs with optional filters."""
+        for key, path in self.runs.items():
+            # Keep filtering simple and explicit so new criteria can be added safely.
+            if config_id is not None and key.config_id != config_id:
+                continue
+            if entity is not None and key.entity != entity:
+                continue
+            if mode is not None and key.mode != mode:
+                continue
+            if sample_name is not None and key.sample_name != sample_name:
+                continue
+            yield key, path
 
     def runs_table(self) -> TableView:
-        """Return a notebook-friendly table view of runs using the runs_report.csv columns."""
+        """Return a notebook-friendly table view of workflow runs."""
         return TableView(
             columns=("sample_name", "config_id", "mode", "entity", "transmission", "file_path"),
-            rows=_runs_report_rows(self),
+            rows=_runs_rows(self),
         )
 
     def configurations_table(self) -> TableView:
-        """Return a notebook-friendly table view of configurations and their properties."""
+        """Return a notebook-friendly table view of configuration parameters."""
         return TableView(
             columns=(
                 "config_id",
                 "wavelength",
                 "sample_detector_distance",
-                "notes",
-                "has_collimation",
                 "collimation_distance",
                 "last_aperture_to_sample_distance",
-                "aperture1_type",
-                "aperture1_x_gap",
-                "aperture1_y_gap",
-                "aperture1_diameter",
-                "aperture2_type",
-                "aperture2_x_gap",
-                "aperture2_y_gap",
-                "aperture2_diameter",
+                "aperture1",
+                "aperture2",
+                "notes",
             ),
-            rows=_configurations_rows(self),
+            rows=_configuration_rows(self),
         )
 
-    def transmissions_table(self) -> TableView:
-        """Return a notebook-friendly table view of sample transmissions."""
-        return TableView(
-            columns=("sample_name", "config_id", "transmission"),
-            rows=_transmissions_rows(self),
+    def write_runs_table_csv(self, file_path: str | Path, *, overwrite: bool = False) -> Path:
+        """Write the current runs table to a CSV file."""
+        output_path = Path(file_path).resolve()
+        if output_path.exists() and not overwrite:
+            raise FileExistsError(f"File already exists: {output_path}")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        table = self.runs_table()
+        with output_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(table.columns))
+            writer.writeheader()
+            writer.writerows(table.rows)
+
+        self.add_artifact(output_path.name, output_path, kind="csv")
+        self.set("runs_table_csv", output_path)
+        return output_path
+
+    def update_from_runs_table_csv(self, file_path: str | Path | None = None) -> WorkflowContext:
+        """Update the workflow context from a CSV previously exported from runs_table()."""
+        from scarlet.workflow.configuration import configuration_from_nexus
+
+        if file_path is None:
+            file_path = self.get("runs_table_csv")
+            if file_path is None:
+                file_path = self.output_dir / "runs_table.csv"
+
+        csv_path = Path(file_path).resolve()
+        if not csv_path.exists():
+            raise FileNotFoundError(f"Runs table CSV not found: {csv_path}")
+
+        existing_by_name: dict[str, Path] = {}
+        ambiguous_names: set[str] = set()
+        for existing_path in self.runs.values():
+            name = existing_path.name
+            previous = existing_by_name.get(name)
+            if previous is None:
+                existing_by_name[name] = existing_path
+            elif previous != existing_path:
+                ambiguous_names.add(name)
+
+        def _resolve_csv_path(raw_path: str, *, row_order: int) -> Path:
+            """Resolve one CSV file path from an absolute path, a relative path, or a known file name."""
+            path = Path(raw_path.strip())
+            if path.is_absolute():
+                resolved = path.resolve()
+            else:
+                candidate = (csv_path.parent / path).resolve()
+                if candidate.exists():
+                    resolved = candidate
+                elif len(path.parts) == 1 and path.name not in ambiguous_names and path.name in existing_by_name:
+                    resolved = existing_by_name[path.name]
+                else:
+                    raise FileNotFoundError(
+                        f"Row {row_order}: data file not found or ambiguous from file_path={raw_path!r}"
+                    )
+            if not resolved.exists():
+                raise FileNotFoundError(f"Row {row_order}: data file not found: {resolved}")
+            return resolved
+
+        valid_entities: set[str] = {"sample", "empty_beam", "empty_cell", "dark", "water"}
+        valid_modes: set[str] = {"scattering", "transmission"}
+
+        with csv_path.open("r", newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            fieldnames = reader.fieldnames or []
+            required = {"sample_name", "config_id", "mode", "entity", "file_path"}
+            missing = required.difference(fieldnames)
+            if missing:
+                missing_text = ", ".join(sorted(missing))
+                raise ValueError(f"runs_table.csv missing required columns: {missing_text}")
+            rows = list(reader)
+
+        rebuilt_runs: dict[RunKey, Path] = {}
+        rebuilt_configurations: dict[str, Any] = {}
+        rebuilt_transmissions: TransmissionValues = {}
+
+        row_order = 0
+        for row in rows:
+            row_order += 1
+            config_id = (row.get("config_id") or "").strip()
+            mode = (row.get("mode") or "").strip().lower()
+            entity = (row.get("entity") or "").strip().lower()
+            sample_name_raw = (row.get("sample_name") or "").strip()
+            transmission_raw = (row.get("transmission") or "").strip()
+            file_path_raw = (row.get("file_path") or "").strip()
+
+            if not any((config_id, mode, entity, sample_name_raw, transmission_raw, file_path_raw)):
+                continue
+            if not config_id:
+                raise ValueError(f"Row {row_order}: config_id must not be empty")
+            if mode not in valid_modes:
+                expected = ", ".join(sorted(valid_modes))
+                raise ValueError(f"Row {row_order}: invalid mode {mode!r}; expected one of {expected}")
+            if entity not in valid_entities:
+                expected = ", ".join(sorted(valid_entities))
+                raise ValueError(f"Row {row_order}: invalid entity {entity!r}; expected one of {expected}")
+            if not file_path_raw:
+                raise ValueError(f"Row {row_order}: file_path must not be empty")
+
+            file_path = _resolve_csv_path(file_path_raw, row_order=row_order)
+            sample_name = sample_name_raw or None
+            transmission = _parse_optional_float(transmission_raw, row_order=row_order)
+            if entity == "sample" and sample_name is None:
+                raise ValueError(f"Row {row_order}: sample entity requires a non-empty sample_name")
+
+            run_key = RunKey(
+                config_id=config_id,
+                entity=cast(Entity, entity),
+                mode=cast(Mode, mode),
+                sample_name=sample_name,
+            )
+            stored_run_key = _allocate_unique_run_key(rebuilt_runs, run_key)
+            if stored_run_key != run_key:
+                self.warn(
+                    "Duplicate run key detected in runs table CSV; preserving both rows",
+                    where="update_from_runs_table_csv",
+                    key=stored_run_key.short(),
+                    previous_path=str(rebuilt_runs[replace(stored_run_key, duplicate_index=stored_run_key.duplicate_index - 1)]),
+                    new_path=str(file_path),
+                )
+            rebuilt_runs[stored_run_key] = file_path
+
+            if sample_name is not None and transmission is not None:
+                rebuilt_transmissions[(sample_name, config_id)] = transmission
+
+            if config_id not in rebuilt_configurations:
+                configuration, issues = configuration_from_nexus(file_path)
+                for issue in issues:
+                    self.warn(issue, where="configuration_from_nexus", key=str(file_path))
+                try:
+                    configuration = replace(configuration, config_id=config_id)
+                except TypeError:
+                    pass
+                rebuilt_configurations[config_id] = configuration
+
+        self.runs.clear()
+        self.configurations.clear()
+        self.dark.clear()
+        self.empty_beam.clear()
+        self.empty_cell.clear()
+        self.transmissions.clear()
+        self.beam_centers.clear()
+        self.rois.clear()
+
+        self.configurations.update(rebuilt_configurations)
+        for run_key, path in rebuilt_runs.items():
+            self.add_run(run_key, path)
+        self.transmissions.update(rebuilt_transmissions)
+
+        _initialize_transmission_geometry(self, where="update_from_runs_table_csv")
+        self.set("runs_table_csv", csv_path)
+        return self
+
+    def set_beam_center(self, config_id: str, detector_number: int, center: BeamCenter) -> None:
+        """Store one detector beam center for a configuration."""
+        self.beam_centers.setdefault(config_id, {})[detector_number] = center
+
+    def get_beam_center(self, config_id: str, detector_number: int) -> BeamCenter:
+        """Return one detector beam center for a configuration."""
+        try:
+            return self.beam_centers[config_id][detector_number]
+        except KeyError as exc:
+            raise KeyError(
+                f"Missing beam center for config_id={config_id}, detector_number={detector_number}"
+            ) from exc
+
+    def set_roi(self, config_id: str, roi: TransmissionRoi) -> None:
+        """Store the transmission ROI for a configuration."""
+        self.rois[config_id] = roi
+
+    def get_roi(self, config_id: str) -> TransmissionRoi:
+        """Return the transmission ROI for a configuration."""
+        try:
+            return self.rois[config_id]
+        except KeyError as exc:
+            raise KeyError(f"Missing ROI for config_id={config_id}") from exc
+
+    def set_dark(self, config_id: str, file_path: Path) -> None:
+        """Store the scattering dark file for a configuration."""
+        self.dark[config_id] = self._resolve_path(file_path)
+
+    def get_dark(self, config_id: str) -> Path:
+        """Return the scattering dark file for a configuration."""
+        try:
+            return self.dark[config_id]
+        except KeyError as exc:
+            raise KeyError(f"Missing dark file for config_id={config_id}") from exc
+
+    def set_empty_beam(self, config_id: str, mode: Mode, file_path: Path) -> None:
+        """Store one empty-beam reference file for a configuration and mode."""
+        self.empty_beam.setdefault(config_id, {})[mode] = self._resolve_path(file_path)
+
+    def get_empty_beam(self, config_id: str, mode: Mode) -> Path:
+        """Return one empty-beam reference file for a configuration and mode."""
+        try:
+            return self.empty_beam[config_id][mode]
+        except KeyError as exc:
+            raise KeyError(f"Missing empty_beam file for config_id={config_id}, mode={mode}") from exc
+
+    def set_empty_cell(self, config_id: str, mode: Mode, file_path: Path) -> None:
+        """Store one empty-cell reference file for a configuration and mode."""
+        self.empty_cell.setdefault(config_id, {})[mode] = self._resolve_path(file_path)
+
+    def get_empty_cell(self, config_id: str, mode: Mode) -> Path:
+        """Return one empty-cell reference file for a configuration and mode."""
+        try:
+            return self.empty_cell[config_id][mode]
+        except KeyError as exc:
+            raise KeyError(f"Missing empty_cell file for config_id={config_id}, mode={mode}") from exc
+
+    def set_transmission(self, sample_name: str, config_id: str, value: float) -> None:
+        """Store one computed sample transmission."""
+        self.transmissions[(sample_name, config_id)] = float(value)
+
+    def get_transmission(self, sample_name: str, config_id: str) -> float:
+        """Return one computed sample transmission."""
+        try:
+            return self.transmissions[(sample_name, config_id)]
+        except KeyError as exc:
+            raise KeyError(
+                f"Missing transmission for sample_name={sample_name}, config_id={config_id}"
+            ) from exc
+
+    def compute_transmissions(self, *, detector_number: int = 0) -> TransmissionValues:
+        """Compute transmissions for sample and empty-cell transmission runs."""
+        for entity in ("sample", "empty_cell"):
+            for key, path in self.iter_runs(entity=cast(Entity, entity), mode="transmission"):
+                if key.sample_name is None:
+                    continue
+                value = compute_transmission(
+                    path,
+                    self.get_empty_beam(key.config_id, "transmission"),
+                    self.get_roi(key.config_id),
+                    detector_number=detector_number,
+                )
+                self.set_transmission(key.sample_name, key.config_id, value)
+        return dict(self.transmissions)
+
+    def get_reference_file(self, ref_name: Entity, mode: Mode, config_id: str) -> Path:
+        """Return the path of a reference file for a configuration."""
+        if ref_name == "dark":
+            if mode != "scattering":
+                raise KeyError(f"Missing dark file for config_id={config_id}, mode={mode}")
+            return self.get_dark(config_id)
+        if ref_name == "empty_beam":
+            return self.get_empty_beam(config_id, mode)
+        if ref_name == "empty_cell":
+            return self.get_empty_cell(config_id, mode)
+
+        # Fallback to the run registry for references not yet mirrored in dedicated stores.
+        for key, path in self.iter_runs(config_id=config_id, entity=ref_name, mode=mode):
+            return path
+        raise KeyError(
+            f"Missing reference file for entity={ref_name}, mode={mode}, config_id={config_id}"
         )
 
+    def set(self, key: str, value: Any) -> None:
+        """Store arbitrary workflow data."""
+        self.store[key] = value
 
-def _write_scalar_dataset(parent: h5py.Group, name: str, value: Any) -> None:
-    """Create a scalar dataset, encoding text values in a NeXus-friendly way."""
-    if isinstance(value, Path):
-        value = str(value)
-    if isinstance(value, str):
-        parent.create_dataset(name, data=np.bytes_(value))
-    else:
-        parent.create_dataset(name, data=value)
+    def get(self, key: str, default: Any = None) -> Any:
+        """Read arbitrary workflow data."""
+        return self.store.get(key, default)
+
+    def require(self, key: str) -> Any:
+        """Read a required stored value."""
+        if key not in self.store:
+            raise KeyError(f"Missing required context key: {key}")
+        return self.store[key]
+
+    def add_artifact(self, name: str, path: Path, *, kind: str = "file") -> None:
+        """Register a produced file."""
+        self.artifacts.append(Artifact(name=name, path=self._resolve_path(path), kind=kind))
+
+    def log(self, level: Level, message: str, *, where: Optional[str] = None, **meta: Any) -> None:
+        """Append a structured log message."""
+        self.logs.append(LogMessage(level=level, message=message, where=where, meta=dict(meta)))
+
+    def info(self, message: str, *, where: Optional[str] = None, **meta: Any) -> None:
+        self.log("INFO", message, where=where, **meta)
+
+    def warn(self, message: str, *, where: Optional[str] = None, key: Optional[str] = None, **meta: Any) -> None:
+        self.issues.append(Issue(level="WARN", message=message, where=where, key=key, meta=dict(meta)))
+        self.log("WARN", message, where=where, key=key, **meta)
+
+    def error(self, message: str, *, where: Optional[str] = None, key: Optional[str] = None, **meta: Any) -> None:
+        self.issues.append(Issue(level="ERROR", message=message, where=where, key=key, meta=dict(meta)))
+        self.log("ERROR", message, where=where, key=key, **meta)
+
+    def has_errors(self) -> bool:
+        """Return True when at least one error has been recorded."""
+        return any(issue.level == "ERROR" for issue in self.issues)
 
 
-def _replace_scalar_dataset(parent: h5py.Group, name: str, value: Any) -> None:
-    """Replace an existing scalar dataset while preserving the simple write API."""
-    if name in parent:
-        del parent[name]
-    _write_scalar_dataset(parent, name, value)
+def iter_reference_runs(
+    ctx: WorkflowContext,
+    *,
+    config_id: Optional[str] = None,
+    mode: Optional[Mode] = None,
+) -> Iterable[tuple[RunKey, Path]]:
+    """Iterate over non-sample runs stored in the workflow context."""
+    for key, path in ctx.iter_runs(config_id=config_id, mode=mode):
+        if key.entity != "sample":
+            yield key, path
 
 
-def _read_text_dataset(dataset: h5py.Dataset) -> str:
-    """Read a scalar text dataset and normalize its value to str."""
-    value = dataset[()]
-    return _read_text_value(value)
+def _format_value(value: Any) -> str:
+    """Format scalar values for lightweight tabular display."""
+    if value is None:
+        return ""
+    if isinstance(value, (float, np.floating)):
+        return f"{float(value):.6g}"
+    return str(value)
+
+
+def _get_field_value(value: Any, name: str) -> Any:
+    """Read one field from a dataclass-like object or mapping."""
+    if isinstance(value, Mapping):
+        return value.get(name)
+    return getattr(value, name, None)
+
+
+def _format_measurement(value: Any, unit: str) -> str:
+    """Format one numeric configuration value with its unit."""
+    if value is None:
+        return ""
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if not np.isfinite(numeric):
+        return "missing"
+    return f"{numeric:.6g} {unit}"
+
+
+def _format_distance_values(value: Any) -> str:
+    """Format one scalar or per-detector distance value."""
+    if isinstance(value, np.ndarray):
+        value = value.tolist()
+    if isinstance(value, tuple):
+        value = list(value)
+    if isinstance(value, list):
+        parts = []
+        for detector_number, item in enumerate(value):
+            parts.append(f"detector{detector_number}={_format_measurement(item, 'm')}")
+        return "; ".join(parts)
+    return _format_measurement(value, "m")
+
+
+def _format_aperture(aperture: Any) -> str:
+    """Format one aperture definition for display."""
+    if aperture is None:
+        return ""
+    aperture_type = _get_field_value(aperture, "type")
+    if aperture_type == "slit":
+        return (
+            "slit "
+            f"x={_format_measurement(_get_field_value(aperture, 'x_gap'), 'm')} "
+            f"y={_format_measurement(_get_field_value(aperture, 'y_gap'), 'm')}"
+        )
+    if aperture_type == "pinhole":
+        return f"pinhole d={_format_measurement(_get_field_value(aperture, 'diameter'), 'm')}"
+    return str(aperture)
+
+
+def _parse_optional_float(value: str, *, row_order: Optional[int] = None) -> Optional[float]:
+    """Parse an optional floating-point string from CSV workflow metadata."""
+    text = value.strip()
+    if text == "":
+        return None
+    try:
+        return float(text)
+    except ValueError as exc:
+        if row_order is None:
+            raise ValueError(f"Invalid transmission value: {value!r}") from exc
+        raise ValueError(f"Row {row_order}: invalid transmission value {value!r}") from exc
+
+
+def _allocate_unique_run_key(mapping: Dict[RunKey, Path], key: RunKey) -> RunKey:
+    """Return a unique run key for one mapping while preserving duplicates."""
+    candidate = key
+    duplicate_index = key.duplicate_index
+    while candidate in mapping:
+        duplicate_index += 1
+        candidate = replace(key, duplicate_index=duplicate_index)
+    return candidate
+
+
+def _runs_rows(workflow_context: WorkflowContext) -> list[dict[str, str]]:
+    """Build sorted run rows for notebook-friendly display."""
+    rows: list[tuple[int, dict[str, str]]] = []
+    for key, path in workflow_context.runs.items():
+        transmission = None
+        if key.sample_name is not None:
+            transmission = workflow_context.transmissions.get((key.sample_name, key.config_id))
+
+        stat = path.stat()
+        timestamp_ns = getattr(stat, "st_birthtime_ns", None)
+        if timestamp_ns is None:
+            timestamp_ns = getattr(stat, "st_ctime_ns", int(stat.st_ctime * 1_000_000_000))
+        rows.append(
+            (
+                timestamp_ns,
+                {
+                    "sample_name": key.sample_name or "",
+                    "config_id": key.config_id,
+                    "mode": key.mode,
+                    "entity": key.entity,
+                    "transmission": _format_value(transmission),
+                    "file_path": path.name,
+                },
+            )
+        )
+
+    rows.sort(
+        key=lambda item: (
+            item[0],
+            item[1]["sample_name"],
+            item[1]["config_id"],
+            item[1]["mode"],
+            item[1]["entity"],
+            item[1]["transmission"],
+            item[1]["file_path"],
+        )
+    )
+    return [row for _, row in rows]
+
+
+def _configuration_rows(workflow_context: WorkflowContext) -> list[dict[str, str]]:
+    """Build sorted configuration rows for notebook-friendly display."""
+    rows: list[dict[str, str]] = []
+    for config_id, configuration in sorted(workflow_context.configurations.items()):
+        collimation = _get_field_value(configuration, "collimation")
+        rows.append(
+            {
+                "config_id": config_id,
+                "wavelength": _format_measurement(_get_field_value(configuration, "wavelength"), "A"),
+                "sample_detector_distance": _format_distance_values(
+                    _get_field_value(configuration, "sample_detector_distance")
+                ),
+                "collimation_distance": _format_measurement(
+                    _get_field_value(collimation, "collimation_distance"),
+                    "m",
+                ),
+                "last_aperture_to_sample_distance": _format_measurement(
+                    _get_field_value(collimation, "last_aperture_to_sample_distance"),
+                    "m",
+                ),
+                "aperture1": _format_aperture(_get_field_value(collimation, "aperture1")),
+                "aperture2": _format_aperture(_get_field_value(collimation, "aperture2")),
+                "notes": _format_value(_get_field_value(configuration, "notes")),
+            }
+        )
+    return rows
 
 
 def _read_text_value(value: Any) -> str:
@@ -567,29 +705,56 @@ def _read_text_value(value: Any) -> str:
     return str(value)
 
 
-def _rebase_path_if_under(path: Path, old_base: Path, new_base: Path) -> Path:
-    """Rebase a path onto a new root when it is located under the old root."""
-    resolved_path = Path(path).resolve()
-    try:
-        relative_path = resolved_path.relative_to(old_base)
-    except ValueError:
-        return resolved_path
-    return (new_base / relative_path).resolve()
+def _read_text_dataset(dataset: h5py.Dataset) -> str:
+    """Read a scalar text dataset and normalize its value to str."""
+    return _read_text_value(dataset[()])
 
 
 def _read_sample_name(path: Path) -> str:
     """Extract the sample name from a raw or converted NeXus file."""
-    with h5py.File(path, "r") as h5:
+    with h5py.File(path, "r") as handle:
         for entry_path in ("/raw_data", "/entry", "/entry0", "/entry1"):
-            if entry_path not in h5:
+            if entry_path not in handle:
                 continue
             for dataset_path in (f"{entry_path}/sample/name", f"{entry_path}/title"):
-                if dataset_path in h5:
-                    try:
-                        return _read_text_dataset(h5[dataset_path]).strip() or path.stem
-                    except Exception:
-                        continue
+                if dataset_path not in handle:
+                    continue
+                try:
+                    return _read_text_dataset(handle[dataset_path]).strip() or path.stem
+                except Exception:
+                    continue
     return path.stem
+
+
+def _read_beam_centers_from_file(path: Path) -> dict[int, BeamCenter]:
+    """Read detector beam centers stored in a SCARLET-compatible file."""
+    beam_centers: dict[int, BeamCenter] = {}
+    with h5py.File(path, "r") as handle:
+        entry_path = _pick_nexus_entry_path(handle)
+        if entry_path is None:
+            return beam_centers
+        instrument_path = f"{entry_path}/instrument"
+        if instrument_path not in handle or not isinstance(handle[instrument_path], h5py.Group):
+            return beam_centers
+
+        instrument = handle[instrument_path]
+        for name in instrument.keys():
+            match = re.fullmatch(r"detector(\d+)", name)
+            if match is None:
+                continue
+            detector_path = f"{instrument_path}/{name}"
+            beam_center_x_path = f"{detector_path}/beam_center_x"
+            beam_center_y_path = f"{detector_path}/beam_center_y"
+            if beam_center_x_path not in handle or beam_center_y_path not in handle:
+                continue
+            try:
+                beam_centers[int(match.group(1))] = (
+                    float(np.asarray(handle[beam_center_x_path][()]).reshape(())),
+                    float(np.asarray(handle[beam_center_y_path][()]).reshape(())),
+                )
+            except Exception:
+                continue
+    return beam_centers
 
 
 def _classify_entity_from_sample_name(sample_name: str) -> Entity:
@@ -647,14 +812,13 @@ def _pick_nexus_entry_path(handle: h5py.File) -> Optional[str]:
         obj = handle[candidate]
         if not isinstance(obj, h5py.Group):
             continue
-        nx_class = _read_text_value(obj.attrs.get("NX_class", ""))
-        if nx_class == "NXentry":
+        if _read_text_value(obj.attrs.get("NX_class", "")) == "NXentry":
             return candidate
     return None
 
 
 def _detector_data_dimensionality_issue(entry: h5py.Group, *, entry_path: str) -> Optional[str]:
-    """Return a warning message when detector data under an entry are not strictly 2D."""
+    """Return a warning message when detector data are not strictly 2D."""
     instrument_group: Optional[h5py.Group] = None
     if "instrument" in entry and isinstance(entry["instrument"], h5py.Group):
         instrument_group = entry["instrument"]
@@ -662,8 +826,7 @@ def _detector_data_dimensionality_issue(entry: h5py.Group, *, entry_path: str) -
         for obj in entry.values():
             if not isinstance(obj, h5py.Group):
                 continue
-            nx_class = _read_text_value(obj.attrs.get("NX_class", ""))
-            if nx_class == "NXinstrument":
+            if _read_text_value(obj.attrs.get("NX_class", "")) == "NXinstrument":
                 instrument_group = obj
                 break
 
@@ -674,13 +837,12 @@ def _detector_data_dimensionality_issue(entry: h5py.Group, *, entry_path: str) -
     for detector_name, detector_group in instrument_group.items():
         if not isinstance(detector_group, h5py.Group):
             continue
-        nx_class = _read_text_value(detector_group.attrs.get("NX_class", ""))
-        if nx_class != "NXdetector" or "data" not in detector_group:
+        if _read_text_value(detector_group.attrs.get("NX_class", "")) != "NXdetector":
             continue
-        data = detector_group["data"]
-        if not isinstance(data, h5py.Dataset):
+        if "data" not in detector_group or not isinstance(detector_group["data"], h5py.Dataset):
             continue
         found_detector_data = True
+        data = detector_group["data"]
         if len(data.shape) != 2:
             dataset_path = f"{entry_path}/{instrument_group.name.split('/')[-1]}/{detector_name}/data"
             return (
@@ -755,22 +917,14 @@ def _ingest_raw_directory_into_workflow_context(
 
     raw_files: list[Path] = []
     for path in candidate_files:
-        if _is_hdf5_file(path):
-            is_raw_candidate, skip_reason = _classify_hdf5_input_candidate(path)
-            if is_raw_candidate:
-                raw_files.append(path)
-                continue
-            ctx.warn(
-                skip_reason or "Skipping unsupported HDF5 input file",
-                where=where,
-                key=str(path),
-            )
+        if not _is_hdf5_file(path):
+            ctx.warn("Skipping non-HDF5 input file", where=where, key=str(path))
             continue
-        ctx.warn(
-            "Skipping non-HDF5 input file",
-            where=where,
-            key=str(path),
-        )
+        is_raw_candidate, skip_reason = _classify_hdf5_input_candidate(path)
+        if is_raw_candidate:
+            raw_files.append(path)
+            continue
+        ctx.warn(skip_reason or "Skipping unsupported HDF5 input file", where=where, key=str(path))
 
     if not raw_files:
         raise FileNotFoundError(f"No HDF5 input files found in {input_dir}")
@@ -784,14 +938,12 @@ def _ingest_raw_directory_into_workflow_context(
             continue
 
         if not converted_path.exists() or overwrite:
-            report = convert_to_scarlet_nxsas_raw(
+            convert_to_scarlet_nxsas_raw(
                 instrument_name,
                 raw_path,
                 converted_path,
                 overwrite=overwrite,
             )
-        else:
-            report = None
 
         if converted_path not in existing_artifact_paths:
             ctx.add_artifact(converted_path.name, converted_path, kind="nexus")
@@ -825,7 +977,6 @@ def _ingest_raw_directory_into_workflow_context(
                 where=where,
                 key=str(converted_path),
                 guessed_mode=mode,
-                converter_output=None if report is None else str(report.output_file),
             )
 
         run_key = RunKey(
@@ -834,574 +985,46 @@ def _ingest_raw_directory_into_workflow_context(
             mode=mode,
             sample_name=sample_name,
         )
-        if run_key in ctx.runs:
+        stored_run_key = ctx._allocate_run_key(run_key)
+        if stored_run_key != run_key:
             ctx.warn(
-                "Duplicate run key detected; overwriting previous file",
+                "Duplicate run key detected; preserving both files",
                 where=where,
-                key=run_key.short(),
+                key=stored_run_key.short(),
                 previous_path=str(ctx.runs[run_key]),
                 new_path=str(converted_path),
             )
         ctx.add_run(run_key, converted_path)
         existing_run_paths.add(converted_path)
 
+    _initialize_transmission_geometry(ctx, where=where)
     return ctx
 
 
-def _path_to_storage_string(path: Path, *, base_dir: Path) -> str:
-    """Serialize a path relative to a storage base directory when possible."""
-    path = Path(path).resolve()
-    try:
-        return str(path.relative_to(base_dir))
-    except ValueError:
-        return str(path)
-
-
-def _resolve_stored_path(raw_path: str, *, base_dir: Path) -> Path:
-    """Resolve a stored path string against the file storage base directory."""
-    path = Path(raw_path)
-    if path.is_absolute():
-        return path.resolve()
-    return (base_dir / path).resolve()
-
-
-def _to_json_compatible(value: Any) -> Any:
-    """Convert store metadata to a JSON-serializable representation."""
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    if isinstance(value, Path):
-        return {"__type__": "path", "value": str(value)}
-    if isinstance(value, list):
-        return [_to_json_compatible(item) for item in value]
-    if isinstance(value, tuple):
-        return {"__type__": "tuple", "items": [_to_json_compatible(item) for item in value]}
-    if isinstance(value, dict):
-        out: dict[str, Any] = {}
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise TypeError("Only string dict keys are supported")
-            out[key] = _to_json_compatible(item)
-        return out
-    raise TypeError(f"Unsupported value type: {type(value).__name__}")
-
-
-def _from_json_compatible(value: Any) -> Any:
-    """Reconstruct Python values previously normalized for JSON storage."""
-    if isinstance(value, list):
-        return [_from_json_compatible(item) for item in value]
-    if isinstance(value, dict):
-        value_type = value.get("__type__")
-        if value_type == "path":
-            return Path(str(value["value"]))
-        if value_type == "tuple":
-            return tuple(_from_json_compatible(item) for item in value["items"])
-        return {key: _from_json_compatible(item) for key, item in value.items()}
-    return value
-
-
-def _serialize_configuration(parent: h5py.Group, configuration: Any) -> None:
-    """Write a configuration object into an HDF5 group."""
-    _write_scalar_dataset(parent, "wavelength", float(configuration.wavelength))
-    sample_detector_distance = configuration.sample_detector_distance
-    if isinstance(sample_detector_distance, list):
-        parent.create_dataset("sample_detector_distance", data=np.asarray(sample_detector_distance, dtype=np.float64))
-    else:
-        _write_scalar_dataset(parent, "sample_detector_distance", float(sample_detector_distance))
-    if configuration.config_id is not None:
-        _write_scalar_dataset(parent, "config_id", configuration.config_id)
-    if configuration.notes is not None:
-        _write_scalar_dataset(parent, "notes", configuration.notes)
-
-    if configuration.collimation is None:
-        return
-
-    col = parent.create_group("collimation")
-    _write_scalar_dataset(col, "collimation_distance", float(configuration.collimation.collimation_distance))
-    _write_scalar_dataset(
-        col,
-        "last_aperture_to_sample_distance",
-        float(configuration.collimation.last_aperture_to_sample_distance),
-    )
-    for aperture_name in ("aperture1", "aperture2"):
-        aperture = getattr(configuration.collimation, aperture_name)
-        ap = col.create_group(aperture_name)
-        _write_scalar_dataset(ap, "type", aperture.type)
-        if aperture.x_gap is not None:
-            _write_scalar_dataset(ap, "x_gap", float(aperture.x_gap))
-        if aperture.y_gap is not None:
-            _write_scalar_dataset(ap, "y_gap", float(aperture.y_gap))
-        if aperture.diameter is not None:
-            _write_scalar_dataset(ap, "diameter", float(aperture.diameter))
-
-
-def _deserialize_configuration(group: h5py.Group) -> Any:
-    """Read a configuration object from an HDF5 group."""
-    from scarlet.workflow.configuration import Aperture, Collimation, Configuration
-
-    sample_detector_distance_ds = group["sample_detector_distance"][()]
-    sample_detector_distance_arr = np.asarray(sample_detector_distance_ds)
-    if sample_detector_distance_arr.ndim == 0:
-        sample_detector_distance: float | list[float] = float(sample_detector_distance_arr.reshape(()))
-    else:
-        sample_detector_distance = [float(item) for item in sample_detector_distance_arr.tolist()]
-
-    collimation = None
-    if "collimation" in group:
-        col_group = group["collimation"]
-
-        def read_aperture(ap_group: h5py.Group) -> Aperture:
-            return Aperture(
-                type=_read_text_dataset(ap_group["type"]),
-                x_gap=float(ap_group["x_gap"][()]) if "x_gap" in ap_group else None,
-                y_gap=float(ap_group["y_gap"][()]) if "y_gap" in ap_group else None,
-                diameter=float(ap_group["diameter"][()]) if "diameter" in ap_group else None,
+def _initialize_transmission_geometry(ctx: WorkflowContext, *, where: str) -> None:
+    """Initialize ROI and detector0 beam center from empty-beam transmission files."""
+    for config_id, files_by_mode in sorted(ctx.empty_beam.items()):
+        empty_beam_transmission = files_by_mode.get("transmission")
+        if empty_beam_transmission is None:
+            ctx.warn(
+                "Missing empty_beam transmission file; cannot initialize ROI or beam center",
+                where=where,
+                key=config_id,
             )
-
-        collimation = Collimation(
-            aperture1=read_aperture(col_group["aperture1"]),
-            aperture2=read_aperture(col_group["aperture2"]),
-            collimation_distance=float(col_group["collimation_distance"][()]),
-            last_aperture_to_sample_distance=float(col_group["last_aperture_to_sample_distance"][()]),
-        )
-
-    return Configuration(
-        wavelength=float(group["wavelength"][()]),
-        sample_detector_distance=sample_detector_distance,
-        collimation=collimation,
-        config_id=_read_text_dataset(group["config_id"]) if "config_id" in group else None,
-        notes=_read_text_dataset(group["notes"]) if "notes" in group else None,
-    )
-
-
-def _runs_report_rows(workflow_context: WorkflowContext) -> List[Dict[str, str]]:
-    """Build sorted rows for the runs report and notebook table views."""
-    rows: List[Tuple[int, Dict[str, str]]] = []
-    for key, path in workflow_context.runs.items():
-        stat = path.stat()
-        timestamp_ns = getattr(stat, "st_birthtime_ns", None)
-        if timestamp_ns is None:
-            timestamp_ns = getattr(stat, "st_ctime_ns", int(stat.st_ctime * 1_000_000_000))
-        rows.append(
-            (
-                timestamp_ns,
-                {
-                    "sample_name": key.sample_name or "",
-                    "config_id": key.config_id,
-                    "mode": key.mode,
-                    "entity": key.entity,
-                    "transmission": _format_value(key.transmission),
-                    "file_path": str(path),
-                },
+            continue
+        try:
+            ctx.set_roi(config_id, compute_transmission_roi(empty_beam_transmission, detector_number=0))
+            for detector_number, center in _read_beam_centers_from_file(empty_beam_transmission).items():
+                ctx.set_beam_center(config_id, detector_number, center)
+            ctx.set_beam_center(config_id, 0, compute_beam_center(empty_beam_transmission, detector_number=0))
+        except Exception as exc:
+            ctx.warn(
+                "Failed to initialize transmission ROI or detector0 beam center",
+                where=where,
+                key=config_id,
+                error=str(exc),
+                empty_beam_transmission=str(empty_beam_transmission),
             )
-        )
-
-    rows.sort(
-        key=lambda item: (
-            item[0],
-            item[1]["sample_name"],
-            item[1]["config_id"],
-            item[1]["mode"],
-            item[1]["entity"],
-            item[1]["transmission"],
-            item[1]["file_path"],
-        )
-    )
-    return [row for _, row in rows]
-
-
-def _format_value(value: Any) -> str:
-    """Format scalar or list values for lightweight tabular display."""
-    if value is None:
-        return ""
-    if isinstance(value, list):
-        return ", ".join(_format_value(item) for item in value)
-    if isinstance(value, (float, np.floating)):
-        return f"{float(value):.6g}"
-    return str(value)
-
-
-def _parse_optional_float(value: str, *, row_order: Optional[int] = None) -> Optional[float]:
-    """Parse an optional floating-point string from persisted workflow metadata."""
-    text = value.strip()
-    if text == "":
-        return None
-    try:
-        return float(text)
-    except ValueError as exc:
-        if row_order is None:
-            raise ValueError(f"Invalid transmission value: {value!r}") from exc
-        raise ValueError(f"Row {row_order}: invalid transmission value {value!r}") from exc
-
-
-def _configurations_rows(workflow_context: WorkflowContext) -> List[Dict[str, str]]:
-    """Build flattened configuration rows for notebook-friendly display."""
-    rows: List[Dict[str, str]] = []
-    for config_id, cfg in sorted(workflow_context.configurations.items()):
-        collimation = getattr(cfg, "collimation", None)
-        aperture1 = None if collimation is None else collimation.aperture1
-        aperture2 = None if collimation is None else collimation.aperture2
-        rows.append(
-            {
-                "config_id": config_id,
-                "wavelength": _format_value(getattr(cfg, "wavelength", None)),
-                "sample_detector_distance": _format_value(getattr(cfg, "sample_detector_distance", None)),
-                "notes": _format_value(getattr(cfg, "notes", None)),
-                "has_collimation": "True" if collimation is not None else "False",
-                "collimation_distance": _format_value(None if collimation is None else collimation.collimation_distance),
-                "last_aperture_to_sample_distance": _format_value(
-                    None if collimation is None else collimation.last_aperture_to_sample_distance
-                ),
-                "aperture1_type": _format_value(None if aperture1 is None else aperture1.type),
-                "aperture1_x_gap": _format_value(None if aperture1 is None else aperture1.x_gap),
-                "aperture1_y_gap": _format_value(None if aperture1 is None else aperture1.y_gap),
-                "aperture1_diameter": _format_value(None if aperture1 is None else aperture1.diameter),
-                "aperture2_type": _format_value(None if aperture2 is None else aperture2.type),
-                "aperture2_x_gap": _format_value(None if aperture2 is None else aperture2.x_gap),
-                "aperture2_y_gap": _format_value(None if aperture2 is None else aperture2.y_gap),
-                "aperture2_diameter": _format_value(None if aperture2 is None else aperture2.diameter),
-            }
-        )
-    return rows
-
-
-def _transmissions_rows(workflow_context: WorkflowContext) -> List[Dict[str, str]]:
-    """Build sorted transmission rows for notebook-friendly display."""
-    rows: List[Dict[str, str]] = []
-    for (sample_name, config_id), value in sorted(
-        workflow_context.transmissions.items(),
-        key=lambda item: (item[0][0], item[0][1]),
-    ):
-        rows.append(
-            {
-                "sample_name": sample_name,
-                "config_id": config_id,
-                "transmission": _format_value(value),
-            }
-        )
-    return rows
-
-
-def save_workflow_context(
-    workflow_context: WorkflowContext,
-    file_path: str | Path,
-) -> Path:
-    """
-    Save the lightweight state of a WorkflowContext to a NeXus/HDF5 file.
-
-    Heavy transient caches such as open HDF5 handles, frames and frame errors
-    are intentionally excluded.
-    """
-    file_path = Path(file_path).resolve()
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-    base_dir = file_path.parent
-
-    with h5py.File(file_path, "w") as f:
-        entry = f.create_group("entry")
-        entry.attrs["NX_class"] = np.bytes_("NXentry")
-        _write_scalar_dataset(entry, "definition", "SCARLET_workflow_context")
-        _write_scalar_dataset(entry, "schema_version", "1.0")
-
-        metadata = entry.create_group("metadata")
-        metadata.attrs["NX_class"] = np.bytes_("NXcollection")
-        _write_scalar_dataset(metadata, "experiment_id", workflow_context.experiment_id)
-        _write_scalar_dataset(metadata, "instrument_name", workflow_context.instrument_name)
-        _write_scalar_dataset(metadata, "root_dir", _path_to_storage_string(workflow_context.root_dir, base_dir=base_dir))
-        _write_scalar_dataset(metadata, "output_dir", _path_to_storage_string(workflow_context.output_dir, base_dir=base_dir))
-        _write_scalar_dataset(metadata, "schema_raw", workflow_context.schema_raw)
-        _write_scalar_dataset(metadata, "schema_refs_sub", workflow_context.schema_refs_sub)
-        _write_scalar_dataset(metadata, "schema_refs_norm", workflow_context.schema_refs_norm)
-        _write_scalar_dataset(metadata, "schema_masks", workflow_context.schema_masks)
-        _write_scalar_dataset(metadata, "created_utc", datetime.now(timezone.utc).isoformat())
-
-        runs_group = entry.create_group("runs")
-        runs_group.attrs["NX_class"] = np.bytes_("NXcollection")
-        dt = h5py.string_dtype(encoding="utf-8")
-        rows = _runs_report_rows(workflow_context)
-        runs_group.create_dataset("sample_name", data=np.asarray([row["sample_name"] for row in rows], dtype=dt))
-        runs_group.create_dataset("config_id", data=np.asarray([row["config_id"] for row in rows], dtype=dt))
-        runs_group.create_dataset("mode", data=np.asarray([row["mode"] for row in rows], dtype=dt))
-        runs_group.create_dataset("entity", data=np.asarray([row["entity"] for row in rows], dtype=dt))
-        runs_group.create_dataset("transmission", data=np.asarray([row["transmission"] for row in rows], dtype=dt))
-        runs_group.create_dataset(
-            "file_path",
-            data=np.asarray(
-                [_path_to_storage_string(Path(row["file_path"]), base_dir=base_dir) for row in rows],
-                dtype=dt,
-            ),
-        )
-
-        configs_group = entry.create_group("configurations")
-        configs_group.attrs["NX_class"] = np.bytes_("NXcollection")
-        for config_id, configuration in sorted(workflow_context.configurations.items()):
-            cfg_group = configs_group.create_group(config_id)
-            cfg_group.attrs["NX_class"] = np.bytes_("NXcollection")
-            _serialize_configuration(cfg_group, configuration)
-
-        refs_group = entry.create_group("references")
-        refs_group.attrs["NX_class"] = np.bytes_("NXcollection")
-        for group_name, mapping in (
-            ("refs_sub_files", workflow_context.refs_sub_files),
-            ("masks_files", workflow_context.masks_files),
-        ):
-            subgroup = refs_group.create_group(group_name)
-            subgroup.attrs["NX_class"] = np.bytes_("NXcollection")
-            for config_id, path in sorted(mapping.items()):
-                _write_scalar_dataset(subgroup, config_id, _path_to_storage_string(path, base_dir=base_dir))
-
-        refs_norm_group = refs_group.create_group("refs_norm_files")
-        refs_norm_group.attrs["NX_class"] = np.bytes_("NXcollection")
-        for config_id, value in sorted(workflow_context.refs_norm_files.items()):
-            if isinstance(value, str) and workflow_context._looks_like_refs_norm_alias(value):
-                _write_scalar_dataset(refs_norm_group, config_id, value)
-            else:
-                _write_scalar_dataset(refs_norm_group, config_id, _path_to_storage_string(Path(value), base_dir=base_dir))
-
-        masks_group = entry.create_group("masks")
-        masks_group.attrs["NX_class"] = np.bytes_("NXcollection")
-        for (config_id, detector), mask in sorted(workflow_context.masks.items()):
-            cfg_group = masks_group.require_group(config_id)
-            cfg_group.attrs["NX_class"] = np.bytes_("NXcollection")
-            cfg_group.create_dataset(f"detector{detector}", data=np.asarray(mask, dtype=np.uint8))
-
-        transmissions_group = entry.create_group("transmissions")
-        transmissions_group.attrs["NX_class"] = np.bytes_("NXcollection")
-        transmissions_group.create_dataset(
-            "sample_name",
-            data=np.asarray([sample_name for sample_name, _ in workflow_context.transmissions.keys()], dtype=dt),
-        )
-        transmissions_group.create_dataset(
-            "config_id",
-            data=np.asarray([config_id for _, config_id in workflow_context.transmissions.keys()], dtype=dt),
-        )
-        transmissions_group.create_dataset(
-            "value",
-            data=np.asarray(list(workflow_context.transmissions.values()), dtype=np.float64),
-        )
-
-        artifacts_group = entry.create_group("artifacts")
-        artifacts_group.attrs["NX_class"] = np.bytes_("NXcollection")
-        artifacts_group.create_dataset("name", data=np.asarray([artifact.name for artifact in workflow_context.artifacts], dtype=dt))
-        artifacts_group.create_dataset(
-            "path",
-            data=np.asarray(
-                [_path_to_storage_string(artifact.path, base_dir=base_dir) for artifact in workflow_context.artifacts],
-                dtype=dt,
-            ),
-        )
-        artifacts_group.create_dataset("kind", data=np.asarray([artifact.kind for artifact in workflow_context.artifacts], dtype=dt))
-        artifacts_group.create_dataset(
-            "created_utc",
-            data=np.asarray([artifact.created_utc for artifact in workflow_context.artifacts], dtype=dt),
-        )
-
-        logs_group = entry.create_group("logs")
-        logs_group.attrs["NX_class"] = np.bytes_("NXcollection")
-        logs_group.create_dataset("level", data=np.asarray([log.level for log in workflow_context.logs], dtype=dt))
-        logs_group.create_dataset("message", data=np.asarray([log.message for log in workflow_context.logs], dtype=dt))
-        logs_group.create_dataset(
-            "where",
-            data=np.asarray([(log.where or "") for log in workflow_context.logs], dtype=dt),
-        )
-        logs_group.create_dataset("when_utc", data=np.asarray([log.when_utc for log in workflow_context.logs], dtype=dt))
-        logs_group.create_dataset(
-            "meta_json",
-            data=np.asarray([json.dumps(_to_json_compatible(log.meta), sort_keys=True) for log in workflow_context.logs], dtype=dt),
-        )
-
-        issues_group = entry.create_group("issues")
-        issues_group.attrs["NX_class"] = np.bytes_("NXcollection")
-        issues_group.create_dataset("level", data=np.asarray([issue.level for issue in workflow_context.issues], dtype=dt))
-        issues_group.create_dataset("message", data=np.asarray([issue.message for issue in workflow_context.issues], dtype=dt))
-        issues_group.create_dataset(
-            "where",
-            data=np.asarray([(issue.where or "") for issue in workflow_context.issues], dtype=dt),
-        )
-        issues_group.create_dataset(
-            "key",
-            data=np.asarray([(issue.key or "") for issue in workflow_context.issues], dtype=dt),
-        )
-        issues_group.create_dataset("when_utc", data=np.asarray([issue.when_utc for issue in workflow_context.issues], dtype=dt))
-        issues_group.create_dataset(
-            "meta_json",
-            data=np.asarray([json.dumps(_to_json_compatible(issue.meta), sort_keys=True) for issue in workflow_context.issues], dtype=dt),
-        )
-
-        timings_group = entry.create_group("timings")
-        timings_group.attrs["NX_class"] = np.bytes_("NXcollection")
-        for key, value in sorted(workflow_context.timings.items()):
-            _write_scalar_dataset(timings_group, key, float(value))
-
-        store_group = entry.create_group("store")
-        store_group.attrs["NX_class"] = np.bytes_("NXcollection")
-        skipped_store_keys: list[str] = []
-        for key, value in sorted(workflow_context.store.items()):
-            if key in {"frames", "frame_errors", "masks", "transmissions"}:
-                continue
-            try:
-                encoded = json.dumps(_to_json_compatible(value), sort_keys=True)
-            except TypeError:
-                skipped_store_keys.append(key)
-                continue
-            _write_scalar_dataset(store_group, key, encoded)
-        if skipped_store_keys:
-            _write_scalar_dataset(store_group, "_skipped_keys", json.dumps(sorted(skipped_store_keys)))
-
-    return file_path
-
-
-def load_workflow_context(file_path: str | Path) -> WorkflowContext:
-    """Load a WorkflowContext previously saved with save_workflow_context()."""
-    file_path = Path(file_path).resolve()
-    base_dir = file_path.parent
-
-    with h5py.File(file_path, "r") as f:
-        entry = f["/entry"]
-        definition = _read_text_dataset(entry["definition"])
-        if definition != "SCARLET_workflow_context":
-            raise ValueError(f"Unsupported workflow context definition: {definition!r}")
-
-        metadata = entry["metadata"]
-        workflow_context = WorkflowContext(
-            experiment_id=_read_text_dataset(metadata["experiment_id"]),
-            instrument_name=_read_text_dataset(metadata["instrument_name"]),
-            root_dir=_resolve_stored_path(_read_text_dataset(metadata["root_dir"]), base_dir=base_dir),
-            output_dir=_resolve_stored_path(_read_text_dataset(metadata["output_dir"]), base_dir=base_dir),
-        )
-        workflow_context.schema_raw = _read_text_dataset(metadata["schema_raw"])
-        workflow_context.schema_refs_sub = _read_text_dataset(metadata["schema_refs_sub"])
-        workflow_context.schema_refs_norm = _read_text_dataset(metadata["schema_refs_norm"])
-        workflow_context.schema_masks = _read_text_dataset(metadata["schema_masks"])
-
-        runs_group = entry["runs"]
-        sample_names = [_read_text_value(runs_group["sample_name"][i]) for i in range(len(runs_group["sample_name"]))]
-        config_ids = [_read_text_value(runs_group["config_id"][i]) for i in range(len(runs_group["config_id"]))]
-        modes = [_read_text_value(runs_group["mode"][i]) for i in range(len(runs_group["mode"]))]
-        entities = [_read_text_value(runs_group["entity"][i]) for i in range(len(runs_group["entity"]))]
-        run_transmissions = (
-            [_read_text_value(runs_group["transmission"][i]) for i in range(len(runs_group["transmission"]))]
-            if "transmission" in runs_group
-            else [""] * len(sample_names)
-        )
-        file_paths = [_read_text_value(runs_group["file_path"][i]) for i in range(len(runs_group["file_path"]))]
-        for sample_name, config_id, mode, entity, run_transmission, raw_path in zip(
-            sample_names,
-            config_ids,
-            modes,
-            entities,
-            run_transmissions,
-            file_paths,
-        ):
-            workflow_context.add_run(
-                RunKey(
-                    config_id=config_id,
-                    entity=cast(Entity, entity),
-                    mode=cast(Mode, mode),
-                    sample_name=sample_name or None,
-                    transmission=_parse_optional_float(run_transmission),
-                ),
-                _resolve_stored_path(raw_path, base_dir=base_dir),
-            )
-
-        if "configurations" in entry:
-            for config_id, group in entry["configurations"].items():
-                if isinstance(group, h5py.Group):
-                    workflow_context.configurations[config_id] = _deserialize_configuration(group)
-
-        refs_group = entry["references"]
-        for attribute_name, group_name in (
-            ("refs_sub_files", "refs_sub_files"),
-            ("masks_files", "masks_files"),
-        ):
-            mapping = cast(dict[str, Path], getattr(workflow_context, attribute_name))
-            for key, dataset in refs_group[group_name].items():
-                if isinstance(dataset, h5py.Dataset):
-                    mapping[key] = _resolve_stored_path(_read_text_dataset(dataset), base_dir=base_dir)
-
-        if "refs_norm_files" in refs_group:
-            for key, dataset in refs_group["refs_norm_files"].items():
-                if isinstance(dataset, h5py.Dataset):
-                    raw_value = _read_text_dataset(dataset)
-                    if workflow_context._looks_like_refs_norm_alias(raw_value):
-                        workflow_context.set_refs_norm(key, raw_value)
-                    else:
-                        workflow_context.refs_norm_files[key] = _resolve_stored_path(raw_value, base_dir=base_dir)
-
-        if "refs_norm_fallbacks" in refs_group:
-            for key, dataset in refs_group["refs_norm_fallbacks"].items():
-                if isinstance(dataset, h5py.Dataset):
-                    source_config_id = _read_text_dataset(dataset)
-                    if source_config_id:
-                        workflow_context.set_refs_norm(key, source_config_id)
-
-        if "masks" in entry:
-            for config_id, config_group in entry["masks"].items():
-                if not isinstance(config_group, h5py.Group):
-                    continue
-                for detector_name, dataset in config_group.items():
-                    if not isinstance(dataset, h5py.Dataset):
-                        continue
-                    detector = int(detector_name.removeprefix("detector"))
-                    workflow_context.set_mask(config_id, detector, np.asarray(dataset[()], dtype=np.uint8))
-
-        if "transmissions" in entry:
-            transmissions_group = entry["transmissions"]
-            sample_names = [_read_text_value(transmissions_group["sample_name"][i]) for i in range(len(transmissions_group["sample_name"]))]
-            config_ids = [_read_text_value(transmissions_group["config_id"][i]) for i in range(len(transmissions_group["config_id"]))]
-            values = np.asarray(transmissions_group["value"][()], dtype=np.float64)
-            for sample_name, config_id, value in zip(sample_names, config_ids, values):
-                workflow_context.set_transmission(sample_name, config_id, float(value))
-
-        if "artifacts" in entry:
-            artifacts_group = entry["artifacts"]
-            for i in range(len(artifacts_group["name"])):
-                workflow_context.artifacts.append(
-                    Artifact(
-                        name=_read_text_value(artifacts_group["name"][i]),
-                        path=_resolve_stored_path(_read_text_value(artifacts_group["path"][i]), base_dir=base_dir),
-                        kind=_read_text_value(artifacts_group["kind"][i]),
-                        created_utc=_read_text_value(artifacts_group["created_utc"][i]),
-                    )
-                )
-
-        if "logs" in entry:
-            logs_group = entry["logs"]
-            for i in range(len(logs_group["level"])):
-                workflow_context.logs.append(
-                    LogMessage(
-                        level=cast(Level, _read_text_value(logs_group["level"][i])),
-                        message=_read_text_value(logs_group["message"][i]),
-                        where=(_read_text_value(logs_group["where"][i]) or None),
-                        when_utc=_read_text_value(logs_group["when_utc"][i]),
-                        meta=_from_json_compatible(json.loads(_read_text_value(logs_group["meta_json"][i]))),
-                    )
-                )
-
-        if "issues" in entry:
-            issues_group = entry["issues"]
-            for i in range(len(issues_group["level"])):
-                workflow_context.issues.append(
-                    Issue(
-                        level=cast(Literal["WARN", "ERROR"], _read_text_value(issues_group["level"][i])),
-                        message=_read_text_value(issues_group["message"][i]),
-                        where=(_read_text_value(issues_group["where"][i]) or None),
-                        key=(_read_text_value(issues_group["key"][i]) or None),
-                        when_utc=_read_text_value(issues_group["when_utc"][i]),
-                        meta=_from_json_compatible(json.loads(_read_text_value(issues_group["meta_json"][i]))),
-                    )
-                )
-
-        if "timings" in entry:
-            for key, dataset in entry["timings"].items():
-                if isinstance(dataset, h5py.Dataset):
-                    workflow_context.timings[key] = float(dataset[()])
-
-        if "store" in entry:
-            for key, dataset in entry["store"].items():
-                if not isinstance(dataset, h5py.Dataset) or key == "_skipped_keys":
-                    continue
-                workflow_context.store[key] = _from_json_compatible(json.loads(_read_text_dataset(dataset)))
-
-    return workflow_context
 
 
 def initialize_workflow_context_from_raw_directory(
@@ -1419,17 +1042,9 @@ def initialize_workflow_context_from_raw_directory(
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    candidate_files = sorted(
-        path
-        for path in input_dir.rglob("*")
-        if path.is_file() and not _is_relative_to(path.resolve(), output_dir)
-    )
-    if not candidate_files:
-        raise FileNotFoundError(f"No input files found in {input_dir}")
-
     ctx = WorkflowContext(
         experiment_id=experiment_id,
-        instrument_name=instrument_name,
+        instrument_name=instrument_name or "unknown",
         root_dir=input_dir,
         output_dir=output_dir,
     )
@@ -1444,1106 +1059,56 @@ def initialize_workflow_context_from_raw_directory(
     )
 
 
-def update_workflow_context_from_raw_directory(
-    ctx: WorkflowContext,
-    *,
-    overwrite: bool = False,
-) -> WorkflowContext:
-    """
-    Refresh a WorkflowContext by scanning its raw-data directory for newly added files.
-
-    The function converts and registers any new raw HDF5 files found under
-    ``ctx.root_dir`` while preserving the existing workflow state. Existing runs are
-    left untouched unless ``overwrite=True`` is passed, in which case converted files
-    are regenerated and duplicate run keys are updated.
-    """
-    if not isinstance(ctx.root_dir, Path):
-        raise TypeError("WorkflowContext.root_dir must be a Path")
-    if not isinstance(ctx.output_dir, Path):
-        raise TypeError("WorkflowContext.output_dir must be a Path")
-
-    input_dir = ctx.root_dir.resolve()
-    output_dir = ctx.output_dir.resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    ctx.root_dir = input_dir
-    ctx.output_dir = output_dir
-    if ctx.get("converted_data_dir") is None:
-        ctx.set("converted_data_dir", output_dir)
-
-    return _ingest_raw_directory_into_workflow_context(
-        ctx,
-        input_dir=input_dir,
-        output_dir=output_dir,
-        instrument_name=ctx.instrument_name,
-        overwrite=overwrite,
-        where="update_workflow_context_from_raw_directory",
+def _legacy_context_api_removed(name: str) -> NotImplementedError:
+    """Build a consistent error for legacy context APIs removed by the migration."""
+    return NotImplementedError(
+        f"{name} is not available in the current workflow context API. "
+        "Use WorkflowContext and initialize_workflow_context_from_raw_directory() "
+        "from scarlet.workflow.context instead."
     )
 
 
-def write_runs_report_csv(
-    workflow_context: WorkflowContext,
-    csv_path: str | Path | None = None,
-    *,
-    overwrite: bool = False,
-) -> Path:
-    """Write the editable CSV summary used to review and adjust registered runs."""
-    if not workflow_context.runs:
-        raise ValueError("WorkflowContext has no runs")
+def save_workflow_context(*args: Any, **kwargs: Any) -> WorkflowContext:
+    raise _legacy_context_api_removed("save_workflow_context")
 
-    if csv_path is None:
-        csv_path = workflow_context.output_dir / "runs_report.csv"
 
-    csv_path = Path(csv_path).resolve()
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
+def load_workflow_context(*args: Any, **kwargs: Any) -> WorkflowContext:
+    raise _legacy_context_api_removed("load_workflow_context")
 
-    if csv_path.exists() and not overwrite:
-        raise FileExistsError(f"Refusing to overwrite existing file: {csv_path}")
 
-    with csv_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(("sample_name", "config_id", "mode", "entity", "transmission", "file_path"))
-        writer.writerows(
-            (
-                row["sample_name"],
-                row["config_id"],
-                row["mode"],
-                row["entity"],
-                row["transmission"],
-                row["file_path"],
-            )
-            for row in _runs_report_rows(workflow_context)
-        )
+def update_workflow_context_from_raw_directory(*args: Any, **kwargs: Any) -> WorkflowContext:
+    raise _legacy_context_api_removed("update_workflow_context_from_raw_directory")
 
-    workflow_context.add_artifact(csv_path.name, csv_path, kind="csv")
-    workflow_context.set("runs_report_csv", csv_path)
-    return csv_path
 
+def write_runs_report_csv(*args: Any, **kwargs: Any) -> Path:
+    raise _legacy_context_api_removed("write_runs_report_csv")
 
-def update_workflow_context_from_runs_report_csv(
-    workflow_context: WorkflowContext,
-    csv_path: str | Path | None = None,
-) -> WorkflowContext:
-    """
-    Update a WorkflowContext from an edited runs_report.csv file.
 
-    The CSV may be manually edited to:
-    - change ``sample_name``
-    - change ``mode``
-    - change ``entity``
-    - set or clear ``transmission``
-    - remove rows entirely
+def update_workflow_context_from_runs_report_csv(*args: Any, **kwargs: Any) -> WorkflowContext:
+    if not args:
+        raise TypeError("update_workflow_context_from_runs_report_csv requires a WorkflowContext instance")
+    workflow_context = args[0]
+    if not isinstance(workflow_context, WorkflowContext):
+        raise TypeError("First argument must be a WorkflowContext")
+    csv_path = args[1] if len(args) > 1 else kwargs.get("csv_path")
+    return workflow_context.update_from_runs_table_csv(csv_path)
 
-    The function rebuilds ``ctx.runs`` from the CSV rows that remain, refreshes
-    ``ctx.configurations`` from the referenced files, and invalidates derived
-    state that may no longer be valid after the manual edits.
-    """
-    from scarlet.workflow.configuration import configuration_from_nexus
 
-    if csv_path is None:
-        csv_path = workflow_context.get("runs_report_csv")
-        if csv_path is None:
-            csv_path = workflow_context.output_dir / "runs_report.csv"
+def generate_reference_files_from_workflow_context(*args: Any, **kwargs: Any) -> WorkflowContext:
+    raise _legacy_context_api_removed("generate_reference_files_from_workflow_context")
 
-    csv_path = Path(csv_path).resolve()
-    if not csv_path.exists():
-        raise FileNotFoundError(f"Runs report CSV not found: {csv_path}")
 
-    def _resolve_report_path(raw_path: str) -> Path:
-        """Resolve a CSV file path relative to the report location when needed."""
-        path = Path(raw_path.strip())
-        if path.is_absolute():
-            return path.resolve()
-        return (csv_path.parent / path).resolve()
+def update_transmissions_from_workflow_context(*args: Any, **kwargs: Any) -> WorkflowContext:
+    raise _legacy_context_api_removed("update_transmissions_from_workflow_context")
 
-    valid_entities: set[str] = {"sample", "empty_beam", "empty_cell", "dark", "refs_sub"}
-    valid_modes: set[str] = {"scattering", "transmission"}
 
-    with csv_path.open("r", newline="", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle)
-        fieldnames = reader.fieldnames or []
-        required = {"sample_name", "config_id", "mode", "entity", "file_path"}
-        missing = required.difference(fieldnames)
-        if missing:
-            missing_text = ", ".join(sorted(missing))
-            raise ValueError(f"runs_report.csv missing required columns: {missing_text}")
-        rows = list(reader)
+def update_reference_masks_from_workflow_context(*args: Any, **kwargs: Any) -> WorkflowContext:
+    raise _legacy_context_api_removed("update_reference_masks_from_workflow_context")
 
-    rebuilt_runs: dict[RunKey, Path] = {}
-    rebuilt_configurations: dict[str, Any] = {}
-    row_order = 0
 
-    for row in rows:
-        row_order += 1
-        config_id = (row.get("config_id") or "").strip()
-        mode = (row.get("mode") or "").strip().lower()
-        entity = (row.get("entity") or "").strip().lower()
-        sample_name_raw = (row.get("sample_name") or "").strip()
-        transmission_raw = (row.get("transmission") or "").strip()
-        file_path_raw = (row.get("file_path") or "").strip()
+def integrate_scattering_from_workflow_context(*args: Any, **kwargs: Any) -> list[Any]:
+    raise _legacy_context_api_removed("integrate_scattering_from_workflow_context")
 
-        if not any((config_id, mode, entity, sample_name_raw, transmission_raw, file_path_raw)):
-            continue
-        if not config_id:
-            raise ValueError(f"Row {row_order}: config_id must not be empty")
-        if mode not in valid_modes:
-            expected = ", ".join(sorted(valid_modes))
-            raise ValueError(f"Row {row_order}: invalid mode {mode!r}; expected one of {expected}")
-        if entity not in valid_entities:
-            expected = ", ".join(sorted(valid_entities))
-            raise ValueError(f"Row {row_order}: invalid entity {entity!r}; expected one of {expected}")
-        if not file_path_raw:
-            raise ValueError(f"Row {row_order}: file_path must not be empty")
 
-        file_path = _resolve_report_path(file_path_raw)
-        if not file_path.exists():
-            raise FileNotFoundError(f"Row {row_order}: data file not found: {file_path}")
-
-        sample_name = sample_name_raw or None
-        transmission = _parse_optional_float(transmission_raw, row_order=row_order)
-        if entity == "sample" and sample_name is None:
-            raise ValueError(f"Row {row_order}: sample entity requires a non-empty sample_name")
-
-        run_key = RunKey(
-            config_id=config_id,
-            entity=cast(Entity, entity),
-            mode=cast(Mode, mode),
-            sample_name=sample_name,
-            transmission=transmission,
-        )
-        if run_key in rebuilt_runs:
-            workflow_context.warn(
-                "Duplicate run key detected in runs_report.csv; overwriting previous row",
-                where="update_workflow_context_from_runs_report_csv",
-                key=run_key.short(),
-                previous_path=str(rebuilt_runs[run_key]),
-                new_path=str(file_path),
-            )
-        rebuilt_runs[run_key] = file_path
-
-        if config_id not in rebuilt_configurations:
-            configuration, issues = configuration_from_nexus(file_path)
-            for issue in issues:
-                workflow_context.warn(
-                    issue,
-                    where="update_workflow_context_from_runs_report_csv",
-                    key=str(file_path),
-                )
-            try:
-                configuration = replace(configuration, config_id=config_id)
-            except TypeError:
-                pass
-            rebuilt_configurations[config_id] = configuration
-
-    workflow_context.close_all_h5()
-    workflow_context.runs.clear()
-    workflow_context.runs.update(rebuilt_runs)
-
-    workflow_context.configurations.clear()
-    workflow_context.configurations.update(rebuilt_configurations)
-
-    workflow_context.frames.clear()
-    workflow_context.frame_errors.clear()
-    workflow_context.transmissions.clear()
-    workflow_context.refs_sub_files.clear()
-    workflow_context.refs_norm_files.clear()
-
-    valid_config_ids = set(rebuilt_configurations)
-    stale_mask_keys = [key for key in workflow_context.masks if key[0] not in valid_config_ids]
-    for key in stale_mask_keys:
-        del workflow_context.masks[key]
-
-    workflow_context.set("runs_report_csv", csv_path)
-    return workflow_context
-
-
-def _normalize_sample_name(name: str) -> str:
-    """Normalize a sample name for heuristic comparisons."""
-    return re.sub(r"[^a-z0-9]+", "", name.strip().lower())
-
-
-def _is_water_sample_name(name: str) -> bool:
-    """Return True when a sample name looks like a water reference."""
-    sample_norm = _normalize_sample_name(name)
-    return sample_norm in {"h2o", "d2o"} or "water" in sample_norm
-
-
-def generate_reference_files_from_workflow_context(ctx: WorkflowContext) -> WorkflowContext:
-    """Generate refs_sub and refs_norm bundles from the runs registered in the context."""
-    from scarlet.workflow.configuration import (
-        _transmission_roi_from_file,
-        configuration_from_nexus,
-        write_refs_norm_file,
-        write_refs_sub_file,
-    )
-
-    if not ctx.runs:
-        raise ValueError("WorkflowContext has no runs")
-
-    ctx.output_dir.mkdir(parents=True, exist_ok=True)
-    refs_norm_aliases = {
-        config_id: cast(str, value)
-        for config_id, value in ctx.refs_norm_files.items()
-        if isinstance(value, str) and ctx._looks_like_refs_norm_alias(value)
-    }
-    ctx.refs_sub_files.clear()
-    ctx.refs_norm_files.clear()
-    ctx.refs_norm_files.update(refs_norm_aliases)
-
-    count_time_cache: dict[Path, float] = {}
-    transmission_roi_detector = int(ctx.get("transmission_roi_detector", 0))
-    transmission_roi_half_size = int(ctx.get("transmission_roi_half_size", 1))
-
-    def _entry_path_from_file(handle: h5py.File, path: Path) -> str:
-        """Locate the primary entry group inside a raw or converted NeXus file."""
-        for entry_path in ("/raw_data", "/entry", "/entry0", "/entry1"):
-            if entry_path in handle:
-                return entry_path
-        raise ValueError(f"No entry group found in {path}")
-
-    def _count_time(path: Path) -> float:
-        """Read and cache the count time used to rank competing reference runs."""
-        path = Path(path).resolve()
-        cached = count_time_cache.get(path)
-        if cached is not None:
-            return cached
-
-        handle = ctx.open_h5(path)
-        entry_path = _entry_path_from_file(handle, path)
-        value = float("-inf")
-        for dataset_path in (
-            f"{entry_path}/control/count_time",
-            f"{entry_path}/instrument/monitor0/count_time",
-            f"{entry_path}/instrument/monitor1/count_time",
-            f"{entry_path}/instrument/monitor2/count_time",
-        ):
-            if dataset_path not in handle:
-                continue
-            try:
-                value = float(handle[dataset_path][()])
-                break
-            except Exception:
-                continue
-        count_time_cache[path] = value
-        return value
-
-    all_runs = [(key, path.resolve()) for key, path in ctx.runs.items()]
-
-    def _best_run(
-        runs: list[tuple[RunKey, Path]],
-        *,
-        predicate,
-        mode: Optional[Mode] = None,
-    ) -> Optional[tuple[RunKey, Path]]:
-        """Pick the longest-counting run matching the requested predicate."""
-        candidates = [
-            (key, path)
-            for key, path in runs
-            if predicate(key) and (mode is None or key.mode == mode)
-        ]
-        return max(candidates, key=lambda item: _count_time(item[1]), default=None)
-
-    config_ids = sorted({*ctx.configurations.keys(), *(key.config_id for key, _ in all_runs)})
-    for config_id in config_ids:
-        config_runs = [(key, path) for key, path in all_runs if key.config_id == config_id]
-        if not config_runs:
-            continue
-
-        empty_beam_transmission = _best_run(
-            config_runs,
-            predicate=lambda key: key.entity == "empty_beam",
-            mode="transmission",
-        )
-        if empty_beam_transmission is None:
-            empty_beam_transmission = _best_run(
-                config_runs,
-                predicate=lambda key: key.entity == "empty_beam",
-            )
-
-        empty_beam_scattering = _best_run(
-            config_runs,
-            predicate=lambda key: key.entity == "empty_beam",
-            mode="scattering",
-        )
-        empty_cell_transmission = _best_run(
-            config_runs,
-            predicate=lambda key: key.entity == "empty_cell",
-            mode="transmission",
-        )
-        empty_cell_scattering = _best_run(
-            config_runs,
-            predicate=lambda key: key.entity == "empty_cell",
-            mode="scattering",
-        )
-        dark = _best_run(
-            config_runs,
-            predicate=lambda key: key.entity == "dark",
-        )
-
-        local_water_scattering = _best_run(
-            config_runs,
-            predicate=lambda key: key.entity == "sample" and _is_water_sample_name(key.sample_name or ""),
-            mode="scattering",
-        )
-        local_water_transmission = _best_run(
-            config_runs,
-            predicate=lambda key: key.entity == "sample" and _is_water_sample_name(key.sample_name or ""),
-            mode="transmission",
-        )
-
-        global_water_scattering = _best_run(
-            all_runs,
-            predicate=lambda key: key.entity == "sample" and _is_water_sample_name(key.sample_name or ""),
-            mode="scattering",
-        )
-        global_water_transmission = _best_run(
-            all_runs,
-            predicate=lambda key: key.entity == "sample" and _is_water_sample_name(key.sample_name or ""),
-            mode="transmission",
-        )
-
-        water_scattering = local_water_scattering or global_water_scattering
-        water_transmission = local_water_transmission or global_water_transmission
-        refs_norm_source_config_id = cast(str, ctx.refs_norm_files.get(config_id)) if ctx.is_refs_norm_alias(config_id) else None
-        if refs_norm_source_config_id is None and water_scattering is None:
-            raise ValueError(f"Missing water scattering reference for {config_id}")
-        if refs_norm_source_config_id is None and water_transmission is None:
-            raise ValueError(f"Missing water transmission reference for {config_id}")
-
-        water_scattering_source_config_id = None
-        if water_scattering is not None and water_scattering[0].config_id != config_id:
-            water_scattering_source_config_id = water_scattering[0].config_id
-        water_transmission_source_config_id = None
-        if water_transmission is not None and water_transmission[0].config_id != config_id:
-            water_transmission_source_config_id = water_transmission[0].config_id
-
-        configuration = ctx.configurations.get(config_id)
-        if configuration is None:
-            configuration_source = (
-                empty_beam_transmission
-                or water_transmission
-                or water_scattering
-                or config_runs[0]
-            )
-            configuration, issues = configuration_from_nexus(configuration_source[1])
-            for issue in issues:
-                ctx.warn(issue, where="configuration_from_nexus", key=str(configuration_source[1]))
-        try:
-            configuration = replace(configuration, config_id=config_id)
-        except TypeError:
-            pass
-        ctx.configurations[config_id] = configuration
-
-        masks = {
-            detector: mask
-            for (mask_config_id, detector), mask in ctx.masks.items()
-            if mask_config_id == config_id
-        }
-
-        roi_source = empty_beam_transmission or water_transmission
-        if roi_source is None:
-            raise ValueError(f"Missing transmission-like source file for ROI estimation: {config_id}")
-
-        roi = _transmission_roi_from_file(
-            roi_source[1],
-            transmission_roi_detector=transmission_roi_detector,
-            transmission_roi_half_size=transmission_roi_half_size,
-        )
-
-        if empty_beam_transmission is None:
-            raise ValueError(f"Missing empty_beam transmission reference for {config_id}")
-
-        refs_sub_path = write_refs_sub_file(
-            ctx.output_dir / f"refs_sub_{config_id}.nxs",
-            configuration,
-            empty_beam_transmission=empty_beam_transmission[1],
-            dark=None if dark is None else dark[1],
-            empty_beam_scattering=None if empty_beam_scattering is None else empty_beam_scattering[1],
-            empty_cell_transmission=None if empty_cell_transmission is None else empty_cell_transmission[1],
-            empty_cell_scattering=None if empty_cell_scattering is None else empty_cell_scattering[1],
-            transmission_roi_detector=transmission_roi_detector,
-            transmission_roi=roi,
-            transmission_roi_notes="estimated from empty_beam transmission image",
-            masks=masks or None,
-            overwrite=True,
-        ).resolve()
-        ctx.set_refs_sub(config_id, refs_sub_path)
-        ctx.add_artifact(refs_sub_path.name, refs_sub_path, kind="nexus")
-
-        if refs_norm_source_config_id is not None:
-            ctx.info(
-                "Using refs_norm source config",
-                where="generate_reference_files_from_workflow_context",
-                config_id=config_id,
-                source_config_id=refs_norm_source_config_id,
-            )
-            continue
-
-        if water_scattering is None:
-            raise ValueError(f"Missing water scattering reference for {config_id}")
-        if water_transmission is None:
-            raise ValueError(f"Missing water transmission reference for {config_id}")
-
-        refs_norm_path = write_refs_norm_file(
-            ctx.output_dir / f"refs_norm_{config_id}.nxs",
-            configuration,
-            water_scattering=water_scattering[1],
-            water_transmission=water_transmission[1],
-            water_scattering_source_config_id=water_scattering_source_config_id,
-            water_transmission_source_config_id=water_transmission_source_config_id,
-            dark=None if dark is None else dark[1],
-            empty_beam_transmission=None if empty_beam_transmission is None else empty_beam_transmission[1],
-            empty_beam_scattering=None if empty_beam_scattering is None else empty_beam_scattering[1],
-            empty_cell_transmission=None if empty_cell_transmission is None else empty_cell_transmission[1],
-            empty_cell_scattering=None if empty_cell_scattering is None else empty_cell_scattering[1],
-            transmission_roi_detector=transmission_roi_detector,
-            transmission_roi=roi,
-            transmission_roi_notes=(
-                "estimated from empty_beam transmission image"
-                if empty_beam_transmission is not None
-                else "estimated from water transmission image"
-            ),
-            masks=masks or None,
-            overwrite=True,
-        ).resolve()
-        ctx.set_refs_norm(config_id, refs_norm_path)
-        ctx.add_artifact(refs_norm_path.name, refs_norm_path, kind="nexus")
-
-    for config_id, source_config_id in sorted(
-        (config_id, cast(str, value))
-        for config_id, value in ctx.refs_norm_files.items()
-        if isinstance(value, str) and ctx._looks_like_refs_norm_alias(value)
-    ):
-        try:
-            source_path = ctx.get_refs_norm_path(config_id)
-        except KeyError as exc:
-            raise ValueError(
-                f"refs_norm source for {config_id} points to missing config_id={source_config_id}"
-            ) from exc
-        ctx.info(
-            "Resolved refs_norm source config",
-            where="generate_reference_files_from_workflow_context",
-            config_id=config_id,
-            source_config_id=source_config_id,
-            refs_norm_path=str(source_path),
-        )
-
-    return ctx
-
-
-def update_transmissions_from_workflow_context(
-    ctx: WorkflowContext,
-    *,
-    refs_entry_path: str = "/entry",
-) -> WorkflowContext:
-    """Compute or reuse sample transmissions from workflow runs and reference files."""
-    from scarlet.reduction.transmission import compute_transmission
-
-    if not ctx.runs:
-        raise ValueError("WorkflowContext has no runs")
-
-    all_runs = [(key, path.resolve()) for key, path in ctx.runs.items()]
-    sample_targets = sorted(
-        {
-            (key.config_id, key.sample_name)
-            for key, _ in all_runs
-            if key.entity == "sample" and key.sample_name
-        }
-    )
-    if not sample_targets:
-        ctx.transmissions.clear()
-        return ctx
-
-    count_time_cache: dict[Path, float] = {}
-
-    def _entry_path_from_file(handle: h5py.File, path: Path) -> str:
-        """Locate the primary entry group inside a raw or converted NeXus file."""
-        for entry_path in ("/raw_data", "/entry", "/entry0", "/entry1"):
-            if entry_path in handle:
-                return entry_path
-        raise ValueError(f"No entry group found in {path}")
-
-    def _count_time(path: Path) -> float:
-        """Read and cache the count time used to pick the best transmission run."""
-        path = Path(path).resolve()
-        cached = count_time_cache.get(path)
-        if cached is not None:
-            return cached
-
-        handle = ctx.open_h5(path)
-        entry_path = _entry_path_from_file(handle, path)
-        value = float("-inf")
-        for dataset_path in (
-            f"{entry_path}/control/count_time",
-            f"{entry_path}/instrument/monitor0/count_time",
-            f"{entry_path}/instrument/monitor1/count_time",
-            f"{entry_path}/instrument/monitor2/count_time",
-        ):
-            if dataset_path not in handle:
-                continue
-            try:
-                value = float(handle[dataset_path][()])
-                break
-            except Exception:
-                continue
-        count_time_cache[path] = value
-        return value
-
-    def _best_sample_transmission_run(config_id: str, sample_name: str) -> Optional[tuple[RunKey, Path]]:
-        """Select the best transmission run for one sample/configuration pair."""
-        candidates = [
-            (key, path)
-            for key, path in all_runs
-            if key.config_id == config_id
-            and key.entity == "sample"
-            and key.mode == "transmission"
-            and key.sample_name == sample_name
-        ]
-        return max(candidates, key=lambda item: _count_time(item[1]), default=None)
-
-    def _configuration_wavelength(config_id: str, refs_sub_path: Path) -> float:
-        """Read the wavelength from the cached configuration or the refs_sub file."""
-        configuration = ctx.configurations.get(config_id)
-        if configuration is not None:
-            try:
-                return float(getattr(configuration, "wavelength"))
-            except Exception:
-                pass
-
-        with h5py.File(refs_sub_path, "r") as refs_file:
-            dataset_path = f"{refs_entry_path}/configuration/wavelength"
-            if dataset_path not in refs_file:
-                raise ValueError(f"Missing configuration wavelength in refs_sub: {dataset_path}")
-            return float(np.asarray(refs_file[dataset_path][()]).reshape(()))
-
-    def _read_text_dataset(group: h5py.Group, dataset_path: str) -> Optional[str]:
-        """Read an optional scalar text dataset from a group."""
-        if dataset_path not in group:
-            return None
-        raw = group[dataset_path][()]
-        if isinstance(raw, (bytes, bytearray, np.bytes_)):
-            return raw.decode(errors="replace")
-        return str(raw)
-
-    ctx.transmissions.clear()
-    direct_values: dict[tuple[str, str], float] = {}
-    wavelength_by_config: dict[str, float] = {}
-
-    config_ids = sorted({config_id for config_id, _ in sample_targets})
-    for config_id in config_ids:
-        refs_sub_path = ctx.refs_sub_files.get(config_id)
-        if refs_sub_path is None:
-            raise ValueError(f"Missing refs_sub for config_id={config_id}")
-        refs_sub_path = refs_sub_path.resolve()
-        wavelength_by_config[config_id] = _configuration_wavelength(config_id, refs_sub_path)
-
-        with h5py.File(refs_sub_path, "r") as refs_file:
-            definition_path = f"{refs_entry_path}/definition"
-            if definition_path not in refs_file:
-                raise ValueError(f"Missing refs_sub definition: {definition_path}")
-            definition = np.asarray(refs_file[definition_path][()]).reshape(()).item()
-            if isinstance(definition, (bytes, bytearray, np.bytes_)):
-                definition = definition.decode(errors="replace")
-            if str(definition) != "SCARLET_refs_sub":
-                raise ValueError(f"Unsupported refs bundle definition: {definition!r}")
-
-            roi_root = f"{refs_entry_path}/transmission_roi"
-            roi = (
-                int(np.asarray(refs_file[f"{roi_root}/x0"][()]).reshape(())),
-                int(np.asarray(refs_file[f"{roi_root}/x1"][()]).reshape(())),
-                int(np.asarray(refs_file[f"{roi_root}/y0"][()]).reshape(())),
-                int(np.asarray(refs_file[f"{roi_root}/y1"][()]).reshape(())),
-            )
-            detector_raw = np.asarray(refs_file[f"{roi_root}/detector"][()]).reshape(()).item()
-            if isinstance(detector_raw, (bytes, bytearray, np.bytes_)):
-                detector_raw = detector_raw.decode(errors="replace")
-            if isinstance(detector_raw, str) and detector_raw.lower().startswith("detector"):
-                detector_number = int(detector_raw[len("detector") :])
-            else:
-                detector_number = int(detector_raw)
-
-            empty_beam_source = _read_text_dataset(refs_file, f"{refs_entry_path}/meta/empty_beam_transmission_source_file")
-            if empty_beam_source is None:
-                raise ValueError(f"refs_sub is missing empty_beam_transmission_source_file for {config_id}")
-            empty_beam_transmission_file = Path(empty_beam_source).resolve()
-
-        config_sample_names = sorted(
-            {
-                sample_name
-                for target_config_id, sample_name in sample_targets
-                if target_config_id == config_id and sample_name is not None
-            }
-        )
-        for sample_name in config_sample_names:
-            transmission_run = _best_sample_transmission_run(config_id, sample_name)
-            if transmission_run is None:
-                continue
-            value = compute_transmission(
-                transmission_run[1],
-                empty_beam_transmission_file,
-                roi,
-                detector_number=detector_number,
-            )
-            ctx.set_transmission(sample_name, config_id, value)
-            direct_values[(sample_name, config_id)] = value
-
-    for config_id, sample_name in sample_targets:
-        if sample_name is None or (sample_name, config_id) in ctx.transmissions:
-            continue
-        wavelength = wavelength_by_config.get(config_id)
-        if wavelength is None:
-            refs_sub_path = ctx.refs_sub_files.get(config_id)
-            if refs_sub_path is None:
-                continue
-            wavelength = _configuration_wavelength(config_id, refs_sub_path)
-            wavelength_by_config[config_id] = wavelength
-
-        fallback_value = None
-        for (other_sample_name, other_config_id), value in sorted(direct_values.items()):
-            if other_sample_name != sample_name or other_config_id == config_id:
-                continue
-            other_wavelength = wavelength_by_config.get(other_config_id)
-            if other_wavelength is None:
-                refs_sub_path = ctx.refs_sub_files.get(other_config_id)
-                if refs_sub_path is None:
-                    continue
-                other_wavelength = _configuration_wavelength(other_config_id, refs_sub_path)
-                wavelength_by_config[other_config_id] = other_wavelength
-            if np.isclose(wavelength, other_wavelength, rtol=0.0, atol=1e-6):
-                fallback_value = value
-                break
-        if fallback_value is not None:
-            ctx.set_transmission(sample_name, config_id, fallback_value)
-        else:
-            ctx.warn(
-                "No transmission file or wavelength-matched fallback found",
-                where="update_transmissions_from_workflow_context",
-                key=f"{config_id}:{sample_name}",
-            )
-
-    return ctx
-
-
-def update_reference_masks_from_workflow_context(
-    ctx: WorkflowContext,
-    *,
-    search_dir: str | Path | None = None,
-) -> WorkflowContext:
-    """Attach mask bundles to configurations and inject them into reference files."""
-    from scarlet.workflow.configuration import compare_configurations, configuration_from_nexus
-    from scarlet.workflow.reference import insert_masks_in_refs_file
-
-    if search_dir is None:
-        search_dir = ctx.output_dir
-    search_dir = Path(search_dir).resolve()
-    if not search_dir.exists():
-        raise FileNotFoundError(f"Mask search directory not found: {search_dir}")
-    if not search_dir.is_dir():
-        raise NotADirectoryError(f"Mask search path is not a directory: {search_dir}")
-
-    def _read_text_dataset(group: h5py.Group, dataset_path: str) -> Optional[str]:
-        """Read an optional scalar text dataset from a group."""
-        if dataset_path not in group:
-            return None
-        raw = group[dataset_path][()]
-        if isinstance(raw, (bytes, bytearray, np.bytes_)):
-            return raw.decode(errors="replace")
-        return str(raw)
-
-    def _load_mask_bundle(path: Path) -> Optional[tuple[Optional[str], dict[int, np.ndarray]]]:
-        """Load one SCARLET mask bundle and return its config id plus detector masks."""
-        try:
-            with h5py.File(path, "r") as f:
-                if "/entry" not in f or not isinstance(f["/entry"], h5py.Group):
-                    return None
-                entry = f["/entry"]
-                definition = _read_text_dataset(entry, "definition")
-                if definition != "SCARLET_masks":
-                    return None
-                if "mask" not in entry or not isinstance(entry["mask"], h5py.Group):
-                    raise ValueError(f"Missing /entry/mask group in mask bundle: {path}")
-
-                masks: dict[int, np.ndarray] = {}
-                for dataset_name, dataset in entry["mask"].items():
-                    if not isinstance(dataset, h5py.Dataset):
-                        continue
-                    match = re.fullmatch(r"mask_detector(\d+)", dataset_name)
-                    if match is None:
-                        continue
-                    masks[int(match.group(1))] = np.asarray(dataset[()], dtype=np.uint8)
-                if not masks:
-                    raise ValueError(f"No mask_detectorN datasets found in mask bundle: {path}")
-                return (
-                    _read_text_dataset(entry, "config_id")
-                    or _read_text_dataset(entry, "configuration/config_id"),
-                    masks,
-                )
-        except OSError:
-            return None
-
-    def _match_mask_configuration(mask_configuration: Any, candidate_configuration: Any) -> bool:
-        """Compare mask and candidate configurations with distance normalization fallback."""
-        same, _diffs = compare_configurations(mask_configuration, candidate_configuration)
-        if same:
-            return True
-
-        mask_distance = getattr(mask_configuration, "sample_detector_distance", None)
-        candidate_distance = getattr(candidate_configuration, "sample_detector_distance", None)
-        if isinstance(mask_distance, list) == isinstance(candidate_distance, list):
-            return False
-
-        normalized_mask = replace(
-            mask_configuration,
-            sample_detector_distance=(
-                float(mask_distance[0]) if isinstance(mask_distance, list) else float(mask_distance)
-            ),
-        )
-        normalized_candidate = replace(
-            candidate_configuration,
-            sample_detector_distance=(
-                float(candidate_distance[0]) if isinstance(candidate_distance, list) else float(candidate_distance)
-            ),
-        )
-        same, _diffs = compare_configurations(normalized_mask, normalized_candidate)
-        return same
-
-    target_config_ids = {
-        *ctx.configurations.keys(),
-        *ctx.refs_sub_files.keys(),
-        *ctx.refs_norm_files.keys(),
-        *(
-            cast(str, value)
-            for value in ctx.refs_norm_files.values()
-            if isinstance(value, str) and ctx._looks_like_refs_norm_alias(value)
-        ),
-        *(key.config_id for key in ctx.runs),
-    }
-    selected_mask_files: dict[str, Path] = {}
-    selected_masks: dict[str, dict[int, np.ndarray]] = {}
-
-    for path in sorted(search_dir.rglob("*.nxs")):
-        loaded = _load_mask_bundle(path)
-        if loaded is None:
-            continue
-        config_id, masks = loaded
-
-        matched_config_id: Optional[str] = None
-        if config_id is not None and config_id in target_config_ids:
-            matched_config_id = config_id
-        else:
-            mask_configuration, _issues = configuration_from_nexus(path)
-            for candidate_config_id in sorted(target_config_ids):
-                candidate_configuration = ctx.configurations.get(candidate_config_id)
-                if candidate_configuration is None:
-                    continue
-                if _match_mask_configuration(mask_configuration, candidate_configuration):
-                    matched_config_id = candidate_config_id
-                    break
-
-        if matched_config_id is None:
-            ctx.warn(
-                "Could not match mask bundle to a workflow configuration",
-                where="update_reference_masks_from_workflow_context",
-                key=str(path),
-                config_id=config_id,
-            )
-            continue
-
-        previous_path = selected_mask_files.get(matched_config_id)
-        if previous_path is not None:
-            previous_mtime_ns = previous_path.stat().st_mtime_ns
-            current_mtime_ns = path.stat().st_mtime_ns
-            if current_mtime_ns < previous_mtime_ns:
-                continue
-            ctx.warn(
-                "Multiple mask bundles matched the same configuration; keeping the newest file",
-                where="update_reference_masks_from_workflow_context",
-                key=matched_config_id,
-                previous_path=str(previous_path),
-                new_path=str(path),
-            )
-
-        selected_mask_files[matched_config_id] = path.resolve()
-        selected_masks[matched_config_id] = masks
-
-    ctx.masks_files.clear()
-    for config_id, mask_path in selected_mask_files.items():
-        ctx.set_masks_file(config_id, mask_path)
-
-        stale_mask_keys = [key for key in ctx.masks if key[0] == config_id]
-        for key in stale_mask_keys:
-            del ctx.masks[key]
-        for detector, mask in selected_masks[config_id].items():
-            ctx.set_mask(config_id, detector, mask)
-
-        refs_sub_path = ctx.refs_sub_files.get(config_id)
-        if refs_sub_path is not None and refs_sub_path.exists():
-            insert_masks_in_refs_file(refs_sub_path, mask=mask_path)
-
-        if not ctx.is_refs_norm_alias(config_id):
-            try:
-                refs_norm_path = ctx.get_refs_norm_path(config_id)
-            except KeyError:
-                refs_norm_path = None
-            if refs_norm_path is not None and refs_norm_path.exists():
-                insert_masks_in_refs_file(refs_norm_path, mask=mask_path)
-
-    return ctx
-
-
-def integrate_scattering_from_workflow_context(
-    ctx: WorkflowContext,
-    *,
-    n_bins: int = 200,
-    refs_entry_path: str = "/entry",
-    sample_name: Optional[str] = None,
-    config_id: Optional[str] = None,
-    detector_number: Optional[int] = None,
-) -> WorkflowContext:
-    """Run reductions and export integrated scattering curves as text artifacts."""
-    results = _run_reduction_pipeline_results_from_workflow_context(
-        ctx,
-        n_bins=n_bins,
-        refs_entry_path=refs_entry_path,
-        sample_name=sample_name,
-        config_id=config_id,
-        detector_number=detector_number,
-    )
-
-    for result in results:
-        sample_name = result.run_key.sample_name or "sample"
-        config_id = result.run_key.config_id
-        detector_numbers = sorted(result.state.detectors)
-        if result.detector_number is not None:
-            detector_numbers = [result.detector_number]
-
-        for current_detector_number in detector_numbers:
-            detector = result.state.detectors.get(current_detector_number)
-            if detector is None or detector.x is None:
-                raise ValueError(
-                    f"Reduction pipeline did not produce azimuthal data for detector{current_detector_number}"
-                )
-
-            q_all = np.asarray(detector.x, dtype=np.float64)
-            intensity_all = np.asarray(detector.data, dtype=np.float64)
-            valid_bins = np.isfinite(q_all) & np.isfinite(intensity_all)
-            q_values = q_all[valid_bins]
-            intensity_values = intensity_all[valid_bins]
-            intensity_error_values = (
-                np.full_like(q_values, np.nan)
-                if detector.data_error is None
-                else np.asarray(detector.data_error, dtype=np.float64)[valid_bins]
-            )
-            if detector.x_error is None:
-                q_error_values = np.full_like(q_values, np.nan)
-            else:
-                q_error_array = np.asarray(detector.x_error, dtype=np.float64)
-                if q_error_array.ndim == 0:
-                    q_error_values = np.full_like(q_values, float(q_error_array))
-                else:
-                    q_error_values = q_error_array[valid_bins]
-
-            sample_t = float(result.state.inputs.sample_transmission)
-            safe_sample_name = re.sub(r"[^A-Za-z0-9._-]+", "_", sample_name).strip("_") or "sample"
-            output_path = (ctx.output_dir / f"{safe_sample_name}_det{current_detector_number}_{config_id}.txt").resolve()
-            header = "\n".join(
-                (
-                    f"sample_name: {sample_name}",
-                    f"config_id: {config_id}",
-                    f"detector: detector{current_detector_number}",
-                    f"transmission: {sample_t:.6g}",
-                    "columns: q i i_error q_error",
-                )
-            )
-            np.savetxt(
-                output_path,
-                np.column_stack((q_values, intensity_values, intensity_error_values, q_error_values)),
-                header=header,
-                comments="# ",
-            )
-            ctx.add_artifact(output_path.name, output_path, kind="text")
-
-    return ctx
-
-
-def run_reduction_pipeline_from_workflow_context(
-    ctx: WorkflowContext,
-    *,
-    n_bins: int = 200,
-    refs_entry_path: str = "/entry",
-    pipeline: Optional[Any] = None,
-    sample_name: Optional[str] = None,
-    config_id: Optional[str] = None,
-    detector_number: Optional[int] = None,
-) -> "ReductionState":
-    """Run one reduction selected from the workflow context and return its state."""
-    results = _run_reduction_pipeline_results_from_workflow_context(
-        ctx,
-        n_bins=n_bins,
-        refs_entry_path=refs_entry_path,
-        pipeline=pipeline,
-        sample_name=sample_name,
-        config_id=config_id,
-        detector_number=detector_number,
-    )
-    if len(results) != 1:
-        selection = []
-        if sample_name is not None:
-            selection.append(f"sample_name={sample_name!r}")
-        if config_id is not None:
-            selection.append(f"config_id={config_id!r}")
-        if detector_number is not None:
-            selection.append(f"detector_number={detector_number!r}")
-        detail = ", ".join(selection) if selection else "the current selection"
-        raise ValueError(
-            f"Expected exactly one reduction result for {detail}, got {len(results)}. "
-            "Filter further with config_id/detector_number or use integrate_scattering_from_workflow_context()."
-        )
-    return results[0].state
-
-
-def _run_reduction_pipeline_results_from_workflow_context(
-    ctx: WorkflowContext,
-    *,
-    n_bins: int = 200,
-    refs_entry_path: str = "/entry",
-    pipeline: Optional[Any] = None,
-    sample_name: Optional[str] = None,
-    config_id: Optional[str] = None,
-    detector_number: Optional[int] = None,
-) -> List[WorkflowReductionResult]:
-    """Run the reduction pipeline for matching sample scattering runs."""
-    from scarlet.workflow.pipeline import ReductionInputs, ReductionPipeline
-
-    if not ctx.runs:
-        raise ValueError("WorkflowContext has no runs")
-
-    if int(n_bins) <= 0:
-        raise ValueError(f"n_bins must be > 0, got {n_bins!r}")
-
-    ctx.output_dir.mkdir(parents=True, exist_ok=True)
-
-    def _empty_cell_transmission_from_refs(refs_file: h5py.File) -> Optional[float]:
-        """Read the empty-cell transmission value embedded in a refs file."""
-        dataset_path = f"{refs_entry_path}/references/empty_cell_transmission/entry/sample/transmission"
-        if dataset_path not in refs_file:
-            return None
-        value = float(np.asarray(refs_file[dataset_path][()]).reshape(()))
-        return value if np.isfinite(value) and value > 0.0 else None
-
-    def _sample_transmission(sample_name: str, config_id: str) -> float:
-        """Return the cached transmission for a given sample/configuration pair."""
-        value = ctx.get_transmission(sample_name, config_id)
-        if value is None:
-            raise ValueError(f"Missing transmission in workflow context for sample={sample_name!r}, config_id={config_id}")
-        return float(value)
-
-    def _sample_transmission_file(sample_name: str, config_id: str) -> str:
-        """Return the transmission file path used for a sample/configuration pair."""
-        for key, path in ctx.runs.items():
-            if (
-                key.entity == "sample"
-                and key.mode == "transmission"
-                and key.sample_name == sample_name
-                and key.config_id == config_id
-            ):
-                return str(path.resolve())
-        return ""
-
-    scattering_runs = [
-        (key, path.resolve())
-        for key, path in ctx.runs.items()
-        if key.entity == "sample"
-        and key.mode == "scattering"
-        and key.sample_name
-        and (sample_name is None or key.sample_name == sample_name)
-        and (config_id is None or key.config_id == config_id)
-    ]
-    if not scattering_runs:
-        if sample_name is None and config_id is None and detector_number is None:
-            raise ValueError("WorkflowContext has no sample scattering runs")
-        filters = []
-        if sample_name is not None:
-            filters.append(f"sample_name={sample_name!r}")
-        if config_id is not None:
-            filters.append(f"config_id={config_id!r}")
-        if detector_number is not None:
-            filters.append(f"detector_number={detector_number!r}")
-        raise ValueError(f"WorkflowContext has no scattering run for {', '.join(filters)}")
-
-    reduction_pipeline = ReductionPipeline.default() if pipeline is None else pipeline
-    results: List[WorkflowReductionResult] = []
-
-    for key, path in scattering_runs:
-        sample_name = key.sample_name or "sample"
-        config_id = key.config_id
-        refs_sub_path = ctx.refs_sub_files.get(config_id)
-        if refs_sub_path is None:
-            raise ValueError(f"Missing refs_sub for config_id={config_id}")
-        refs_sub_path = refs_sub_path.resolve()
-        try:
-            refs_norm_path = ctx.get_refs_norm_path(config_id).resolve()
-        except KeyError as exc:
-            raise ValueError(f"Missing refs_norm for config_id={config_id}") from exc
-
-        sample_t = _sample_transmission(sample_name, config_id)
-        reduction = reduction_pipeline.run(
-            ReductionInputs(
-                sample_file_scattering=str(path),
-                sample_file_transmission=_sample_transmission_file(sample_name, config_id),
-                sample_transmission=sample_t,
-                ref_sub_file=str(refs_sub_path),
-                ref_norm_file=str(refs_norm_path),
-            )
-        )
-
-        if detector_number is None:
-            results.append(
-                WorkflowReductionResult(
-                    run_key=key,
-                    detector_number=None,
-                    source_path=path,
-                    state=reduction,
-                )
-            )
-            continue
-
-        current_detector_number = int(detector_number)
-        if current_detector_number not in reduction.detectors:
-            continue
-        detector = reduction.detectors[current_detector_number]
-        water_corrected = reduction.water_corrected_detectors.get(current_detector_number)
-        detector_state = replace(
-            reduction,
-            detectors={current_detector_number: detector},
-            water_corrected_detectors=(
-                {}
-                if water_corrected is None
-                else {current_detector_number: water_corrected}
-            ),
-            data=detector.data,
-            data_error=detector.data_error,
-            x=detector.x,
-            x_error=detector.x_error,
-            y=detector.y,
-            y_error=detector.y_error,
-        )
-        results.append(
-            WorkflowReductionResult(
-                run_key=key,
-                detector_number=current_detector_number,
-                source_path=path,
-                state=detector_state,
-            )
-        )
-    if not results:
-        if sample_name is None and config_id is None and detector_number is None:
-            raise ValueError("WorkflowContext has no matching scattering reductions")
-        filters = []
-        if sample_name is not None:
-            filters.append(f"sample_name={sample_name!r}")
-        if config_id is not None:
-            filters.append(f"config_id={config_id!r}")
-        if detector_number is not None:
-            filters.append(f"detector_number={detector_number!r}")
-        raise ValueError(f"WorkflowContext has no scattering reduction for {', '.join(filters)}")
-    return results
+def run_reduction_pipeline_from_workflow_context(*args: Any, **kwargs: Any) -> Any:
+    raise _legacy_context_api_removed("run_reduction_pipeline_from_workflow_context")
