@@ -458,17 +458,6 @@ def _normalize_mask_array(mask: Union[np.ndarray, str, Path], *, label: str) -> 
     return array.astype(np.uint8, copy=False)
 
 
-from .reference import (
-    compute_corrected_water_scattering,
-    insert_beam_centers_in_refs_file,
-    insert_masks_in_refs_file,
-    update_detector0_beam_center_from_empty_beam_transmission,
-    write_corrected_water_scattering,
-    write_refs_norm_file,
-    write_refs_sub_file,
-)
-
-
 def configuration_from_nexus(
     file_path: Union[str, Path],
     *,
@@ -713,6 +702,19 @@ def _fmt_diff(name: str, a: Optional[float], b: Optional[float], diff: Optional[
     if a is None or b is None or diff is None:
         return f"{name}: missing value(s) (a={a}, b={b})"
     return f"{name}: a={a:.6g}{unit}, b={b:.6g}{unit}, |Δ|={diff:.3g}{unit} > tol={tol:.3g}{unit}"
+
+
+def compare_configurations_wavelength(
+    a: "Configuration",
+    b: "Configuration",
+    *,
+    tol_a: float = ConfigTolerance().wavelength_a,
+) -> Tuple[bool, List[str]]:
+    """Compare two configurations using only the wavelength criterion."""
+    ok, diff = _close(a.wavelength, b.wavelength, tol_a)
+    if ok:
+        return True, []
+    return False, [_fmt_diff("wavelength", a.wavelength, b.wavelength, diff, tol_a, "Å")]
 
 
 def compare_configurations(

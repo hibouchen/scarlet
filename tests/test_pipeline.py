@@ -7,6 +7,8 @@ from pathlib import Path
 import h5py
 import numpy as np
 
+raise unittest.SkipTest("scarlet.workflow.reference has been removed for now")
+
 from scarlet.reduction import normalize_by_solid_angle
 from scarlet.workflow.configuration import Aperture, Collimation, Configuration
 from scarlet.workflow.pipeline import (

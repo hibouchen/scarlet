@@ -68,7 +68,7 @@ class TestGuiMaskEditor(unittest.TestCase):
             self.assertEqual(source.detector_data[0].shape, (3, 4))
             self.assertEqual(source.detector_data[1].shape, (3, 4))
             self.assertAlmostEqual(source.configuration.wavelength, 6.0)
-            self.assertAlmostEqual(float(source.configuration.sample_detector_distance), 4.2)
+            self.assertEqual(source.configuration.sample_detector_distance, [4.2, 4.2])
 
     def test_write_mask_bundle_stores_masks_and_configuration(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -101,7 +101,10 @@ class TestGuiMaskEditor(unittest.TestCase):
                 self.assertEqual(f["/entry/meta/source_entry_path"][()].decode(), "/raw_data")
                 self.assertEqual(f["/entry/meta/mask_convention"][()].decode(), "1=masked, 0=valid")
                 self.assertAlmostEqual(float(f["/entry/configuration/wavelength"][()]), 6.0)
-                self.assertAlmostEqual(float(f["/entry/configuration/sample_detector_distance"][()]), 4.2)
+                np.testing.assert_array_equal(
+                    np.asarray(f["/entry/configuration/sample_detector_distance"][()], dtype=np.float64),
+                    np.asarray([4.2, 4.2], dtype=np.float64),
+                )
 
 
 if __name__ == "__main__":

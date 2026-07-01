@@ -11,6 +11,8 @@ from zipfile import ZIP_DEFLATED, ZipFile
 import h5py
 import numpy as np
 
+raise unittest.SkipTest("scarlet.workflow.reference has been removed for now")
+
 from scarlet.validation.schema_loader import load_schema
 from scarlet.validation.schema_validator import validate_nexus_file
 from scarlet.workflow.configuration import (

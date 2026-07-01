@@ -3,21 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import re
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import h5py
 import numpy as np
 
 if TYPE_CHECKING:
+    import scipp as sc
     from scarlet.workflow.configuration import Configuration
-
-
-@dataclass(frozen=True)
-class DetectorData:
-    detector_number: int
-    data: np.ndarray
-    error: np.ndarray
-    pixel_size: tuple[float, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -26,7 +19,7 @@ class NexusRawData:
     entry_path: str
     monitor: float
     count_time: float | None
-    detectors: dict[int, DetectorData]
+    detectors: dict[int, Any]
     configuration: Configuration
     configuration_issues: list[str]
 
@@ -81,15 +74,37 @@ def read_count_time_value(file_path: Path | str) -> float | None:
         return _read_optional_scalar(handle, f"{entry_path}/control/count_time")
 
 
+def read_deadtime_value(file_path: Path | str, detector_number: int) -> float:
+    """Read the detector dead time, returning ``0.0`` when it is absent or non-finite."""
+    file_path = Path(file_path).resolve()
+    with h5py.File(file_path, "r") as handle:
+        entry_path = _resolve_entry_path(handle, file_path=file_path)
+        return _read_detector_deadtime(handle, entry_path, detector_number, file_path=file_path)
+
+
 def read_detector_data(
     file_path: Path | str,
     detector_number: int,
     *,
     normalize_by_monitor: bool = False,
+    correct_deadtime: bool = False,
 ) -> np.ndarray:
-    """Read a single detector image and optionally normalize it by the monitor integral."""
-    detector = read_detector(file_path, detector_number, normalize_by_monitor=normalize_by_monitor)
-    return detector.data
+    """Read a single detector image with optional dead-time and monitor corrections."""
+    file_path = Path(file_path).resolve()
+    with h5py.File(file_path, "r") as handle:
+        entry_path = _resolve_entry_path(handle, file_path=file_path)
+        monitor = _read_monitor_value(handle, entry_path, file_path=file_path)
+        count_time = _read_optional_scalar(handle, f"{entry_path}/control/count_time")
+        data, _, _, _ = _read_detector_payload(
+            handle,
+            entry_path,
+            detector_number,
+            monitor=monitor,
+            normalize_by_monitor=normalize_by_monitor,
+            count_time=count_time,
+            correct_deadtime=correct_deadtime,
+        )
+        return data
 
 
 def read_detector_error(
@@ -97,24 +112,49 @@ def read_detector_error(
     detector_number: int,
     *,
     normalize_by_monitor: bool = False,
+    correct_deadtime: bool = False,
 ) -> np.ndarray:
     """Read the Poisson error estimate associated with one detector image."""
-    detector = read_detector(file_path, detector_number, normalize_by_monitor=normalize_by_monitor)
-    return detector.error
+    file_path = Path(file_path).resolve()
+    with h5py.File(file_path, "r") as handle:
+        entry_path = _resolve_entry_path(handle, file_path=file_path)
+        monitor = _read_monitor_value(handle, entry_path, file_path=file_path)
+        count_time = _read_optional_scalar(handle, f"{entry_path}/control/count_time")
+        _, error, _, _ = _read_detector_payload(
+            handle,
+            entry_path,
+            detector_number,
+            monitor=monitor,
+            normalize_by_monitor=normalize_by_monitor,
+            count_time=count_time,
+            correct_deadtime=correct_deadtime,
+        )
+        return error
 
 
 def read_detector_pixel_size(file_path: Path | str, detector_number: int) -> tuple[float, float] | None:
     """Read detector pixel sizes if both X and Y pixel sizes are present in the file."""
-    detector = read_detector(file_path, detector_number)
-    return detector.pixel_size
-
-
-def read_detector_deadtime(file_path: Path | str, detector_number: int) -> float | None:
-    """Read the optional detector dead time stored under ``dead_time`` or ``deadtime``."""
     file_path = Path(file_path).resolve()
     with h5py.File(file_path, "r") as handle:
         entry_path = _resolve_entry_path(handle, file_path=file_path)
-        return _read_detector_deadtime(handle, entry_path, detector_number, file_path=file_path)
+        monitor = _read_monitor_value(handle, entry_path, file_path=file_path)
+        _, _, x_pixel_size, y_pixel_size = _read_detector_payload(
+            handle,
+            entry_path,
+            detector_number,
+            monitor=monitor,
+            normalize_by_monitor=False,
+            count_time=None,
+            correct_deadtime=False,
+        )
+        if x_pixel_size is None or y_pixel_size is None:
+            return None
+        return x_pixel_size, y_pixel_size
+
+
+def read_detector_deadtime(file_path: Path | str, detector_number: int) -> float:
+    """Read detector dead time stored under ``dead_time`` or ``deadtime``."""
+    return read_deadtime_value(file_path, detector_number)
 
 
 def read_empty_beam_transmission_source_file(file_path: Path | str) -> Path:
@@ -138,25 +178,37 @@ def read_detector(
     detector_number: int,
     *,
     normalize_by_monitor: bool = False,
-) -> DetectorData:
+    correct_deadtime: bool = False,
+) -> "sc.DataArray":
     """Read one detector image together with its error estimate and optional pixel sizes."""
     file_path = Path(file_path).resolve()
     with h5py.File(file_path, "r") as handle:
         entry_path = _resolve_entry_path(handle, file_path=file_path)
         monitor = _read_monitor_value(handle, entry_path, file_path=file_path)
-        return _read_detector(handle, entry_path, detector_number, monitor=monitor, normalize_by_monitor=normalize_by_monitor)
+        count_time = _read_optional_scalar(handle, f"{entry_path}/control/count_time")
+        return _read_detector(
+            handle,
+            entry_path,
+            detector_number,
+            monitor=monitor,
+            normalize_by_monitor=normalize_by_monitor,
+            count_time=count_time,
+            correct_deadtime=correct_deadtime,
+        )
 
 
 def read_all_detectors(
     file_path: Path | str,
     *,
     normalize_by_monitor: bool = False,
-) -> dict[int, DetectorData]:
+    correct_deadtime: bool = False,
+) -> dict[int, "sc.DataArray"]:
     """Read every detector image found in the file and return them keyed by detector number."""
     file_path = Path(file_path).resolve()
     with h5py.File(file_path, "r") as handle:
         entry_path = _resolve_entry_path(handle, file_path=file_path)
         monitor = _read_monitor_value(handle, entry_path, file_path=file_path)
+        count_time = _read_optional_scalar(handle, f"{entry_path}/control/count_time")
         detector_numbers = list_detector_numbers(file_path)
         return {
             detector_number: _read_detector(
@@ -165,6 +217,8 @@ def read_all_detectors(
                 detector_number,
                 monitor=monitor,
                 normalize_by_monitor=normalize_by_monitor,
+                count_time=count_time,
+                correct_deadtime=correct_deadtime,
             )
             for detector_number in detector_numbers
         }
@@ -183,6 +237,7 @@ def load_nxsas_raw(
     file_path: Path | str,
     *,
     normalize_by_monitor: bool = False,
+    correct_deadtime: bool = False,
 ) -> NexusRawData:
     """Load a full SCARLET NXsas_raw file into a structured in-memory representation."""
     from scarlet.workflow.configuration import configuration_from_nexus
@@ -200,6 +255,8 @@ def load_nxsas_raw(
                 detector_number,
                 monitor=monitor,
                 normalize_by_monitor=normalize_by_monitor,
+                count_time=count_time,
+                correct_deadtime=correct_deadtime,
             )
             for detector_number in detector_numbers
         }
@@ -249,8 +306,8 @@ def _read_detector_deadtime(
     detector_number: int,
     *,
     file_path: Path,
-) -> float | None:
-    """Read and validate the optional dead time for a detector from an open file handle."""
+) -> float:
+    """Read and validate detector dead time from an open file handle."""
     detector_path = f"{entry_path}/instrument/detector{detector_number}"
     if detector_path not in handle or not isinstance(handle[detector_path], h5py.Group):
         raise ValueError(f"Missing detector group in {file_path}: {detector_path}")
@@ -260,11 +317,11 @@ def _read_detector_deadtime(
             continue
         value = float(np.asarray(handle[dataset_path][()]).reshape(()))
         if not np.isfinite(value):
-            return None
+            return 0.0
         if value < 0.0:
             raise ValueError(f"dead_time must be >= 0 in {file_path}: {dataset_path}")
         return value
-    return None
+    return 0.0
 
 
 def _read_empty_beam_transmission_source_file(
@@ -335,8 +392,39 @@ def _read_detector(
     *,
     monitor: float,
     normalize_by_monitor: bool,
-) -> DetectorData:
+    count_time: float | None,
+    correct_deadtime: bool,
+) -> "sc.DataArray":
     """Read one detector dataset from an open file handle and derive its default error model."""
+    data, error, x_pixel_size, y_pixel_size = _read_detector_payload(
+        handle,
+        entry_path,
+        detector_number,
+        monitor=monitor,
+        normalize_by_monitor=normalize_by_monitor,
+        count_time=count_time,
+        correct_deadtime=correct_deadtime,
+    )
+    return _build_detector_dataarray(
+        detector_number=int(detector_number),
+        data=data,
+        error=error,
+        x_pixel_size=x_pixel_size,
+        y_pixel_size=y_pixel_size,
+    )
+
+
+def _read_detector_payload(
+    handle: h5py.File,
+    entry_path: str,
+    detector_number: int,
+    *,
+    monitor: float,
+    normalize_by_monitor: bool,
+    count_time: float | None,
+    correct_deadtime: bool,
+) -> tuple[np.ndarray, np.ndarray, float | None, float | None]:
+    """Read one detector dataset and return raw arrays plus pixel-size metadata."""
     detector_path = f"{entry_path}/instrument/detector{detector_number}"
     data_path = f"{detector_path}/data"
     if data_path not in handle:
@@ -346,20 +434,77 @@ def _read_detector(
     if raw_data.ndim != 2:
         raise ValueError(f"Detector data must be 2D at {data_path}, got shape {raw_data.shape}")
 
-    data = raw_data / monitor if normalize_by_monitor else raw_data
-    error = np.sqrt(np.clip(raw_data, 0.0, None))
+    corrected_data = raw_data
+    deadtime = _read_detector_deadtime(handle, entry_path, detector_number, file_path=Path(handle.filename).resolve())
+    effective_deadtime = float(deadtime)
+    if correct_deadtime and effective_deadtime != 0.0:
+        if count_time is None:
+            raise ValueError(
+                f"Missing count_time in {Path(handle.filename).resolve()}: "
+                f"{entry_path}/control/count_time required for dead-time correction"
+            )
+        if count_time <= 0.0:
+            raise ValueError(
+                f"count_time must be > 0 in {Path(handle.filename).resolve()}: {entry_path}/control/count_time"
+            )
+        corrected_data = _correct_detector_dead_time(
+            raw_data,
+            acq_time=float(count_time),
+            deadtime=effective_deadtime,
+        )
+
+    data = corrected_data / monitor if normalize_by_monitor else corrected_data
+    error = np.sqrt(np.clip(corrected_data, 0.0, None))
     if normalize_by_monitor:
         error = error / monitor
 
     x_pixel_size = _read_optional_scalar(handle, f"{detector_path}/x_pixel_size")
     y_pixel_size = _read_optional_scalar(handle, f"{detector_path}/y_pixel_size")
-    pixel_size = None if x_pixel_size is None or y_pixel_size is None else (x_pixel_size, y_pixel_size)
+    return data, error, x_pixel_size, y_pixel_size
 
-    return DetectorData(
-        detector_number=int(detector_number),
-        data=data,
-        error=error,
-        pixel_size=pixel_size,
+
+def _correct_detector_dead_time(image: np.ndarray, *, acq_time: float, deadtime: float) -> np.ndarray:
+    """Apply the dead-time correction formula locally to avoid io/reduction import cycles."""
+    rate = np.asarray(image, dtype=np.float64) / float(acq_time)
+    denominator = 1.0 - rate * float(deadtime)
+    if np.any(denominator <= 0.0):
+        raise ValueError("dead-time correction is undefined when 1 - rate * deadtime <= 0")
+    return rate / denominator
+
+
+def _require_scipp():
+    """Import Scipp lazily so metadata-only helpers can still work without it."""
+    try:
+        import scipp as sc
+    except ImportError as exc:
+        raise ImportError("scipp is required to read detector data from nexus_reader") from exc
+    return sc
+
+
+def _build_detector_dataarray(
+    *,
+    detector_number: int,
+    data: np.ndarray,
+    error: np.ndarray,
+    x_pixel_size: float | None,
+    y_pixel_size: float | None,
+):
+    """Build one detector payload as a Scipp ``DataArray``."""
+    sc = _require_scipp()
+    ny, nx = data.shape
+    coords: dict[str, Any] = {
+        "y": sc.array(dims=["y"], values=np.arange(ny, dtype=np.float64)),
+        "x": sc.array(dims=["x"], values=np.arange(nx, dtype=np.float64)),
+        "detector_number": sc.scalar(int(detector_number)),
+    }
+
+    return sc.DataArray(
+        data=sc.array(
+            dims=["y", "x"],
+            values=np.asarray(data, dtype=np.float64),
+            variances=np.square(np.asarray(error, dtype=np.float64)),
+        ),
+        coords=coords,
     )
 
 
@@ -406,7 +551,6 @@ def _require_refs_bundle_definition(handle: h5py.File, entry_path: str, *, file_
 
 
 __all__ = [
-    "DetectorData",
     "NexusRawData",
     "get_roi",
     "list_detector_numbers",
@@ -414,6 +558,7 @@ __all__ = [
     "read_all_detectors",
     "read_configuration",
     "read_count_time_value",
+    "read_deadtime_value",
     "read_empty_beam_transmission_source_file",
     "read_detector",
     "read_detector_data",

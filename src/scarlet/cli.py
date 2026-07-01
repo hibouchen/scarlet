@@ -1,11 +1,96 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import sys
 from pathlib import Path
 
+import h5py
+import numpy as np
+
 from scarlet.validation.schema_loader import load_schema
 from scarlet.validation.schema_validator import ValidationReport, validate_nexus_file
+
+
+@dataclass(frozen=True)
+class _AzimuthalAverageExport:
+    detector_indices: list[int]
+    q: np.ndarray
+    intensity: np.ndarray
+    q_edges: np.ndarray
+    n_pixels: np.ndarray
+
+
+def _read_azimuthal_average_entry(
+    file_path: Path,
+    *,
+    processed_entry: str,
+    detector_indices: list[int] | None,
+    q_min: float | None,
+    q_max: float | None,
+) -> _AzimuthalAverageExport:
+    with h5py.File(file_path, "r") as handle:
+        if processed_entry not in handle:
+            raise ValueError(f"Missing processed entry: {processed_entry}")
+        entry = handle[processed_entry]
+        available = sorted(
+            int(name[4:])
+            for name, group in entry.items()
+            if isinstance(group, h5py.Group) and name.startswith("data") and name[4:].isdigit()
+        )
+        if not available:
+            raise ValueError(f"No NXdata groups found under {processed_entry}")
+        selected = available if detector_indices is None else detector_indices
+        missing = [index for index in selected if index not in available]
+        if missing:
+            raise ValueError(f"Missing detector data for indices {missing} in {processed_entry}")
+        if len(selected) != 1:
+            raise ValueError("azimuthal-average export currently supports one detector at a time")
+
+        group = entry[f"data{selected[0]}"]
+        q = np.asarray(group["Q"][()], dtype=np.float64)
+        intensity = np.asarray(group["I"][()], dtype=np.float64)
+        q_edges = np.asarray(group["Q_edges"][()], dtype=np.float64)
+        n_pixels = np.asarray(group["n_pixels"][()], dtype=np.int64)
+
+    if q.shape != intensity.shape or q.shape != n_pixels.shape:
+        raise ValueError("Reduced azimuthal datasets must share the same 1D shape")
+
+    valid = np.ones(q.shape, dtype=bool)
+    if q_min is not None:
+        valid &= q >= float(q_min)
+    if q_max is not None:
+        valid &= q <= float(q_max)
+    if not np.any(valid):
+        raise ValueError("No azimuthal-average points remain after applying the requested q range")
+
+    return _AzimuthalAverageExport(
+        detector_indices=list(selected),
+        q=q[valid],
+        intensity=intensity[valid],
+        q_edges=q_edges,
+        n_pixels=n_pixels[valid],
+    )
+
+
+def _write_azimuthal_average_csv(
+    file_path: Path,
+    result: _AzimuthalAverageExport,
+    *,
+    overwrite: bool,
+) -> None:
+    output_path = file_path.resolve()
+    if output_path.exists() and not overwrite:
+        raise FileExistsError(f"Refusing to overwrite existing file: {output_path}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    matrix = np.column_stack((result.q, result.intensity, result.n_pixels))
+    np.savetxt(
+        output_path,
+        matrix,
+        delimiter=",",
+        header="Q,I,n_pixels",
+        comments="",
+    )
 
 
 def _cmd_schema_list(_: argparse.Namespace) -> int:
@@ -176,20 +261,16 @@ def _cmd_reduce_2d(args: argparse.Namespace) -> int:
 
 
 def _cmd_azimuthal_average(args: argparse.Namespace) -> int:
-    from scarlet.reduction import azimuthal_average, write_azimuthal_average_csv
-
     detector_indices = None if args.detector is None else list(args.detector)
     try:
-        result = azimuthal_average(
+        result = _read_azimuthal_average_entry(
             Path(args.input),
-            detector_indices=detector_indices,
             processed_entry=args.processed_entry,
-            n_bins=args.bins,
+            detector_indices=detector_indices,
             q_min=args.q_min,
             q_max=args.q_max,
-            q_scale=args.q_scale,
         )
-        write_azimuthal_average_csv(
+        _write_azimuthal_average_csv(
             Path(args.output),
             result,
             overwrite=args.overwrite,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,19 +8,45 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-from scarlet.io import get_roi, read_detector_deadtime, read_empty_beam_transmission_source_file
+from scarlet.io import (
+    get_roi,
+    read_deadtime_value,
+    read_detector,
+    read_detector_data,
+    read_detector_deadtime,
+    read_detector_error,
+    read_detector_pixel_size,
+    read_empty_beam_transmission_source_file,
+)
+from scarlet.reduction.correction import correct_detector_dead_time
 
 
-def _write_test_raw_file(path: Path, *, dataset_name: str | None, value: float | None) -> None:
+def _write_test_raw_file(
+    path: Path,
+    *,
+    dataset_name: str | None,
+    value: float | None,
+    image_data: np.ndarray | None = None,
+    monitor: float = 100.0,
+    count_time: float | None = None,
+    include_pixel_size: bool = False,
+) -> None:
     with h5py.File(path, "w") as f:
         entry = f.create_group("raw_data")
         entry.attrs["NX_class"] = b"NXentry"
         control = entry.create_group("control")
-        control.create_dataset("integral", data=100.0)
+        control.create_dataset("integral", data=float(monitor))
+        if count_time is not None:
+            control.create_dataset("count_time", data=float(count_time))
         instrument = entry.create_group("instrument")
         detector = instrument.create_group("detector0")
         detector.attrs["NX_class"] = b"NXdetector"
-        detector.create_dataset("data", data=np.arange(12, dtype=np.float64).reshape(3, 4))
+        if image_data is None:
+            image_data = np.arange(12, dtype=np.float64).reshape(3, 4)
+        detector.create_dataset("data", data=np.asarray(image_data, dtype=np.float64))
+        if include_pixel_size:
+            detector.create_dataset("x_pixel_size", data=0.001)
+            detector.create_dataset("y_pixel_size", data=0.002)
         if dataset_name is not None:
             detector.create_dataset(dataset_name, data=(float("nan") if value is None else float(value)))
 
@@ -41,6 +68,25 @@ def _write_test_refs_file(path: Path, *, definition: str, source_file: str | Non
 
 
 class TestNexusReader(unittest.TestCase):
+    def test_read_detector_returns_dataarray_or_clear_import_error(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            file_path = Path(td) / "raw.nxs"
+            _write_test_raw_file(file_path, dataset_name=None, value=None, include_pixel_size=True)
+
+            if importlib.util.find_spec("scipp") is None:
+                with self.assertRaisesRegex(ImportError, "scipp is required"):
+                    read_detector(file_path, 0)
+                return
+
+            detector = read_detector(file_path, 0)
+            self.assertEqual(tuple(detector.dims), ("y", "x"))
+            np.testing.assert_allclose(detector.values, np.arange(12, dtype=np.float64).reshape(3, 4))
+            np.testing.assert_allclose(detector.variances, np.arange(12, dtype=np.float64).reshape(3, 4))
+            np.testing.assert_allclose(detector.coords["x"].values, np.arange(4, dtype=np.float64))
+            np.testing.assert_allclose(detector.coords["y"].values, np.arange(3, dtype=np.float64))
+            self.assertNotIn("x_pixel_size", detector.coords)
+            self.assertNotIn("y_pixel_size", detector.coords)
+
     def test_read_detector_deadtime_reads_dead_time_dataset(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             file_path = Path(td) / "raw.nxs"
@@ -48,7 +94,25 @@ class TestNexusReader(unittest.TestCase):
 
             deadtime = read_detector_deadtime(file_path, 0)
 
-            self.assertAlmostEqual(deadtime or 0.0, 1.2e-6)
+            self.assertAlmostEqual(deadtime, 1.2e-6)
+
+    def test_read_deadtime_value_reads_dead_time_dataset(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            file_path = Path(td) / "raw.nxs"
+            _write_test_raw_file(file_path, dataset_name="dead_time", value=1.2e-6)
+
+            deadtime = read_deadtime_value(file_path, 0)
+
+            self.assertAlmostEqual(deadtime, 1.2e-6)
+
+    def test_read_detector_pixel_size_reads_file_metadata_without_exposing_it_as_coords(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            file_path = Path(td) / "raw.nxs"
+            _write_test_raw_file(file_path, dataset_name=None, value=None, include_pixel_size=True)
+
+            pixel_size = read_detector_pixel_size(file_path, 0)
+
+            self.assertEqual(pixel_size, (0.001, 0.002))
 
     def test_read_detector_deadtime_reads_deadtime_dataset(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -57,17 +121,93 @@ class TestNexusReader(unittest.TestCase):
 
             deadtime = read_detector_deadtime(file_path, 0)
 
-            self.assertAlmostEqual(deadtime or 0.0, 2.5e-6)
+            self.assertAlmostEqual(deadtime, 2.5e-6)
 
-    def test_read_detector_deadtime_returns_none_when_missing_or_nan(self) -> None:
+    def test_read_detector_deadtime_returns_zero_when_missing_or_nan(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             missing_file = Path(td) / "missing.nxs"
             nan_file = Path(td) / "nan.nxs"
             _write_test_raw_file(missing_file, dataset_name=None, value=None)
             _write_test_raw_file(nan_file, dataset_name="dead_time", value=None)
 
-            self.assertIsNone(read_detector_deadtime(missing_file, 0))
-            self.assertIsNone(read_detector_deadtime(nan_file, 0))
+            self.assertEqual(read_detector_deadtime(missing_file, 0), 0.0)
+            self.assertEqual(read_detector_deadtime(nan_file, 0), 0.0)
+
+    def test_read_detector_data_can_correct_deadtime_before_monitor_normalization(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            file_path = Path(td) / "raw.nxs"
+            image = np.array([[50.0, 100.0], [25.0, 40.0]], dtype=np.float64)
+            _write_test_raw_file(
+                file_path,
+                dataset_name="dead_time",
+                value=1.0e-2,
+                image_data=image,
+                monitor=10.0,
+                count_time=10.0,
+            )
+
+            corrected = read_detector_data(
+                file_path,
+                0,
+                correct_deadtime=True,
+                normalize_by_monitor=True,
+            )
+
+            expected = correct_detector_dead_time(image, acq_time=10.0, deadtime=1.0e-2) / 10.0
+            np.testing.assert_allclose(corrected, expected)
+
+    def test_read_detector_error_uses_corrected_data_when_deadtime_is_applied(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            file_path = Path(td) / "raw.nxs"
+            image = np.array([[50.0, 100.0], [25.0, 40.0]], dtype=np.float64)
+            _write_test_raw_file(
+                file_path,
+                dataset_name="dead_time",
+                value=1.0e-2,
+                image_data=image,
+                monitor=10.0,
+                count_time=10.0,
+            )
+
+            error = read_detector_error(
+                file_path,
+                0,
+                correct_deadtime=True,
+                normalize_by_monitor=True,
+            )
+
+            expected_data = correct_detector_dead_time(image, acq_time=10.0, deadtime=1.0e-2)
+            np.testing.assert_allclose(error, np.sqrt(expected_data) / 10.0)
+
+    def test_read_detector_data_requires_count_time_for_non_zero_deadtime_correction(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            file_path = Path(td) / "raw.nxs"
+            _write_test_raw_file(file_path, dataset_name="dead_time", value=1.0e-2, count_time=None)
+
+            with self.assertRaisesRegex(ValueError, "count_time"):
+                read_detector_data(file_path, 0, correct_deadtime=True)
+
+    def test_read_detector_accepts_deadtime_correction_option(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            file_path = Path(td) / "raw.nxs"
+            image = np.array([[50.0, 100.0], [25.0, 40.0]], dtype=np.float64)
+            _write_test_raw_file(
+                file_path,
+                dataset_name="dead_time",
+                value=1.0e-2,
+                image_data=image,
+                monitor=10.0,
+                count_time=10.0,
+            )
+
+            if importlib.util.find_spec("scipp") is None:
+                with self.assertRaisesRegex(ImportError, "scipp is required"):
+                    read_detector(file_path, 0, correct_deadtime=True, normalize_by_monitor=True)
+                return
+
+            detector = read_detector(file_path, 0, correct_deadtime=True, normalize_by_monitor=True)
+            expected = correct_detector_dead_time(image, acq_time=10.0, deadtime=1.0e-2) / 10.0
+            np.testing.assert_allclose(detector.values, expected)
 
     def test_read_empty_beam_transmission_source_file_reads_refs_bundle_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as td:

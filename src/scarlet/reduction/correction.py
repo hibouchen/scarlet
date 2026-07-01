@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
+
+if TYPE_CHECKING:
+    import scipp as sc
 
 
 def _as_image(image: Any, *, name: str) -> np.ndarray:
@@ -22,6 +25,57 @@ def _require_positive_scalar(value: float, *, name: str) -> float:
 def _require_same_shape(reference: np.ndarray, other: np.ndarray, *, name: str) -> None:
     if reference.shape != other.shape:
         raise ValueError(f"{name} shape mismatch: expected {reference.shape}, got {other.shape}")
+
+
+def _require_scipp():
+    """Import Scipp lazily so callers only pay the dependency when needed."""
+    try:
+        import scipp as sc
+    except ImportError as exc:
+        raise ImportError("scipp is required to use DataArray-based correction helpers") from exc
+    return sc
+
+
+def _require_dataarray(value: Any, *, name: str, ndim: int | None = None) -> "sc.DataArray":
+    sc = _require_scipp()
+    if not isinstance(value, sc.DataArray):
+        raise TypeError(f"{name} must be a scipp.DataArray, got {type(value).__name__}")
+    if ndim is not None and value.ndim != ndim:
+        raise ValueError(f"{name} must be a {ndim}D DataArray, got shape {value.shape}")
+    return value
+
+
+def _require_positive_scalar_dataarray(value: Any, *, name: str) -> "sc.DataArray":
+    data_array = _require_dataarray(value, name=name, ndim=0)
+    scalar = float(np.asarray(data_array.data.values, dtype=np.float64).reshape(()))
+    if not np.isfinite(scalar) or scalar <= 0.0:
+        raise ValueError(f"{name} must be > 0, got {scalar!r}")
+    return data_array
+
+
+def _require_same_dataarray_shape(reference: "sc.DataArray", other: "sc.DataArray", *, name: str) -> None:
+    if reference.dims != other.dims or reference.shape != other.shape:
+        raise ValueError(f"{name} shape mismatch: expected {reference.shape}, got {other.shape}")
+
+
+def _scalar_data_without_variance(data_array: "sc.DataArray", *, name: str):
+    sc = _require_scipp()
+    scalar = float(np.asarray(data_array.data.values, dtype=np.float64).reshape(()))
+    return sc.scalar(scalar, unit=data_array.data.unit)
+
+
+def _normalize_scalar_transmission(value: Any, *, name: str):
+    sc = _require_scipp()
+    if isinstance(value, sc.DataArray):
+        return _scalar_data_without_variance(
+            _require_positive_scalar_dataarray(value, name=name),
+            name=name,
+        )
+
+    scalar = float(value)
+    if not np.isfinite(scalar) or scalar <= 0.0:
+        raise ValueError(f"{name} must be > 0, got {scalar!r}")
+    return sc.scalar(scalar)
 
 
 def normalize_by_monitor(
@@ -103,50 +157,57 @@ def correct_detector_dead_time(
     if np.any(denominator <= 0.0):
         raise ValueError("dead-time correction is undefined when 1 - rate * deadtime <= 0")
 
-    return rate / denominator * acq_time
+    return rate / denominator
 
 
 def subtract_scattering_references(
-    image: Any,
-    transmission: float,
+    sample: Any,
+    transmission: Any,
     *,
     dark: Any | None = None,
     empty_cell: Any | None = None,
-    empty_cell_transmission: float | None = None,
+    empty_cell_transmission: Any | None = None,
     empty_beam: Any | None = None,
-    empty_beam_transmission: float | None = None,
+    empty_beam_transmission: Any | None = None,
     distance: float | None = None,
     beam_center: tuple[float, float] | None = None,
-) -> np.ndarray:
+) -> "sc.DataArray":
     """
     Apply the current reference subtraction model:
 
-    ``I = (I_sample - dark) / T_sample - (I_empty_cell - dark) / T_empty_cell``
+    ``I = (sample - dark) / T_sample - (empty_cell - dark) / T_empty_cell``
 
     `empty_beam`, `empty_beam_transmission`, `distance` and `beam_center` are
     intentionally kept in the API for future extensions and are not used yet.
     """
-    del empty_beam, empty_beam_transmission, distance, beam_center
+    del distance, beam_center
 
-    sample = _as_image(image, name="image")
-    sample_transmission = _require_positive_scalar(transmission, name="transmission")
+    sample = _require_dataarray(sample, name="sample", ndim=2)
+    transmission = _normalize_scalar_transmission(transmission, name="transmission")
 
-    dark_image = np.zeros_like(sample, dtype=np.float64)
+    dark_image = sample * 0.0
     if dark is not None:
-        dark_image = _as_image(dark, name="dark")
-        _require_same_shape(sample, dark_image, name="dark")
+        dark_image = _require_dataarray(dark, name="dark", ndim=2)
+        _require_same_dataarray_shape(sample, dark_image, name="dark")
 
-    result = (sample - dark_image) / sample_transmission
+    if empty_beam is not None:
+        empty_beam = _require_dataarray(empty_beam, name="empty_beam", ndim=2)
+        _require_same_dataarray_shape(sample, empty_beam, name="empty_beam")
+    if empty_beam_transmission is not None:
+        pass
 
-    if empty_cell is not None:
-        if empty_cell_transmission is None:
-            raise ValueError("empty_cell_transmission is required when empty_cell is provided")
-        empty_cell_image = _as_image(empty_cell, name="empty_cell")
-        _require_same_shape(sample, empty_cell_image, name="empty_cell")
-        empty_cell_t = _require_positive_scalar(
-            empty_cell_transmission,
-            name="empty_cell_transmission",
-        )
-        result -= (empty_cell_image - dark_image) / empty_cell_t
+    result = (sample - dark_image) / transmission
 
-    return result
+    if empty_cell is None:
+        return result
+
+    if empty_cell_transmission is None:
+        raise ValueError("empty_cell_transmission is required when empty_cell is provided")
+    empty_cell_transmission = _normalize_scalar_transmission(
+        empty_cell_transmission,
+        name="empty_cell_transmission",
+    )
+
+    empty_cell = _require_dataarray(empty_cell, name="empty_cell", ndim=2)
+    _require_same_dataarray_shape(sample, empty_cell, name="empty_cell")
+    return result - (empty_cell - dark_image) / empty_cell_transmission

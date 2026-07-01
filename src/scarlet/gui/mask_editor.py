@@ -111,11 +111,15 @@ def _write_configuration_snapshot(entry: h5py.Group, configuration: Configuratio
     cfg.attrs["NX_class"] = np.bytes_("NXcollection")
     if np.isfinite(configuration.wavelength):
         _write_dataset(cfg, "wavelength", float(configuration.wavelength))
-    if isinstance(configuration.sample_detector_distance, list):
-        if len(configuration.sample_detector_distance) == 1 and np.isfinite(configuration.sample_detector_distance[0]):
-            _write_dataset(cfg, "sample_detector_distance", float(configuration.sample_detector_distance[0]))
-    elif np.isfinite(configuration.sample_detector_distance):
-        _write_dataset(cfg, "sample_detector_distance", float(configuration.sample_detector_distance))
+    sample_detector_distance = configuration.sample_detector_distance
+    if isinstance(sample_detector_distance, list):
+        values = np.asarray(sample_detector_distance, dtype=np.float64)
+        if values.size == 1 and np.isfinite(values[0]):
+            _write_dataset(cfg, "sample_detector_distance", float(values[0]))
+        elif values.size > 1 and np.all(np.isfinite(values)):
+            _write_dataset(cfg, "sample_detector_distance", values)
+    elif np.isfinite(sample_detector_distance):
+        _write_dataset(cfg, "sample_detector_distance", float(sample_detector_distance))
     if configuration.notes:
         _write_dataset(cfg, "notes", configuration.notes)
 

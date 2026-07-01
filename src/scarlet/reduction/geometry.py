@@ -5,71 +5,50 @@ from typing import Any
 import numpy as np
 
 
+def _require_positive_scalar(value: float, *, name: str) -> float:
+    scalar = float(value)
+    if not np.isfinite(scalar) or scalar <= 0.0:
+        raise ValueError(f"{name} must be > 0, got {value!r}")
+    return scalar
+
+
+def _normalize_pixel_size(pixel_size: float | tuple[float, float]) -> tuple[float, float]:
+    if isinstance(pixel_size, tuple):
+        return (
+            _require_positive_scalar(pixel_size[0], name="pixel_size_x"),
+            _require_positive_scalar(pixel_size[1], name="pixel_size_y"),
+        )
+    value = _require_positive_scalar(pixel_size, name="pixel_size")
+    return value, value
+
+
+def _as_image_shape(image: Any) -> tuple[int, int]:
+    shape = np.asarray(image).shape
+    if len(shape) != 2:
+        raise ValueError(f"image must be a 2D array, got shape {shape}")
+    return int(shape[0]), int(shape[1])
+
+
 def _detector_coordinates(
     image: Any,
     beam_center: tuple[float, float],
+    *,
     detector_distance: float,
     pixel_size: float | tuple[float, float],
-) -> tuple[tuple[np.ndarray, np.ndarray], float]:
-    data = np.asarray(image, dtype=np.float64)
-    if data.ndim != 2:
-        raise ValueError(f"image must be a 2D array, got shape {data.shape}")
-
-    distance = float(detector_distance)
-    if not np.isfinite(distance) or distance <= 0.0:
-        raise ValueError(f"detector_distance must be > 0, got {detector_distance!r}")
+) -> tuple[tuple[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]]:
+    ny, nx = _as_image_shape(image)
+    distance = _require_positive_scalar(detector_distance, name="detector_distance")
+    pixel_size_x, pixel_size_y = _normalize_pixel_size(pixel_size)
 
     beam_center_x = float(beam_center[0])
     beam_center_y = float(beam_center[1])
     if not np.isfinite(beam_center_x) or not np.isfinite(beam_center_y):
         raise ValueError(f"beam_center must contain finite coordinates, got {beam_center!r}")
 
-    if isinstance(pixel_size, tuple):
-        pixel_size_x = float(pixel_size[0])
-        pixel_size_y = float(pixel_size[1])
-    else:
-        pixel_size_x = float(pixel_size)
-        pixel_size_y = float(pixel_size)
-    if not np.isfinite(pixel_size_x) or pixel_size_x <= 0.0:
-        raise ValueError(f"pixel_size_x must be > 0, got {pixel_size_x!r}")
-    if not np.isfinite(pixel_size_y) or pixel_size_y <= 0.0:
-        raise ValueError(f"pixel_size_y must be > 0, got {pixel_size_y!r}")
-
-    ny, nx = data.shape
     x = (np.arange(nx, dtype=np.float64) - beam_center_x) * pixel_size_x
     y = (np.arange(ny, dtype=np.float64) - beam_center_y) * pixel_size_y
-    return np.meshgrid(x, y), distance
-
-
-def _detector_axis_vectors(
-    image: Any,
-    beam_center: tuple[float, float],
-    pixel_size: float | tuple[float, float],
-) -> tuple[np.ndarray, np.ndarray]:
-    data = np.asarray(image, dtype=np.float64)
-    if data.ndim != 2:
-        raise ValueError(f"image must be a 2D array, got shape {data.shape}")
-
-    beam_center_x = float(beam_center[0])
-    beam_center_y = float(beam_center[1])
-    if not np.isfinite(beam_center_x) or not np.isfinite(beam_center_y):
-        raise ValueError(f"beam_center must contain finite coordinates, got {beam_center!r}")
-
-    if isinstance(pixel_size, tuple):
-        pixel_size_x = float(pixel_size[0])
-        pixel_size_y = float(pixel_size[1])
-    else:
-        pixel_size_x = float(pixel_size)
-        pixel_size_y = float(pixel_size)
-    if not np.isfinite(pixel_size_x) or pixel_size_x <= 0.0:
-        raise ValueError(f"pixel_size_x must be > 0, got {pixel_size_x!r}")
-    if not np.isfinite(pixel_size_y) or pixel_size_y <= 0.0:
-        raise ValueError(f"pixel_size_y must be > 0, got {pixel_size_y!r}")
-
-    ny, nx = data.shape
-    x = (np.arange(nx, dtype=np.float64) - beam_center_x) * pixel_size_x
-    y = (np.arange(ny, dtype=np.float64) - beam_center_y) * pixel_size_y
-    return x, y
+    xx, yy = np.meshgrid(x, y)
+    return (xx, yy), (x, y)
 
 
 def compute_qx_vector(
@@ -80,21 +59,17 @@ def compute_qx_vector(
     wavelength: float,
 ) -> np.ndarray:
     """
-    Return the 1D Qx values along the horizontal detector axis.
-
-    The values are computed on the beam-center row, i.e. with ``y = 0``.
+    Return the qx values sampled along the detector X axis through the beam center.
     """
-    distance = float(detector_distance)
-    if not np.isfinite(distance) or distance <= 0.0:
-        raise ValueError(f"detector_distance must be > 0, got {detector_distance!r}")
-
-    lam = float(wavelength)
-    if not np.isfinite(lam) or lam <= 0.0:
-        raise ValueError(f"wavelength must be > 0, got {wavelength!r}")
-
-    x, _ = _detector_axis_vectors(image, beam_center, pixel_size)
-    ray_length = np.sqrt(x * x + distance * distance)
-    return (2.0 * np.pi / lam) * (x / ray_length)
+    (_, _), (x, _) = _detector_coordinates(
+        image,
+        beam_center,
+        detector_distance=detector_distance,
+        pixel_size=pixel_size,
+    )
+    lam = _require_positive_scalar(wavelength, name="wavelength")
+    two_theta_x = np.arctan2(x, float(detector_distance))
+    return (4.0 * np.pi / lam) * np.sin(0.5 * two_theta_x)
 
 
 def compute_qy_vector(
@@ -105,21 +80,17 @@ def compute_qy_vector(
     wavelength: float,
 ) -> np.ndarray:
     """
-    Return the 1D Qy values along the vertical detector axis.
-
-    The values are computed on the beam-center column, i.e. with ``x = 0``.
+    Return the qy values sampled along the detector Y axis through the beam center.
     """
-    distance = float(detector_distance)
-    if not np.isfinite(distance) or distance <= 0.0:
-        raise ValueError(f"detector_distance must be > 0, got {detector_distance!r}")
-
-    lam = float(wavelength)
-    if not np.isfinite(lam) or lam <= 0.0:
-        raise ValueError(f"wavelength must be > 0, got {wavelength!r}")
-
-    _, y = _detector_axis_vectors(image, beam_center, pixel_size)
-    ray_length = np.sqrt(y * y + distance * distance)
-    return (2.0 * np.pi / lam) * (y / ray_length)
+    (_, _), (_, y) = _detector_coordinates(
+        image,
+        beam_center,
+        detector_distance=detector_distance,
+        pixel_size=pixel_size,
+    )
+    lam = _require_positive_scalar(wavelength, name="wavelength")
+    two_theta_y = np.arctan2(y, float(detector_distance))
+    return (4.0 * np.pi / lam) * np.sin(0.5 * two_theta_y)
 
 
 def compute_theta_map(
@@ -129,18 +100,19 @@ def compute_theta_map(
     pixel_size: float | tuple[float, float],
 ) -> np.ndarray:
     """
-    Return the half-scattering angle theta map for a detector image.
+    Return the Bragg angle theta map for a detector image.
 
-    The returned angles are in radians.
+    The returned angle is half of the scattering angle 2theta.
     """
-    (xx, yy), distance = _detector_coordinates(
+    (xx, yy), _ = _detector_coordinates(
         image,
         beam_center,
-        detector_distance,
-        pixel_size,
+        detector_distance=detector_distance,
+        pixel_size=pixel_size,
     )
     radial_distance = np.sqrt(xx * xx + yy * yy)
-    return 0.5 * np.arctan2(radial_distance, distance)
+    two_theta = np.arctan2(radial_distance, float(detector_distance))
+    return 0.5 * two_theta
 
 
 def compute_chi_map(
@@ -176,10 +148,7 @@ def compute_q_norm_map(
     flat plane perpendicular to the direct beam. The beam center is expressed
     in pixel coordinates `(x, y)`.
     """
-    lam = float(wavelength)
-    if not np.isfinite(lam) or lam <= 0.0:
-        raise ValueError(f"wavelength must be > 0, got {wavelength!r}")
-
+    lam = _require_positive_scalar(wavelength, name="wavelength")
     theta = compute_theta_map(
         image,
         beam_center,

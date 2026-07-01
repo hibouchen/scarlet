@@ -176,7 +176,6 @@ def compute_reference_transmissions(
     *,
     refs_entry_path: str = "/entry",
 ) -> dict[str, float]:
-    """Backward-compatible wrapper around :mod:`scarlet.workflow.reference`."""
-    from scarlet.workflow.reference import compute_reference_transmissions as _compute_reference_transmissions
-
-    return _compute_reference_transmissions(refs_file_path, refs_entry_path=refs_entry_path)
+    """Reference-transmission workflow is currently disabled."""
+    del refs_file_path, refs_entry_path
+    raise NotImplementedError("compute_reference_transmissions is unavailable because scarlet.workflow.reference was removed")

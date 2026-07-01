@@ -1,522 +1,110 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional, TypeVar, cast
+import re
+from typing import TYPE_CHECKING, Any, Callable, TypeVar, cast
 
 import h5py
 import numpy as np
 
-from scarlet.io.nexus_reader import (
-    get_roi,
-    read_all_detectors,
-    read_configuration,
-    read_detector_pixel_size,
-    read_empty_beam_transmission_source_file,
-    resolve_entry_path,
-)
+from scarlet.io import nexus_reader
+from scarlet.io.nexus_reader import read_configuration, resolve_entry_path
 from scarlet.reduction.correction import normalize_by_solid_angle, subtract_scattering_references
 from scarlet.reduction.geometry import compute_q_norm_map
 from scarlet.reduction.integration import azimuthal_average
-from scarlet.reduction.transmission import compute_transmission
-from scarlet.workflow.reference import (
-    compute_corrected_water_scattering,
-    compute_reference_transmissions,
-)
+from scarlet.workflow.configuration import Configuration
+from scarlet.workflow.context import RunKey, WorkflowContext
+from scarlet.workflow.normalization import load_flatfield_file
 
+if TYPE_CHECKING:
+    import scipp as sc
 
 StepFunction = Callable[["ReductionState"], "ReductionState"]
 _F = TypeVar("_F", bound=StepFunction)
 
 
-@dataclass(frozen=True)
-class PipelineData:
-    data: np.ndarray
-    data_error: np.ndarray | None
-    x: np.ndarray | None
-    x_error: float | None
-    y: np.ndarray | None
-    y_error: float | None
-    mask: np.ndarray | None = None
-
-
-@dataclass(frozen=True)
-class ReductionInputs:
-    sample_file_scattering: str
-    sample_file_transmission: str
-    sample_transmission: float | None = None
-    ref_sub_file: str = ""
-    ref_norm_file: str = ""
-
-
 @dataclass
 class ReductionState:
-    inputs: ReductionInputs
-    detectors: dict[int, PipelineData] = field(default_factory=dict)
-    water_corrected_detectors: dict[int, np.ndarray] = field(default_factory=dict)
-    data: np.ndarray | None = None
-    data_error: np.ndarray | None = None
-    x: np.ndarray | None = None
-    x_error: np.ndarray | None = None
-    y: np.ndarray | None = None
-    y_error: np.ndarray | None = None
+    sample_name: str
+    config_id: str
+    workflow: WorkflowContext
+    transmission: float = field(default_factory=float)
+    azimuthal_n_bins: int = 200
+    azimuthal_q_scale: str = "linear"
+    detectors: dict[int, Any] = field(default_factory=dict)
     reductions_steps: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    file_path: str = field(default_factory=str)
 
-
-@dataclass(frozen=True)
-class ReductionStep:
-    name: str
-    fn: StepFunction
-
-
-def reduction_step(name: str) -> Callable[[_F], _F]:
-    """Attach a pipeline step name to a state-transform function."""
-    def decorator(fn: _F) -> _F:
-        setattr(fn, "_reduction_step_name", name)
-        return fn
-
-    return decorator
-
-
-def as_reduction_step(fn: StepFunction) -> ReductionStep:
-    """Convert a decorated state-transform function into a ``ReductionStep``."""
-    name = getattr(fn, "_reduction_step_name", None)
-    if not isinstance(name, str) or not name:
-        raise ValueError(f"Function {fn.__name__} is not decorated with @reduction_step")
-    return ReductionStep(name=name, fn=cast(StepFunction, fn))
-
-
-@dataclass(frozen=True)
-class ReductionPipeline:
-    steps: tuple[ReductionStep, ...] = field(default_factory=tuple)
-
-    @classmethod
-    def default(cls) -> "ReductionPipeline":
-        return cls(
-            steps=(
-                as_reduction_step(check_inputs),
-                as_reduction_step(check_ref_sub_file),
-                as_reduction_step(check_ref_norm_file),
-                as_reduction_step(compute_transmission_step),
-                as_reduction_step(subtract_references_step),
-                as_reduction_step(normalize_by_water_step),
-                as_reduction_step(azimutal_averaging_step),
+    def __post_init__(self):
+        file_path = self.workflow.get_run_path(
+            RunKey(
+                config_id=self.config_id,
+                entity="sample",
+                mode="scattering",
+                sample_name=self.sample_name,
             )
         )
-    
-    @classmethod
-    def without_water_correction(cls) -> "ReductionPipeline":
-        return cls(
-            steps=(
-                as_reduction_step(check_inputs),
-                as_reduction_step(check_ref_sub_file),
-                as_reduction_step(compute_transmission_step),
-                as_reduction_step(subtract_references_step),
-                as_reduction_step(azimutal_averaging_step),
+        if file_path:
+            self.detectors = nexus_reader.read_all_detectors(
+                file_path,
+                normalize_by_monitor=True,
+                correct_deadtime=True,
             )
-        )
-    
-    @classmethod
-    def only_azimuthal_averaging(cls) -> "ReductionPipeline":
-        return cls(
-            steps=(
-                as_reduction_step(check_inputs),
-                as_reduction_step(check_ref_sub_file),
-                as_reduction_step(azimutal_averaging_step),
-            )
-        )
+            self.file_path = str(file_path)
+            self.notes.append("Loaded data corrected by the deadtime and the monitor")
+        if not self.transmission:
+            self.transmission = self.workflow.get_transmission(sample_name=self.sample_name, config_id=self.config_id)
 
-    @property
-    def step_names(self) -> tuple[str, ...]:
-        return tuple(step.name for step in self.steps)
-
-    def run(self, inputs: ReductionInputs) -> ReductionState:
-        state = ReductionState(inputs=inputs)
-        for step in self.steps:
-            state = step.fn(state)
-            state.reductions_steps.append(step.name)
-        return state
-    
-@reduction_step("check inputs")
-def check_inputs(state: ReductionState) -> ReductionState:
-    if not state.inputs.sample_file_scattering:
-        raise ValueError("sample_file_scattering is required")
-    if not state.inputs.sample_file_transmission:
-        state.inputs = replace(
-            state.inputs,
-            sample_file_transmission=state.inputs.sample_file_scattering,
-        )
-    return _set_state_detectors(
-        state,
-        _load_sample_detectors(state.inputs.sample_file_scattering),
-    )
+def _require_scipp():
+    try:
+        import scipp as sc
+    except ImportError as exc:
+        raise ImportError("scipp is required to use workflow pipeline steps on detector DataArrays") from exc
+    return sc
 
 
-@reduction_step("check reference subtraction file")
-def check_ref_sub_file(state: ReductionState) -> ReductionState:
-    if not state.inputs.ref_sub_file:
-        raise ValueError("ref_sub_file is required for reference subtraction")
-    compute_reference_transmissions(state.inputs.ref_sub_file)
-    if not state.detectors:
-        state = _set_state_detectors(
-            state,
-            _load_sample_detectors(state.inputs.sample_file_scattering),
-        )
-
-    masked_detectors: dict[int, PipelineData] = {}
-    for detector_number, detector in sorted(state.detectors.items()):
-        merged_mask = _combine_masks(
-            detector.mask,
-            _read_reference_mask(
-                state.inputs.ref_sub_file,
-                detector_number=detector_number,
-            ),
-        )
-        masked_detectors[detector_number] = PipelineData(
-            data=detector.data,
-            data_error=detector.data_error,
-            x=detector.x,
-            x_error=detector.x_error,
-            y=detector.y,
-            y_error=detector.y_error,
-            mask=merged_mask,
-        )
-    return _set_state_detectors(state, masked_detectors)
+def _require_dataarray(value: Any, *, name: str, ndim: int | None = None) -> "sc.DataArray":
+    sc = _require_scipp()
+    if not isinstance(value, sc.DataArray):
+        raise TypeError(f"{name} must be a scipp.DataArray, got {type(value).__name__}")
+    if ndim is not None and value.ndim != ndim:
+        raise ValueError(f"{name} must be a {ndim}D DataArray, got shape {value.shape}")
+    return value
 
 
-@reduction_step("check reference normalization file")
-def check_ref_norm_file(state: ReductionState) -> ReductionState:
-    if not state.inputs.ref_norm_file:
-        raise ValueError("ref_norm_file is required for normalization")
-    compute_reference_transmissions(state.inputs.ref_norm_file)
-    state.water_corrected_detectors = compute_corrected_water_scattering(state.inputs.ref_norm_file)
-
-    return state
-
-
-@reduction_step("compute transmission")
-def compute_transmission_step(state: ReductionState) -> ReductionState:
-    if state.inputs.sample_transmission is not None:
-        return state
-    eb_tr_path = read_empty_beam_transmission_source_file(state.inputs.ref_sub_file)
-    roi, detnum = get_roi(state.inputs.ref_sub_file)
-    transmission_source = state.inputs.sample_file_transmission or state.inputs.sample_file_scattering
-    transmission = compute_transmission(
-        transmission_source,
-        eb_tr_path,
-        roi,
-        detector_number=detnum,
-    )
-    state.inputs = replace(state.inputs, sample_transmission=transmission)
-    return state
+def _read_state_configuration(state: ReductionState) -> Configuration:
+    configuration = state.workflow.configurations.get(state.config_id)
+    if isinstance(configuration, Configuration):
+        return configuration
+    if not state.file_path:
+        raise ValueError(f"Missing sample scattering file for config {state.config_id!r}")
+    configuration, _issues = read_configuration(state.file_path)
+    state.workflow.configurations[state.config_id] = configuration
+    return configuration
 
 
-@reduction_step("subtract references")
-def subtract_references_step(state: ReductionState) -> ReductionState:
-    if state.inputs.sample_transmission is None:
-        raise ValueError("sample_transmission must be defined before subtracting references")
+def _get_detector_distance(configuration: Configuration, *, detector_number: int) -> float:
+    distance = configuration.sample_detector_distance
+    if isinstance(distance, list):
+        if detector_number >= len(distance):
+            raise ValueError(f"Missing sample_detector_distance for detector{detector_number}")
+        value = distance[detector_number]
+    else:
+        value = distance
 
-    if not state.detectors:
-        state = _set_state_detectors(
-            state,
-            _load_sample_detectors(state.inputs.sample_file_scattering),
-        )
-    empty_cell_transmission = _read_reference_transmission(
-        state.inputs.ref_sub_file,
-        "empty_cell_scattering",
-    )
-    if empty_cell_transmission is None:
-        empty_cell_transmission = _read_reference_transmission(
-            state.inputs.ref_sub_file,
-            "empty_cell_transmission",
-        )
-
-    corrected_detectors: dict[int, PipelineData] = {}
-    for detector_number, sample_detector in sorted(state.detectors.items()):
-        dark = _read_reference_detector_data(state.inputs.ref_sub_file, "dark", detector_number=detector_number)
-        empty_cell = _read_reference_detector_data(
-            state.inputs.ref_sub_file,
-            "empty_cell_scattering",
-            detector_number=detector_number,
-        )
-        if sample_detector.data_error is None:
-            raise ValueError(f"sample detector error is required for detector{detector_number} reference subtraction")
-        mask = _combine_masks(
-            sample_detector.mask,
-            _read_reference_mask(
-                state.inputs.ref_sub_file,
-                detector_number=detector_number,
-            ),
-        )
-
-        if empty_cell is not None and empty_cell_transmission is None:
-            raise ValueError("empty_cell transmission is required when empty_cell_scattering is present")
-
-        corrected = subtract_scattering_references(
-            sample_detector.data,
-            state.inputs.sample_transmission,
-            dark=None if dark is None else dark.data,
-            empty_cell=None if empty_cell is None else empty_cell.data,
-            empty_cell_transmission=empty_cell_transmission,
-        )
-        if mask is not None and mask.shape != corrected.shape:
-            raise ValueError(
-                f"Reference mask shape mismatch for detector{detector_number}: "
-                f"expected {corrected.shape}, got {mask.shape}"
-            )
-
-        corrected_variance = np.square(sample_detector.data_error) / (state.inputs.sample_transmission ** 2)
-        if dark is not None and empty_cell is None:
-            corrected_variance += np.square(dark.data_error) / (state.inputs.sample_transmission ** 2)
-        elif dark is not None and empty_cell is not None:
-            corrected_variance += np.square(dark.data_error) * np.square(
-                (1.0 / empty_cell_transmission) - (1.0 / state.inputs.sample_transmission)
-            )
-        if empty_cell is not None:
-            corrected_variance += np.square(empty_cell.data_error) / (empty_cell_transmission ** 2)
-
-        beam_center = _read_detector_beam_center(
-            state.inputs.ref_sub_file,
-            detector_number=detector_number,
-        )
-        pixel_size = read_detector_pixel_size(
-            state.inputs.sample_file_scattering,
-            detector_number=detector_number,
-        )
-        if pixel_size is None:
-            raise ValueError("pixel_size is required to normalize the subtracted data by solid angle")
-        detector_distance = _read_sample_detector_distance(
-            state.inputs.ref_sub_file,
-            detector_number=detector_number,
-        )
-        solid_angle_correction = normalize_by_solid_angle(
-            np.ones_like(corrected, dtype=np.float64),
-            detector_distance=detector_distance,
-            beam_center=beam_center,
-            pixel_size=pixel_size,
-        )
-        corrected_detectors[detector_number] = PipelineData(
-            data=corrected * solid_angle_correction,
-            data_error=np.sqrt(corrected_variance) * solid_angle_correction,
-            x=None,
-            x_error=None,
-            y=None,
-            y_error=None,
-            mask=mask,
-        )
-
-    return _set_state_detectors(state, corrected_detectors)
+    distance_value = float(value)
+    if not np.isfinite(distance_value) or distance_value <= 0.0:
+        raise ValueError(f"Invalid sample_detector_distance for detector{detector_number}: {distance_value!r}")
+    return distance_value
 
 
-@reduction_step("flatfield correction")
-def normalize_by_water_step(state: ReductionState) -> ReductionState:
-    water_corrected_detectors = state.water_corrected_detectors
-    if not water_corrected_detectors:
-        water_corrected_detectors = compute_corrected_water_scattering(state.inputs.ref_norm_file)
-        state.water_corrected_detectors = water_corrected_detectors
-
-    normalized_detectors: dict[int, PipelineData] = {}
-    for detector_number, detector in sorted(state.detectors.items()):
-        water_corrected = water_corrected_detectors.get(detector_number)
-        if water_corrected is None:
-            raise ValueError(f"Missing water_corrected for detector{detector_number} in {state.inputs.ref_norm_file}")
-        if water_corrected.shape != detector.data.shape:
-            raise ValueError(
-                f"water_corrected shape mismatch for detector{detector_number}: "
-                f"expected {detector.data.shape}, got {water_corrected.shape}"
-            )
-
-        ref_norm_mask = _read_reference_mask(
-            state.inputs.ref_norm_file,
-            detector_number=detector_number,
-        )
-        merged_mask = _combine_masks(detector.mask, ref_norm_mask)
-        invalid_water = ~np.isfinite(water_corrected) | (water_corrected <= 0.0)
-        merged_mask = _combine_masks(merged_mask, invalid_water.astype(np.uint8))
-        merged_mask_bool = None if merged_mask is None else np.asarray(merged_mask, dtype=bool)
-
-        safe_water_corrected = water_corrected
-        if merged_mask_bool is not None:
-            safe_water_corrected = np.array(water_corrected, copy=True)
-            safe_water_corrected[merged_mask_bool] = 1.0
-
-        normalized_data = detector.data / safe_water_corrected
-        normalized_error = None
-        if detector.data_error is not None:
-            normalized_error = detector.data_error / np.abs(safe_water_corrected)
-
-        if merged_mask_bool is not None:
-            normalized_data = np.array(normalized_data, copy=True)
-            normalized_data[merged_mask_bool] = np.nan
-            if normalized_error is not None:
-                normalized_error = np.array(normalized_error, copy=True)
-                normalized_error[merged_mask_bool] = np.nan
-
-        normalized_detectors[detector_number] = PipelineData(
-            data=normalized_data,
-            data_error=normalized_error,
-            x=detector.x,
-            x_error=detector.x_error,
-            y=detector.y,
-            y_error=detector.y_error,
-            mask=merged_mask,
-        )
-
-    return _set_state_detectors(state, normalized_detectors)
-
-
-@reduction_step("azimuthal averaging")
-def azimutal_averaging_step(state: ReductionState) -> ReductionState:
-    integrated_detectors: dict[int, PipelineData] = {}
-    wavelength = _read_wavelength(state.inputs.ref_sub_file)
-
-    for detector_number, detector in sorted(state.detectors.items()):
-        beam_center = _read_detector_beam_center(
-            state.inputs.ref_sub_file,
-            detector_number=detector_number,
-        )
-        pixel_size = read_detector_pixel_size(
-            state.inputs.sample_file_scattering,
-            detector_number=detector_number,
-        )
-        if pixel_size is None:
-            raise ValueError(f"pixel_size is required for detector{detector_number} azimuthal averaging")
-        detector_distance = _read_sample_detector_distance(
-            state.inputs.ref_sub_file,
-            detector_number=detector_number,
-        )
-        q_map = compute_q_norm_map(
-            detector.data,
-            beam_center=beam_center,
-            detector_distance=detector_distance,
-            pixel_size=pixel_size,
-            wavelength=wavelength,
-        )
-        integration = azimuthal_average(
-            detector.data,
-            q_map,
-            mask=detector.mask,
-            intensity_error=detector.data_error,
-        )
-        integrated_detectors[detector_number] = PipelineData(
-            data=integration.intensity,
-            data_error=integration.intensity_error,
-            x=integration.q,
-            x_error=integration.q_error,
-            y=None,
-            y_error=None,
-            mask=None,
-        )
-
-    return _set_state_detectors(state, integrated_detectors)
-
-
-def _load_sample_detectors(sample_file_scattering: str | Path) -> dict[int, PipelineData]:
-    sample_detectors = read_all_detectors(
-        sample_file_scattering,
-        normalize_by_monitor=True,
-    )
-    return {
-        detector_number: PipelineData(
-            data=sample_detector.data,
-            data_error=sample_detector.error,
-            x=None,
-            x_error=None,
-            y=None,
-            y_error=None,
-            mask=None,
-        )
-        for detector_number, sample_detector in sorted(sample_detectors.items())
-    }
-
-
-def _set_state_detectors(
-    state: ReductionState,
-    detectors: dict[int, PipelineData],
-) -> ReductionState:
-    state.detectors = detectors
-    primary_detector_number = 0 if 0 in detectors else next(iter(detectors), None)
-    if primary_detector_number is None:
-        state.data = None
-        state.data_error = None
-        state.x = None
-        state.x_error = None
-        state.y = None
-        state.y_error = None
-        return state
-
-    primary = detectors[primary_detector_number]
-    state.data = primary.data
-    state.data_error = primary.data_error
-    state.x = primary.x
-    state.x_error = primary.x_error
-    state.y = primary.y
-    state.y_error = primary.y_error
-    return state
-
-
-def _combine_masks(
-    base_mask: np.ndarray | None,
-    extra_mask: np.ndarray | None,
-) -> np.ndarray | None:
-    if base_mask is None and extra_mask is None:
-        return None
-    if base_mask is None:
-        return np.asarray(extra_mask, dtype=np.uint8)
-    if extra_mask is None:
-        return np.asarray(base_mask, dtype=np.uint8)
-
-    base = np.asarray(base_mask, dtype=bool)
-    extra = np.asarray(extra_mask, dtype=bool)
-    if base.shape != extra.shape:
-        raise ValueError(f"Mask shape mismatch: expected {base.shape}, got {extra.shape}")
-    return np.logical_or(base, extra).astype(np.uint8)
-
-
-def _read_reference_detector_data(
-    refs_file_path: str | Path,
-    reference_name: str,
-    *,
-    detector_number: int,
-) -> PipelineData | None:
-    refs_file_path = Path(refs_file_path).resolve()
-    refs_entry_path = resolve_entry_path(refs_file_path)
-
-    with h5py.File(refs_file_path, "r") as handle:
-        reference_entry_path = f"{refs_entry_path}/references/{reference_name}/entry"
-        data_path = f"{reference_entry_path}/instrument/detector{detector_number}/data"
-        monitor_path = f"{reference_entry_path}/control/integral"
-        if data_path not in handle:
-            return None
-        if monitor_path not in handle:
-            raise ValueError(f"Missing monitor integral for reference {reference_name!r}: {monitor_path}")
-
-        raw_data = np.asarray(handle[data_path][()], dtype=np.float64)
-        if raw_data.ndim != 2:
-            raise ValueError(f"Reference detector data must be 2D at {data_path}, got shape {raw_data.shape}")
-
-        monitor = float(np.asarray(handle[monitor_path][()]).reshape(()))
-        if not np.isfinite(monitor) or monitor <= 0.0:
-            raise ValueError(f"Reference monitor integral must be > 0 at {monitor_path}")
-
-        data = raw_data / monitor
-        error = np.sqrt(np.clip(raw_data, 0.0, None)) / monitor
-        return PipelineData(data=data, data_error=error, x=None, x_error=None, y=None, y_error=None)
-
-
-def _read_reference_transmission(refs_file_path: str | Path, reference_name: str) -> float | None:
-    refs_file_path = Path(refs_file_path).resolve()
-    refs_entry_path = resolve_entry_path(refs_file_path)
-
-    with h5py.File(refs_file_path, "r") as handle:
-        dataset_path = f"{refs_entry_path}/references/{reference_name}/entry/sample/transmission"
-        if dataset_path not in handle:
-            return None
-        value = float(np.asarray(handle[dataset_path][()]).reshape(()))
-        if not np.isfinite(value) or value <= 0.0:
-            raise ValueError(f"Reference transmission must be > 0 at {dataset_path}")
-        return value
+def _get_wavelength(configuration: Configuration) -> float:
+    wavelength = float(configuration.wavelength)
+    if not np.isfinite(wavelength) or wavelength <= 0.0:
+        raise ValueError(f"Invalid wavelength in configuration {configuration.config_id!r}: {wavelength!r}")
+    return wavelength
 
 
 def _read_detector_beam_center(
@@ -537,58 +125,562 @@ def _read_detector_beam_center(
             beam_center_y_path = f"{fallback_root}/beam_center_y"
         if beam_center_x_path not in handle or beam_center_y_path not in handle:
             raise ValueError(f"Missing beam center for detector{detector_number} in {file_path}")
-
         return (
             float(np.asarray(handle[beam_center_x_path][()]).reshape(())),
             float(np.asarray(handle[beam_center_y_path][()]).reshape(())),
         )
 
 
-def _read_reference_mask(
-    refs_file_path: str | Path,
+def _get_beam_center(state: ReductionState, *, detector_number: int) -> tuple[float, float]:
+    beam_center = state.workflow.get_beam_center(state.config_id, detector_number)
+    if beam_center is not None:
+        return beam_center
+    if not state.file_path:
+        raise ValueError(f"Missing sample scattering file for detector{detector_number} beam center lookup")
+    beam_center = _read_detector_beam_center(state.file_path, detector_number=detector_number)
+    state.workflow.set_beam_center(state.config_id, detector_number, beam_center)
+    return beam_center
+
+
+def _get_detector_pixel_size(state: ReductionState, *, detector_number: int) -> tuple[float, float]:
+    if not state.file_path:
+        raise ValueError(f"Missing sample scattering file for detector{detector_number} pixel-size lookup")
+    pixel_size = nexus_reader.read_detector_pixel_size(state.file_path, detector_number)
+    if pixel_size is None:
+        raise ValueError(f"pixel_size is required for detector{detector_number} azimuthal averaging")
+    return pixel_size
+
+
+def _apply_workflow_mask(
+    detector: "sc.DataArray",
     *,
-    detector_number: int,
-) -> np.ndarray | None:
-    refs_file_path = Path(refs_file_path).resolve()
-    refs_entry_path = resolve_entry_path(refs_file_path)
+    mask: np.ndarray | None,
+    name: str = "workflow_config",
+) -> "sc.DataArray":
+    """Attach one workflow-level boolean mask to a detector DataArray."""
+    if mask is None:
+        return detector
 
-    with h5py.File(refs_file_path, "r") as handle:
-        dataset_path = f"{refs_entry_path}/mask/mask_detector{detector_number}"
-        if dataset_path not in handle:
-            return None
+    mask_array = np.asarray(mask, dtype=bool)
+    if mask_array.shape != detector.shape:
+        raise ValueError(f"workflow mask shape mismatch: expected {detector.shape}, got {mask_array.shape}")
 
-        mask = np.asarray(handle[dataset_path][()], dtype=np.uint8)
-        if mask.ndim != 2:
-            raise ValueError(f"Reference mask must be 2D at {dataset_path}, got shape {mask.shape}")
-        return mask
+    sc = _require_scipp()
+    masked = detector.copy(deep=False)
+    mask_variable = sc.array(dims=list(detector.dims), values=mask_array)
+    if name in masked.masks:
+        existing = np.asarray(masked.masks[name].values, dtype=bool)
+        mask_variable = sc.array(dims=list(detector.dims), values=np.logical_or(existing, mask_array))
+    masked.masks[name] = mask_variable
+    return masked
 
 
-def _read_sample_detector_distance(
+def _merge_dataarray_masks(
+    target: "sc.DataArray",
+    *sources: "sc.DataArray",
+) -> "sc.DataArray":
+    """Ensure the output carries all masks from the provided source DataArrays."""
+    sc = _require_scipp()
+    merged = target.copy(deep=False)
+    for source in sources:
+        for mask_name, mask_variable in source.masks.items():
+            if mask_variable.dims != merged.dims or mask_variable.shape != merged.shape:
+                raise ValueError(
+                    f"mask {mask_name!r} shape mismatch: expected {merged.shape}, got {mask_variable.shape}"
+                )
+            source_mask = np.asarray(mask_variable.values, dtype=bool)
+            if mask_name in merged.masks:
+                existing_mask = np.asarray(merged.masks[mask_name].values, dtype=bool)
+                source_mask = np.logical_or(existing_mask, source_mask)
+            merged.masks[mask_name] = sc.array(dims=list(merged.dims), values=source_mask)
+    return merged
+
+
+def _normalize_detector_by_solid_angle(
+    detector: "sc.DataArray",
+    *,
+    detector_distance: float,
+    beam_center: tuple[float, float],
+    pixel_size: tuple[float, float],
+) -> "sc.DataArray":
+    """Apply the standard solid-angle correction while preserving DataArray metadata."""
+    sc = _require_scipp()
+    correction = normalize_by_solid_angle(
+        np.ones(detector.shape, dtype=np.float64),
+        detector_distance=detector_distance,
+        beam_center=beam_center,
+        pixel_size=pixel_size,
+    )
+    return detector * sc.array(dims=list(detector.dims), values=np.asarray(correction, dtype=np.float64))
+
+
+def _write_text_dataset(parent: h5py.Group, name: str, value: str) -> None:
+    parent.create_dataset(name, data=np.bytes_(value))
+
+
+def _write_text_list_dataset(parent: h5py.Group, name: str, values: list[str]) -> None:
+    parent.create_dataset(name, data=np.asarray([np.bytes_(value) for value in values], dtype="S"))
+
+
+def _replace_group(parent: h5py.Group | h5py.File, name: str, *, nx_class: str | None = None) -> h5py.Group:
+    if name in parent:
+        del parent[name]
+    group = parent.create_group(name)
+    if nx_class is not None:
+        group.attrs["NX_class"] = np.bytes_(nx_class)
+    return group
+
+
+def _normalize_processed_entry_name(entry_name: str) -> str:
+    normalized = str(entry_name).strip().strip("/")
+    if not normalized:
+        raise ValueError("processed entry name must not be empty")
+    if "/" in normalized:
+        raise ValueError(f"processed entry must be a top-level NXentry name, got {entry_name!r}")
+    return normalized
+
+
+def _sanitize_output_token(value: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value).strip())
+    sanitized = sanitized.strip("._-")
+    return sanitized or "unknown"
+
+
+def _build_azimuthal_text_output_path(
+    *,
+    output_dir: Path,
+    sample_name: str,
+    config_id: str,
+    detector_number: int | None = None,
+    suffix: str = ".txt",
+) -> Path:
+    stem = f"{_sanitize_output_token(sample_name)}_config_{_sanitize_output_token(config_id)}"
+    if detector_number is not None:
+        stem = f"{stem}_detector{int(detector_number)}"
+    return (output_dir / f"{stem}{suffix}").resolve()
+
+
+def write_azimuthal_text_file(
     file_path: str | Path,
     *,
-    detector_number: int,
-) -> float:
-    file_path = Path(file_path).resolve()
-    configuration, _issues = read_configuration(file_path)
-    distance = configuration.sample_detector_distance
+    q: Any,
+    intensity: Any,
+    intensity_error: Any | None,
+    q_error: Any | None,
+    sample_name: str,
+    config_id: str,
+    transmission: float | None,
+) -> Path:
+    """Write one azimuthal average curve to a 4-column text file."""
+    output_path = Path(file_path).resolve()
+    q_values = np.asarray(q, dtype=np.float64)
+    intensity_values = np.asarray(intensity, dtype=np.float64)
+    if q_values.shape != intensity_values.shape:
+        raise ValueError(f"q/intensity shape mismatch: {q_values.shape} != {intensity_values.shape}")
 
-    if isinstance(distance, list):
-        if detector_number >= len(distance):
-            raise ValueError(f"Missing sample_detector_distance for detector{detector_number} in {file_path}")
-        distance_value = distance[detector_number]
+    if intensity_error is None:
+        intensity_error_values = np.full(q_values.shape, np.nan, dtype=np.float64)
     else:
-        distance_value = distance
+        intensity_error_values = np.asarray(intensity_error, dtype=np.float64)
+        if intensity_error_values.shape != q_values.shape:
+            raise ValueError(f"intensity_error shape mismatch: expected {q_values.shape}, got {intensity_error_values.shape}")
 
-    distance_value = float(distance_value)
-    if not np.isfinite(distance_value) or distance_value <= 0.0:
-        raise ValueError(f"Invalid sample_detector_distance for detector{detector_number} in {file_path}")
-    return distance_value
+    if q_error is None:
+        q_error_values = np.full(q_values.shape, np.nan, dtype=np.float64)
+    else:
+        q_error_values = np.asarray(q_error, dtype=np.float64)
+        if q_error_values.shape != q_values.shape:
+            raise ValueError(f"q_error shape mismatch: expected {q_values.shape}, got {q_error_values.shape}")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    matrix = np.column_stack((q_values, intensity_values, intensity_error_values, q_error_values))
+    transmission_text = "nan" if transmission is None else f"{float(transmission):.6g}"
+    header = "\n".join(
+        (
+            f"sample_name: {sample_name}",
+            f"config_id: {config_id}",
+            f"transmission: {transmission_text}",
+            "q I I_error q_error",
+        )
+    )
+    np.savetxt(output_path, matrix, header=header, comments="")
+    return output_path
 
 
-def _read_wavelength(file_path: str | Path) -> float:
-    file_path = Path(file_path).resolve()
-    configuration, _issues = read_configuration(file_path)
-    wavelength = float(configuration.wavelength)
-    if not np.isfinite(wavelength) or wavelength <= 0.0:
-        raise ValueError(f"Invalid wavelength in {file_path}: {wavelength!r}")
-    return wavelength
+def write_azimuthal_average_text_outputs(
+    state: "ReductionState",
+    *,
+    output_dir: str | Path | None = None,
+) -> list[Path]:
+    """Write one 4-column text file per detector from azimuthally averaged data."""
+    target_dir = state.workflow.output_dir if output_dir is None else Path(output_dir).resolve()
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    detector_numbers = sorted(state.detectors)
+    if not detector_numbers:
+        raise ValueError("No detector data available to write azimuthal average text output")
+
+    output_paths: list[Path] = []
+    multiple_detectors = len(detector_numbers) > 1
+    for detector_number in detector_numbers:
+        detector = _require_dataarray(state.detectors[detector_number], name=f"detector{detector_number}", ndim=1)
+        if "q" not in detector.coords:
+            raise ValueError(f"Missing q coordinate for detector{detector_number} azimuthal output")
+        q_coord = detector.coords["q"]
+        file_path = _build_azimuthal_text_output_path(
+            output_dir=target_dir,
+            sample_name=state.sample_name,
+            config_id=state.config_id,
+            detector_number=detector_number if multiple_detectors else None,
+        )
+        output_paths.append(
+            write_azimuthal_text_file(
+                file_path,
+                q=q_coord.values,
+                intensity=detector.data.values,
+                intensity_error=None if detector.data.variances is None else np.sqrt(np.asarray(detector.data.variances, dtype=np.float64)),
+                q_error=None if q_coord.variances is None else np.sqrt(np.asarray(q_coord.variances, dtype=np.float64)),
+                sample_name=state.sample_name,
+                config_id=state.config_id,
+                transmission=state.transmission,
+            )
+        )
+    return output_paths
+
+
+def _write_dataarray_dataset(parent: h5py.Group, name: str, detector: Any) -> None:
+    data_array = _require_dataarray(detector, name=name)
+    group = _replace_group(parent, name, nx_class="NXdata")
+    group.attrs["signal"] = np.bytes_("data")
+    group.attrs["dims"] = np.asarray([np.bytes_(dim) for dim in data_array.dims], dtype="S")
+
+    axis_names = [dim for dim in data_array.dims if dim in data_array.coords]
+    if axis_names:
+        group.attrs["axes"] = np.asarray([np.bytes_(dim) for dim in axis_names], dtype="S")
+
+    group.create_dataset("data", data=np.asarray(data_array.data.values))
+    if data_array.data.variances is not None:
+        errors = np.sqrt(np.clip(np.asarray(data_array.data.variances, dtype=np.float64), 0.0, None))
+        group.create_dataset("errors", data=errors)
+
+    for coord_name, coord_value in data_array.coords.items():
+        group.create_dataset(coord_name, data=np.asarray(coord_value.values))
+
+    if data_array.masks:
+        masks_group = group.create_group("masks")
+        masks_group.attrs["NX_class"] = np.bytes_("NXcollection")
+        masks_group.attrs["convention"] = np.bytes_("1=masked, 0=valid")
+        for mask_name, mask_value in data_array.masks.items():
+            masks_group.create_dataset(mask_name, data=np.asarray(mask_value.values, dtype=np.uint8))
+
+
+def _write_nxdata_view(
+    entry: h5py.Group,
+    *,
+    detector_number: int,
+    detector_group_name: str,
+    detector: Any,
+) -> None:
+    data_array = _require_dataarray(detector, name=detector_group_name)
+    view_group = _replace_group(entry, f"data{detector_number}", nx_class="NXdata")
+    view_group.attrs["signal"] = np.bytes_("data")
+
+    axis_names = [dim for dim in data_array.dims if dim in data_array.coords]
+    if axis_names:
+        view_group.attrs["axes"] = np.asarray([np.bytes_(dim) for dim in axis_names], dtype="S")
+
+    detector_root = f"/{entry.name.strip('/')}/data/{detector_group_name}"
+    view_group["data"] = h5py.SoftLink(f"{detector_root}/data")
+    if data_array.data.variances is not None:
+        view_group["errors"] = h5py.SoftLink(f"{detector_root}/errors")
+    for coord_name in data_array.coords:
+        view_group[coord_name] = h5py.SoftLink(f"{detector_root}/{coord_name}")
+
+
+def write_processed_detectors(
+    state: ReductionState,
+    *,
+    entry_name: str = "processed",
+) -> Path:
+    """Persist ``state.detectors`` into the source NeXus file under one top-level NXentry."""
+    if not state.file_path:
+        raise ValueError("Cannot save processed detectors without a source sample file")
+
+    normalized_entry_name = _normalize_processed_entry_name(entry_name)
+    source_path = Path(state.file_path).resolve()
+    source_entry_path = resolve_entry_path(source_path)
+
+    with h5py.File(source_path, "a") as handle:
+        entry = _replace_group(handle, normalized_entry_name, nx_class="NXentry")
+        _write_text_dataset(entry, "definition", "SCARLET_processed")
+        handle.attrs["default"] = np.bytes_(normalized_entry_name)
+
+        meta = _replace_group(entry, "meta", nx_class="NXcollection")
+        _write_text_dataset(meta, "source_file", str(source_path))
+        _write_text_dataset(meta, "source_entry", source_entry_path)
+        _write_text_dataset(meta, "sample_name", state.sample_name)
+        _write_text_dataset(meta, "config_id", state.config_id)
+        if state.reductions_steps:
+            _write_text_list_dataset(meta, "reduction_steps", state.reductions_steps)
+        if state.notes:
+            _write_text_list_dataset(meta, "notes", state.notes)
+
+        data_group = _replace_group(entry, "data", nx_class="NXcollection")
+        default_view_name: str | None = None
+        for detector_number, detector in sorted(state.detectors.items()):
+            detector_group_name = f"detector{detector_number}"
+            _write_dataarray_dataset(data_group, detector_group_name, detector)
+            _write_nxdata_view(
+                entry,
+                detector_number=detector_number,
+                detector_group_name=detector_group_name,
+                detector=detector,
+            )
+            if default_view_name is None or detector_number == 0:
+                default_view_name = f"data{detector_number}"
+        if default_view_name is not None:
+            entry.attrs["default"] = np.bytes_(default_view_name)
+
+    return source_path
+
+
+@dataclass(frozen=True)
+class ReductionStep:
+    name: str
+    fn: StepFunction
+
+
+def reduction_step(name: str) -> Callable[[_F], _F]:
+    def decorator(fn: _F) -> _F:
+        setattr(fn, "_reduction_step_name", name)
+        return fn
+
+    return decorator
+
+
+def as_reduction_step(fn: StepFunction) -> ReductionStep:
+    name = getattr(fn, "_reduction_step_name", None)
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"Function {fn.__name__} is not decorated with @reduction_step")
+    return ReductionStep(name=name, fn=cast(StepFunction, fn))
+
+
+@reduction_step("subtract references")
+def subtract_references_step(state: ReductionState) -> ReductionState:
+    dark_data_dict: dict[int, Any] = {}
+    dark_file = state.workflow.get_dark(state.config_id)
+    if dark_file:
+        dark_data_dict = nexus_reader.read_all_detectors(dark_file, normalize_by_monitor=True, correct_deadtime=True)
+    else:
+        for key in state.detectors:
+            dark_data_dict[key] = None
+
+    ec_data_dict: dict[int, Any] = {}
+    ec_file = state.workflow.get_empty_cell(state.config_id, "scattering")
+    if ec_file:
+        tr_ec = state.workflow.get_empty_cell_transmission(state.config_id)
+        ec_data_dict = nexus_reader.read_all_detectors(ec_file, normalize_by_monitor=True, correct_deadtime=True)
+    else:
+        tr_ec = None
+        for key in state.detectors:
+            ec_data_dict[key] = None
+
+    subtracted_data_dict = {}
+    for key in state.detectors:
+        corrected = subtract_scattering_references(
+            state.detectors[key],
+            state.transmission,
+            dark=dark_data_dict[key],
+            empty_cell=ec_data_dict[key],
+            empty_cell_transmission=tr_ec,
+        )
+        corrected = _apply_workflow_mask(
+            corrected,
+            mask=state.workflow.get_mask(state.config_id, key),
+        )
+        subtracted_data_dict[key] = corrected
+    state.detectors = subtracted_data_dict
+    return state
+
+
+@reduction_step("water normalization")
+def normalization_step(state: ReductionState) -> ReductionState:
+    configuration = _read_state_configuration(state)
+    effective_config_id = state.workflow.resolve_flatfield_config(state.config_id)
+    flatfield_path = state.workflow.get_flatfield(state.config_id)
+    if flatfield_path is None:
+        flatfield_path = state.workflow.build_water_flatfield(state.config_id)
+        if effective_config_id == state.config_id:
+            state.notes.append(f"Prepared water flatfield for {state.config_id}")
+        else:
+            state.notes.append(
+                f"Prepared water flatfield for source config {effective_config_id} used by {state.config_id}"
+            )
+
+    flatfields = load_flatfield_file(flatfield_path)
+    normalized: dict[int, Any] = {}
+    for detector_number, detector in state.detectors.items():
+        detector_array = _require_dataarray(detector, name=f"detector{detector_number}", ndim=2)
+        detector_array = _apply_workflow_mask(
+            detector_array,
+            mask=state.workflow.get_mask(state.config_id, detector_number),
+        )
+        flatfield = flatfields.get(detector_number)
+        if flatfield is None:
+            raise ValueError(
+                f"Missing detector{detector_number} flatfield in {flatfield_path} for configuration {state.config_id!r}"
+            )
+        flatfield_array = _require_dataarray(flatfield, name=f"flatfield detector{detector_number}", ndim=2)
+        if detector_array.dims != flatfield_array.dims:
+            raise ValueError(
+                f"Flatfield dimension mismatch for detector{detector_number}: "
+                f"expected {detector_array.dims}, got {flatfield_array.dims}"
+            )
+        if detector_array.shape != flatfield_array.shape:
+            raise ValueError(
+                f"Flatfield shape mismatch for detector{detector_number}: "
+                f"expected {detector_array.shape}, got {flatfield_array.shape}"
+            )
+        corrected = detector_array / flatfield_array
+        corrected = _merge_dataarray_masks(corrected, detector_array, flatfield_array)
+        normalized[detector_number] = _normalize_detector_by_solid_angle(
+            corrected,
+            detector_distance=_get_detector_distance(configuration, detector_number=detector_number),
+            beam_center=_get_beam_center(state, detector_number=detector_number),
+            pixel_size=_get_detector_pixel_size(state, detector_number=detector_number),
+        )
+
+    state.detectors = normalized
+    if effective_config_id == state.config_id:
+        state.notes.append(f"Applied water flatfield and solid-angle correction from {Path(flatfield_path).name}")
+    else:
+        state.notes.append(
+            f"Applied water flatfield and solid-angle correction from {Path(flatfield_path).name} "
+            f"(source config {effective_config_id} for {state.config_id})"
+        )
+    return state
+
+
+@reduction_step("azimuthal averaging")
+def azimuthal_averaging_step(state: ReductionState) -> ReductionState:
+    configuration = _read_state_configuration(state)
+    wavelength = _get_wavelength(configuration)
+
+    integrated: dict[int, Any] = {}
+    for detector_number, detector in state.detectors.items():
+        detector_array = _require_dataarray(detector, name=f"detector{detector_number}", ndim=2)
+        beam_center = _get_beam_center(state, detector_number=detector_number)
+        detector_distance = _get_detector_distance(configuration, detector_number=detector_number)
+        pixel_size = _get_detector_pixel_size(state, detector_number=detector_number)
+        q_map = compute_q_norm_map(
+            np.asarray(detector_array.data.values, dtype=np.float64),
+            beam_center=beam_center,
+            detector_distance=detector_distance,
+            pixel_size=pixel_size,
+            wavelength=wavelength,
+        )
+
+        mask = state.workflow.get_mask(state.config_id, detector_number)
+        if mask is not None and mask.shape != detector_array.shape:
+            raise ValueError(
+                f"Workflow mask shape mismatch for detector{detector_number}: "
+                f"expected {detector_array.shape}, got {mask.shape}"
+            )
+
+        result = azimuthal_average(
+            detector_array,
+            q_map,
+            mask=mask,
+            n_bins=state.azimuthal_n_bins,
+            q_scale=state.azimuthal_q_scale,
+        )
+        integrated[detector_number] = result.to_data_array()
+
+    state.detectors = integrated
+    state.notes.append(
+        f"Computed azimuthal average with {state.azimuthal_n_bins} bins ({state.azimuthal_q_scale})"
+    )
+    return state
+
+
+@reduction_step("save processed detectors")
+def save_processed_detectors_step(state: ReductionState) -> ReductionState:
+    output_path = write_processed_detectors(state, entry_name="processed")
+    state.notes.append(f"Saved processed detectors into {output_path.name}:/processed")
+    return state
+
+
+@reduction_step("save azimuthal text")
+def save_azimuthal_text_step(state: ReductionState) -> ReductionState:
+    output_paths = write_azimuthal_average_text_outputs(state)
+    for output_path in output_paths:
+        state.workflow.add_artifact(output_path.name, output_path, kind="txt")
+    state.notes.append(
+        "Saved azimuthal average text output to "
+        + ", ".join(path.name for path in output_paths)
+    )
+    return state
+
+@dataclass(frozen=True)
+class ReductionPipeline:
+    steps: tuple[ReductionStep, ...] = field(default_factory=tuple)
+
+    @classmethod
+    def default(cls) -> "ReductionPipeline":
+        return cls(steps=(as_reduction_step(subtract_references_step),))
+
+    @classmethod
+    def with_water_normalization(cls) -> "ReductionPipeline":
+        return cls(
+            steps=(
+                as_reduction_step(subtract_references_step),
+                as_reduction_step(normalization_step),
+            )
+        )
+
+    @classmethod
+    def with_processed_output(cls) -> "ReductionPipeline":
+        return cls(
+            steps=(
+                as_reduction_step(subtract_references_step),
+                as_reduction_step(normalization_step),
+                as_reduction_step(save_processed_detectors_step),
+            )
+        )
+
+    @classmethod
+    def with_azimuthal_text_output(cls) -> "ReductionPipeline":
+        return cls(
+            steps=(
+                as_reduction_step(subtract_references_step),
+                as_reduction_step(normalization_step),
+                as_reduction_step(azimuthal_averaging_step),
+                as_reduction_step(save_azimuthal_text_step),
+            )
+        )
+
+    @classmethod
+    def with_azimuthal_averaging(cls) -> "ReductionPipeline":
+        return cls(
+            steps=(
+                as_reduction_step(subtract_references_step),
+                as_reduction_step(normalization_step),
+                as_reduction_step(azimuthal_averaging_step),
+            )
+        )
+
+    @property
+    def step_names(self) -> tuple[str, ...]:
+        return tuple(step.name for step in self.steps)
+
+    def run(self, state: ReductionState) -> ReductionState:
+        for step in self.steps:
+            state = step.fn(state)
+            state.reductions_steps.append(step.name)
+        return state
+    
+    def run_all(self, workflow: WorkflowContext):
+        for run in workflow.runs:
+            if run.entity=="sample" and run.mode=="scattering":
+                state = ReductionState(sample_name=run.sample_name, config_id=run.config_id,workflow=w)
+                pipe.run(state)

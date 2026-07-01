@@ -1,5 +1,4 @@
 from .nexus_reader import (
-    DetectorData,
     NexusRawData,
     get_roi,
     list_detector_numbers,
@@ -7,6 +6,7 @@ from .nexus_reader import (
     read_all_detectors,
     read_configuration,
     read_count_time_value,
+    read_deadtime_value,
     read_empty_beam_transmission_source_file,
     read_detector,
     read_detector_data,
@@ -18,7 +18,6 @@ from .nexus_reader import (
 )
 
 __all__ = [
-    "DetectorData",
     "NexusRawData",
     "get_roi",
     "list_detector_numbers",
@@ -26,6 +25,7 @@ __all__ = [
     "read_all_detectors",
     "read_configuration",
     "read_count_time_value",
+    "read_deadtime_value",
     "read_empty_beam_transmission_source_file",
     "read_detector",
     "read_detector_data",

@@ -34,6 +34,12 @@ TransmissionRoi = tuple[int, int, int, int]
 ReferenceFilesByMode = Dict[Mode, Path]
 # Sample transmission values indexed by sample name and configuration id.
 TransmissionValues = Dict[tuple[str, str], float]
+# Empty-cell transmission values indexed by configuration id.
+EmptyCellTransmissionValues = Dict[str, float]
+# Sample thickness values indexed by sample name and configuration id.
+SampleThicknessValues = Dict[tuple[str, str], float]
+# Per-detector masks indexed by detector number.
+DetectorMasks = Dict[int, np.ndarray]
 
 
 @dataclass(frozen=True)
@@ -146,8 +152,24 @@ class WorkflowContext:
     empty_beam: Dict[str, ReferenceFilesByMode] = field(default_factory=dict)
     # Empty-cell files indexed by configuration id, then by acquisition mode.
     empty_cell: Dict[str, ReferenceFilesByMode] = field(default_factory=dict)
+    # Water files indexed by configuration id, then by acquisition mode.
+    water: Dict[str, ReferenceFilesByMode] = field(default_factory=dict)
     # Computed sample transmissions indexed by sample name and configuration id.
     transmissions: TransmissionValues = field(default_factory=dict)
+    # Computed empty-cell transmissions indexed by configuration id.
+    empty_cell_transmissions: EmptyCellTransmissionValues = field(default_factory=dict)
+    # Sample thicknesses indexed by sample name and configuration id.
+    sample_thicknesses: SampleThicknessValues = field(default_factory=dict)
+    # Per-configuration detector masks cache with 1=masked, 0=valid.
+    masks: Dict[str, DetectorMasks] = field(default_factory=dict)
+    # SCARLET_masks bundle path indexed by configuration id.
+    mask_files: Dict[str, Path] = field(default_factory=dict)
+    # Prepared water flatfield artifacts indexed by configuration id.
+    flatfields: Dict[str, Path] = field(default_factory=dict)
+    # Optional mapping from target configuration id to source flatfield configuration id.
+    flatfield_sources: Dict[str, str] = field(default_factory=dict)
+    # Configurations whose flatfield artifact must be rebuilt before reuse.
+    stale_flatfields: set[str] = field(default_factory=set)
     # Free-form storage for intermediate pipeline state.
     store: Dict[str, Any] = field(default_factory=dict)
 
@@ -165,12 +187,19 @@ class WorkflowContext:
         """Mirror reference runs into the dedicated reference attributes."""
         if key.entity == "dark" and key.mode == "scattering":
             self.set_dark(key.config_id, file_path)
+            self.invalidate_flatfield(key.config_id)
             return
         if key.entity == "empty_beam":
             self.set_empty_beam(key.config_id, key.mode, file_path)
+            self.invalidate_flatfield(key.config_id)
             return
         if key.entity == "empty_cell":
             self.set_empty_cell(key.config_id, key.mode, file_path)
+            self.invalidate_flatfield(key.config_id)
+            return
+        if key.entity == "water":
+            self.set_water(key.config_id, key.mode, file_path)
+            self.invalidate_flatfield(key.config_id)
 
     def _allocate_run_key(self, key: RunKey) -> RunKey:
         """Return a unique run key, preserving duplicate logical runs."""
@@ -189,12 +218,9 @@ class WorkflowContext:
         self._sync_reference_store(stored_key, resolved_path)
         return stored_key
 
-    def get_run_path(self, key: RunKey) -> Path:
-        """Return the registered path for a run key."""
-        try:
-            return self.runs[key]
-        except KeyError as exc:
-            raise KeyError(f"Run not registered: {key.short()}") from exc
+    def get_run_path(self, key: RunKey) -> Optional[Path]:
+        """Return the registered path for a run key, or ``None`` when missing."""
+        return self.runs.get(key)
 
     def iter_runs(
         self,
@@ -220,7 +246,7 @@ class WorkflowContext:
     def runs_table(self) -> TableView:
         """Return a notebook-friendly table view of workflow runs."""
         return TableView(
-            columns=("sample_name", "config_id", "mode", "entity", "transmission", "file_path"),
+            columns=("sample_name", "config_id", "mode", "entity", "thickness", "transmission", "file_path"),
             rows=_runs_rows(self),
         )
 
@@ -315,6 +341,8 @@ class WorkflowContext:
         rebuilt_runs: dict[RunKey, Path] = {}
         rebuilt_configurations: dict[str, Any] = {}
         rebuilt_transmissions: TransmissionValues = {}
+        rebuilt_empty_cell_transmissions: EmptyCellTransmissionValues = {}
+        rebuilt_sample_thicknesses: SampleThicknessValues = {}
 
         row_order = 0
         for row in rows:
@@ -323,10 +351,11 @@ class WorkflowContext:
             mode = (row.get("mode") or "").strip().lower()
             entity = (row.get("entity") or "").strip().lower()
             sample_name_raw = (row.get("sample_name") or "").strip()
+            thickness_raw = (row.get("thickness") or "").strip()
             transmission_raw = (row.get("transmission") or "").strip()
             file_path_raw = (row.get("file_path") or "").strip()
 
-            if not any((config_id, mode, entity, sample_name_raw, transmission_raw, file_path_raw)):
+            if not any((config_id, mode, entity, sample_name_raw, thickness_raw, transmission_raw, file_path_raw)):
                 continue
             if not config_id:
                 raise ValueError(f"Row {row_order}: config_id must not be empty")
@@ -341,6 +370,7 @@ class WorkflowContext:
 
             file_path = _resolve_csv_path(file_path_raw, row_order=row_order)
             sample_name = sample_name_raw or None
+            thickness = _parse_optional_float(thickness_raw, row_order=row_order)
             transmission = _parse_optional_float(transmission_raw, row_order=row_order)
             if entity == "sample" and sample_name is None:
                 raise ValueError(f"Row {row_order}: sample entity requires a non-empty sample_name")
@@ -362,8 +392,15 @@ class WorkflowContext:
                 )
             rebuilt_runs[stored_run_key] = file_path
 
+            if sample_name is not None and thickness is None and entity in {"sample", "water"}:
+                thickness = _read_sample_thickness(file_path)
+            if sample_name is not None and thickness is not None and entity in {"sample", "water"}:
+                rebuilt_sample_thicknesses[(sample_name, config_id)] = thickness
+
             if sample_name is not None and transmission is not None:
                 rebuilt_transmissions[(sample_name, config_id)] = transmission
+                if entity == "empty_cell":
+                    rebuilt_empty_cell_transmissions[config_id] = transmission
 
             if config_id not in rebuilt_configurations:
                 configuration, issues = configuration_from_nexus(file_path)
@@ -380,7 +417,15 @@ class WorkflowContext:
         self.dark.clear()
         self.empty_beam.clear()
         self.empty_cell.clear()
+        self.water.clear()
         self.transmissions.clear()
+        self.empty_cell_transmissions.clear()
+        self.sample_thicknesses.clear()
+        self.masks.clear()
+        self.mask_files.clear()
+        self.flatfields.clear()
+        self.flatfield_sources.clear()
+        self.stale_flatfields.clear()
         self.beam_centers.clear()
         self.rois.clear()
 
@@ -388,6 +433,8 @@ class WorkflowContext:
         for run_key, path in rebuilt_runs.items():
             self.add_run(run_key, path)
         self.transmissions.update(rebuilt_transmissions)
+        self.empty_cell_transmissions.update(rebuilt_empty_cell_transmissions)
+        self.sample_thicknesses.update(rebuilt_sample_thicknesses)
 
         _initialize_transmission_geometry(self, where="update_from_runs_table_csv")
         self.set("runs_table_csv", csv_path)
@@ -397,71 +444,304 @@ class WorkflowContext:
         """Store one detector beam center for a configuration."""
         self.beam_centers.setdefault(config_id, {})[detector_number] = center
 
-    def get_beam_center(self, config_id: str, detector_number: int) -> BeamCenter:
-        """Return one detector beam center for a configuration."""
-        try:
-            return self.beam_centers[config_id][detector_number]
-        except KeyError as exc:
-            raise KeyError(
-                f"Missing beam center for config_id={config_id}, detector_number={detector_number}"
-            ) from exc
+    def get_beam_center(self, config_id: str, detector_number: int) -> Optional[BeamCenter]:
+        """Return one detector beam center for a configuration, or ``None`` when missing."""
+        return self.beam_centers.get(config_id, {}).get(detector_number)
 
     def set_roi(self, config_id: str, roi: TransmissionRoi) -> None:
         """Store the transmission ROI for a configuration."""
         self.rois[config_id] = roi
 
-    def get_roi(self, config_id: str) -> TransmissionRoi:
-        """Return the transmission ROI for a configuration."""
-        try:
-            return self.rois[config_id]
-        except KeyError as exc:
-            raise KeyError(f"Missing ROI for config_id={config_id}") from exc
+    def get_roi(self, config_id: str) -> Optional[TransmissionRoi]:
+        """Return the transmission ROI for a configuration, or ``None`` when missing."""
+        return self.rois.get(config_id)
 
     def set_dark(self, config_id: str, file_path: Path) -> None:
         """Store the scattering dark file for a configuration."""
         self.dark[config_id] = self._resolve_path(file_path)
+        self.invalidate_flatfield(config_id)
 
-    def get_dark(self, config_id: str) -> Path:
-        """Return the scattering dark file for a configuration."""
-        try:
-            return self.dark[config_id]
-        except KeyError as exc:
-            raise KeyError(f"Missing dark file for config_id={config_id}") from exc
+    def get_dark(self, config_id: str) -> Optional[Path]:
+        """Return the scattering dark file for a configuration, or ``None`` when missing."""
+        return self.dark.get(config_id)
 
     def set_empty_beam(self, config_id: str, mode: Mode, file_path: Path) -> None:
         """Store one empty-beam reference file for a configuration and mode."""
         self.empty_beam.setdefault(config_id, {})[mode] = self._resolve_path(file_path)
+        self.invalidate_flatfield(config_id)
 
-    def get_empty_beam(self, config_id: str, mode: Mode) -> Path:
-        """Return one empty-beam reference file for a configuration and mode."""
-        try:
-            return self.empty_beam[config_id][mode]
-        except KeyError as exc:
-            raise KeyError(f"Missing empty_beam file for config_id={config_id}, mode={mode}") from exc
+    def get_empty_beam(self, config_id: str, mode: Mode) -> Optional[Path]:
+        """Return one empty-beam reference file for a configuration and mode, or ``None`` when missing."""
+        return self.empty_beam.get(config_id, {}).get(mode)
 
     def set_empty_cell(self, config_id: str, mode: Mode, file_path: Path) -> None:
         """Store one empty-cell reference file for a configuration and mode."""
         self.empty_cell.setdefault(config_id, {})[mode] = self._resolve_path(file_path)
+        self.invalidate_flatfield(config_id)
 
-    def get_empty_cell(self, config_id: str, mode: Mode) -> Path:
-        """Return one empty-cell reference file for a configuration and mode."""
-        try:
-            return self.empty_cell[config_id][mode]
-        except KeyError as exc:
-            raise KeyError(f"Missing empty_cell file for config_id={config_id}, mode={mode}") from exc
+    def get_empty_cell(self, config_id: str, mode: Mode) -> Optional[Path]:
+        """Return one empty-cell reference file for a configuration and mode, or ``None`` when missing."""
+        return self.empty_cell.get(config_id, {}).get(mode)
+
+    def set_water(self, config_id: str, mode: Mode, file_path: Path) -> None:
+        """Store one water reference file for a configuration and mode."""
+        self.water.setdefault(config_id, {})[mode] = self._resolve_path(file_path)
+        self.invalidate_flatfield(config_id)
+
+    def get_water(self, config_id: str, mode: Mode) -> Optional[Path]:
+        """Return one water reference file for a configuration and mode, or ``None`` when missing."""
+        return self.water.get(config_id, {}).get(mode)
 
     def set_transmission(self, sample_name: str, config_id: str, value: float) -> None:
         """Store one computed sample transmission."""
         self.transmissions[(sample_name, config_id)] = float(value)
 
-    def get_transmission(self, sample_name: str, config_id: str) -> float:
-        """Return one computed sample transmission."""
+    def get_transmission(self, sample_name: str, config_id: str) -> Optional[float]:
+        """Return one computed sample transmission, or ``None`` when missing."""
+        return self.transmissions.get((sample_name, config_id))
+
+    def set_empty_cell_transmission(self, config_id: str, value: float) -> None:
+        """Store one computed empty-cell transmission for a configuration."""
+        self.empty_cell_transmissions[config_id] = float(value)
+        self.invalidate_flatfield(config_id)
+
+    def get_empty_cell_transmission(self, config_id: str) -> Optional[float]:
+        """Return one computed empty-cell transmission, or ``None`` when missing."""
+        return self.empty_cell_transmissions.get(config_id)
+
+    def set_sample_thickness(self, sample_name: str, config_id: str, value: float) -> None:
+        """Store one sample thickness in meters."""
+        self.sample_thicknesses[(sample_name, config_id)] = float(value)
+
+    def get_sample_thickness(self, sample_name: str, config_id: str) -> Optional[float]:
+        """Return one stored sample thickness in meters, or ``None`` when missing."""
+        return self.sample_thicknesses.get((sample_name, config_id))
+
+    def set_mask(self, config_id: str, detector_number: int, mask: np.ndarray) -> None:
+        """Store one detector mask for a configuration with 1=masked and 0=valid."""
+        mask_array = np.asarray(mask, dtype=np.uint8)
+        if mask_array.ndim != 2:
+            raise ValueError(f"mask for detector{detector_number} must be 2D, got shape {mask_array.shape}")
+        if not np.all((mask_array == 0) | (mask_array == 1)):
+            raise ValueError("mask values must use the SCARLET convention 1=masked, 0=valid")
+        self.masks.setdefault(config_id, {})[int(detector_number)] = np.array(mask_array, copy=True)
+        self.invalidate_flatfield(config_id)
+
+    def set_masks(self, config_id: str, masks: Mapping[int, np.ndarray]) -> None:
+        """Store all detector masks for a configuration in the in-memory cache."""
+        stored: DetectorMasks = {}
+        for detector_number, mask in masks.items():
+            mask_array = np.asarray(mask, dtype=np.uint8)
+            if mask_array.ndim != 2:
+                raise ValueError(f"mask for detector{detector_number} must be 2D, got shape {mask_array.shape}")
+            if not np.all((mask_array == 0) | (mask_array == 1)):
+                raise ValueError("mask values must use the SCARLET convention 1=masked, 0=valid")
+            stored[int(detector_number)] = np.array(mask_array, copy=True)
+        self.masks[config_id] = stored
+        self.invalidate_flatfield(config_id)
+
+    def set_mask_file(self, config_id: str, file_path: Path) -> None:
+        """Register a SCARLET_masks bundle for one configuration."""
+        resolved = self._resolve_path(file_path)
+        _load_masks_from_bundle(resolved)
+        self.mask_files[config_id] = resolved
+        self.masks.pop(config_id, None)
+        self.invalidate_flatfield(config_id)
+
+    def get_mask_file(self, config_id: str) -> Optional[Path]:
+        """Return the SCARLET_masks bundle path for a configuration, or ``None`` when missing."""
+        return self.mask_files.get(config_id)
+
+    def attach_mask_bundle(self, file_path: str | Path, *, config_id: str | None = None) -> str:
+        """Attach one SCARLET_masks bundle to the workflow."""
+        resolved = self._resolve_path(Path(file_path))
+        definition, bundle_config_id = _read_bundle_definition_and_config_id(resolved)
+        if definition != "SCARLET_masks":
+            raise ValueError(f"Unsupported mask bundle definition in {resolved}: {definition!r}")
+        attached_config_id = config_id or bundle_config_id
+        if attached_config_id is None:
+            matched_config_ids = self._find_matching_config_ids_for_mask_bundle(resolved)
+            if len(matched_config_ids) == 1:
+                attached_config_id = matched_config_ids[0]
+            elif len(matched_config_ids) > 1:
+                raise ValueError(
+                    "Multiple workflow configurations match mask bundle; "
+                    f"please provide config_id explicitly: {resolved}"
+                )
+            else:
+                raise ValueError(f"No workflow configuration matched mask bundle: {resolved}")
+        if not attached_config_id:
+            raise ValueError(f"Missing config_id in mask bundle and no override provided: {resolved}")
+        if config_id and bundle_config_id and bundle_config_id != config_id:
+            raise ValueError(
+                f"Mask bundle config_id mismatch for {resolved}: file has {bundle_config_id!r}, override is {config_id!r}"
+            )
+        self.set_mask_file(attached_config_id, resolved)
+        return attached_config_id
+
+    def attach_mask_bundles_from_output_dir(
+        self,
+        output_dir: str | Path | None = None,
+    ) -> Dict[str, Path]:
+        """Discover and attach every SCARLET_masks bundle matching one workflow configuration."""
+        search_root = self.output_dir if output_dir is None else self._resolve_path(Path(output_dir))
+        selected: Dict[str, Path] = {}
+        mtimes: Dict[str, float] = {}
+        for path in sorted(search_root.rglob("*")):
+            if not path.is_file() or not _is_hdf5_file(path):
+                continue
+            try:
+                definition, bundle_config_id = _read_bundle_definition_and_config_id(path)
+            except Exception:
+                continue
+            if definition != "SCARLET_masks":
+                continue
+            try:
+                matched_config_ids = self._find_matching_config_ids_for_mask_bundle(path)
+            except Exception as exc:
+                self.warn(
+                    "Failed to read mask bundle configuration; skipping file",
+                    where="attach_mask_bundles_from_output_dir",
+                    key=str(path.resolve()),
+                    error=str(exc),
+                )
+                continue
+            if not matched_config_ids:
+                self.warn(
+                    "No workflow configuration matched mask bundle; skipping file",
+                    where="attach_mask_bundles_from_output_dir",
+                    key=str(path.resolve()),
+                    bundle_config_id=bundle_config_id,
+                )
+                continue
+            resolved = path.resolve()
+            mtime = resolved.stat().st_mtime
+            for matched_config_id in matched_config_ids:
+                previous = selected.get(matched_config_id)
+                if previous is None or mtime > mtimes[matched_config_id] or (
+                    mtime == mtimes[matched_config_id] and str(resolved) > str(previous)
+                ):
+                    if previous is not None and previous != resolved:
+                        self.warn(
+                            "Multiple mask bundles found for one configuration; keeping the most recent file",
+                            where="attach_mask_bundles_from_output_dir",
+                            key=matched_config_id,
+                            previous_path=str(previous),
+                            selected_path=str(resolved),
+                        )
+                    selected[matched_config_id] = resolved
+                    mtimes[matched_config_id] = mtime
+        for bundle_config_id, path in selected.items():
+            self.set_mask_file(bundle_config_id, path)
+        return dict(selected)
+
+    def _find_matching_config_ids_for_mask_bundle(self, file_path: Path) -> list[str]:
+        """Return workflow configuration ids compatible with one mask bundle snapshot."""
+        from scarlet.workflow.configuration import compare_configurations
+
+        bundle_configuration = _read_mask_bundle_configuration(file_path)
+        matched_config_ids: list[str] = []
+        for existing_config_id, existing_configuration in self.configurations.items():
+            same, _ = compare_configurations(bundle_configuration, existing_configuration)
+            if same:
+                matched_config_ids.append(existing_config_id)
+        return matched_config_ids
+
+    def get_mask(self, config_id: str, detector_number: int) -> Optional[np.ndarray]:
+        """Return one detector mask for a configuration, loading a SCARLET_masks bundle when configured."""
+        if config_id in self.mask_files and config_id not in self.masks:
+            self.masks[config_id] = _load_masks_from_bundle(self.mask_files[config_id])
+        mask = self.masks.get(config_id, {}).get(int(detector_number))
+        if mask is None:
+            return None
+        return np.array(mask, copy=True)
+
+    def get_masks(self, config_id: str) -> DetectorMasks:
+        """Return copies of all detector masks for a configuration."""
+        if config_id in self.mask_files and config_id not in self.masks:
+            self.masks[config_id] = _load_masks_from_bundle(self.mask_files[config_id])
+        return {
+            detector_number: np.array(mask, copy=True)
+            for detector_number, mask in self.masks.get(config_id, {}).items()
+        }
+
+    def set_flatfield(self, config_id: str, file_path: Path) -> None:
+        """Store one prepared flatfield artifact for a configuration."""
+        self.flatfields[config_id] = self._resolve_path(file_path)
+        self.stale_flatfields.discard(config_id)
+
+    def invalidate_flatfield(self, config_id: str) -> None:
+        """Mark one configuration flatfield as stale so it is rebuilt before reuse."""
+        self.flatfields.pop(config_id, None)
+        self.stale_flatfields.add(config_id)
+
+    def get_flatfield(self, config_id: str) -> Optional[Path]:
+        """Return one prepared flatfield artifact for a configuration, or ``None`` when missing."""
+        effective_config_id = self.resolve_flatfield_config(config_id)
+        return self.flatfields.get(effective_config_id)
+
+    def set_flatfield_source(self, config_id: str, source_config_id: str) -> str:
+        """Declare that one configuration must reuse the flatfield of another configuration."""
+        config_id = str(config_id).strip()
+        source_config_id = str(source_config_id).strip()
+        if not config_id or not source_config_id:
+            raise ValueError("config_id and source_config_id must not be empty")
+        if config_id == source_config_id:
+            self.flatfield_sources.pop(config_id, None)
+            return config_id
+
+        previous = self.flatfield_sources.get(config_id)
+        self.flatfield_sources[config_id] = source_config_id
         try:
-            return self.transmissions[(sample_name, config_id)]
-        except KeyError as exc:
-            raise KeyError(
-                f"Missing transmission for sample_name={sample_name}, config_id={config_id}"
-            ) from exc
+            resolved = self.resolve_flatfield_config(config_id)
+        except Exception:
+            if previous is None:
+                self.flatfield_sources.pop(config_id, None)
+            else:
+                self.flatfield_sources[config_id] = previous
+            raise
+
+        self.invalidate_flatfield(config_id)
+        return resolved
+
+    def get_flatfield_source(self, config_id: str) -> Optional[str]:
+        """Return the direct source configuration used for flatfield reuse, if any."""
+        return self.flatfield_sources.get(config_id)
+
+    def resolve_flatfield_config(self, config_id: str) -> str:
+        """Resolve the effective configuration that provides the flatfield for one target configuration."""
+        current = str(config_id).strip()
+        if not current:
+            raise ValueError("config_id must not be empty")
+        seen: list[str] = []
+        while True:
+            if current in seen:
+                cycle = " -> ".join([*seen, current])
+                raise ValueError(f"Cycle detected in flatfield source mapping: {cycle}")
+            seen.append(current)
+            source = self.flatfield_sources.get(current)
+            if source is None or source == current:
+                return current
+            current = source
+
+    def build_water_flatfield(
+        self,
+        config_id: str,
+        *,
+        output_path: str | Path | None = None,
+        overwrite: bool = False,
+        detector_number_for_transmission: int = 0,
+    ) -> Path:
+        """Compute and persist the water flatfield for one configuration."""
+        from .normalization import build_water_flatfield_from_workflow_context
+
+        return build_water_flatfield_from_workflow_context(
+            self,
+            config_id,
+            output_path=output_path,
+            overwrite=overwrite,
+            detector_number_for_transmission=detector_number_for_transmission,
+        )
 
     def compute_transmissions(self, *, detector_number: int = 0) -> TransmissionValues:
         """Compute transmissions for sample and empty-cell transmission runs."""
@@ -469,32 +749,45 @@ class WorkflowContext:
             for key, path in self.iter_runs(entity=cast(Entity, entity), mode="transmission"):
                 if key.sample_name is None:
                     continue
+                empty_beam_path = self.get_empty_beam(key.config_id, "transmission")
+                roi = self.get_roi(key.config_id)
+                if empty_beam_path is None or roi is None:
+                    self.warn(
+                        "Skipping transmission computation because prerequisites are missing",
+                        where="compute_transmissions",
+                        key=key.short(),
+                        missing_empty_beam=empty_beam_path is None,
+                        missing_roi=roi is None,
+                    )
+                    continue
                 value = compute_transmission(
                     path,
-                    self.get_empty_beam(key.config_id, "transmission"),
-                    self.get_roi(key.config_id),
+                    empty_beam_path,
+                    roi,
                     detector_number=detector_number,
                 )
                 self.set_transmission(key.sample_name, key.config_id, value)
+                if key.entity == "empty_cell":
+                    self.set_empty_cell_transmission(key.config_id, value)
         return dict(self.transmissions)
 
-    def get_reference_file(self, ref_name: Entity, mode: Mode, config_id: str) -> Path:
-        """Return the path of a reference file for a configuration."""
+    def get_reference_file(self, ref_name: Entity, mode: Mode, config_id: str) -> Optional[Path]:
+        """Return the path of a reference file for a configuration, or ``None`` when missing."""
         if ref_name == "dark":
             if mode != "scattering":
-                raise KeyError(f"Missing dark file for config_id={config_id}, mode={mode}")
+                return None
             return self.get_dark(config_id)
         if ref_name == "empty_beam":
             return self.get_empty_beam(config_id, mode)
         if ref_name == "empty_cell":
             return self.get_empty_cell(config_id, mode)
+        if ref_name == "water":
+            return self.get_water(config_id, mode)
 
         # Fallback to the run registry for references not yet mirrored in dedicated stores.
         for key, path in self.iter_runs(config_id=config_id, entity=ref_name, mode=mode):
             return path
-        raise KeyError(
-            f"Missing reference file for entity={ref_name}, mode={mode}, config_id={config_id}"
-        )
+        return None
 
     def set(self, key: str, value: Any) -> None:
         """Store arbitrary workflow data."""
@@ -633,8 +926,10 @@ def _runs_rows(workflow_context: WorkflowContext) -> list[dict[str, str]]:
     rows: list[tuple[int, dict[str, str]]] = []
     for key, path in workflow_context.runs.items():
         transmission = None
+        thickness = None
         if key.sample_name is not None:
             transmission = workflow_context.transmissions.get((key.sample_name, key.config_id))
+            thickness = workflow_context.sample_thicknesses.get((key.sample_name, key.config_id))
 
         stat = path.stat()
         timestamp_ns = getattr(stat, "st_birthtime_ns", None)
@@ -648,6 +943,7 @@ def _runs_rows(workflow_context: WorkflowContext) -> list[dict[str, str]]:
                     "config_id": key.config_id,
                     "mode": key.mode,
                     "entity": key.entity,
+                    "thickness": _format_value(thickness),
                     "transmission": _format_value(transmission),
                     "file_path": path.name,
                 },
@@ -661,6 +957,7 @@ def _runs_rows(workflow_context: WorkflowContext) -> list[dict[str, str]]:
             item[1]["config_id"],
             item[1]["mode"],
             item[1]["entity"],
+            item[1]["thickness"],
             item[1]["transmission"],
             item[1]["file_path"],
         )
@@ -710,6 +1007,64 @@ def _read_text_dataset(dataset: h5py.Dataset) -> str:
     return _read_text_value(dataset[()])
 
 
+def _read_bundle_definition_and_config_id(file_path: Path) -> tuple[str, Optional[str]]:
+    """Read the NeXus definition and optional config_id from a bundle-like file."""
+    with h5py.File(file_path, "r") as handle:
+        definition = ""
+        if "/entry/definition" in handle:
+            definition = _read_text_dataset(handle["/entry/definition"]).strip()
+        config_id = None
+        if "/entry/config_id" in handle:
+            config_id = _read_text_dataset(handle["/entry/config_id"]).strip() or None
+        return definition, config_id
+
+
+def _read_mask_bundle_configuration(file_path: Path):
+    """Read the configuration snapshot stored in one SCARLET_masks bundle."""
+    from scarlet.workflow.configuration import configuration_from_nexus
+
+    configuration, _ = configuration_from_nexus(file_path, entry_path="/entry")
+    return configuration
+
+
+def _load_masks_from_bundle(file_path: Path) -> DetectorMasks:
+    """Load detector masks from a SCARLET_masks bundle."""
+    masks: DetectorMasks = {}
+    with h5py.File(file_path, "r") as handle:
+        definition_path = "/entry/definition"
+        if definition_path not in handle:
+            raise ValueError(f"Missing definition dataset in mask bundle: {file_path}")
+        definition = _read_text_dataset(handle[definition_path]).strip()
+        if definition != "SCARLET_masks":
+            raise ValueError(f"Unsupported mask bundle definition in {file_path}: {definition!r}")
+
+        convention_path = "/entry/meta/mask_convention"
+        if convention_path in handle:
+            convention = _read_text_dataset(handle[convention_path]).strip()
+            if convention != "1=masked, 0=valid":
+                raise ValueError(f"Unsupported mask convention in {file_path}: {convention!r}")
+
+        mask_group_path = "/entry/mask"
+        if mask_group_path not in handle or not isinstance(handle[mask_group_path], h5py.Group):
+            raise ValueError(f"Missing mask group in mask bundle: {file_path}")
+
+        for name, dataset in handle[mask_group_path].items():
+            match = re.fullmatch(r"mask_detector(\d+)", name)
+            if match is None or not isinstance(dataset, h5py.Dataset):
+                continue
+            mask = np.asarray(dataset[()], dtype=np.uint8)
+            if mask.ndim != 2:
+                raise ValueError(
+                    f"Mask dataset must be 2D for detector{int(match.group(1))} in {file_path}, got {mask.shape}"
+                )
+            if not np.all((mask == 0) | (mask == 1)):
+                raise ValueError(
+                    f"Mask dataset for detector{int(match.group(1))} in {file_path} must contain only 0/1 values"
+                )
+            masks[int(match.group(1))] = mask
+    return masks
+
+
 def _read_sample_name(path: Path) -> str:
     """Extract the sample name from a raw or converted NeXus file."""
     with h5py.File(path, "r") as handle:
@@ -724,6 +1079,22 @@ def _read_sample_name(path: Path) -> str:
                 except Exception:
                     continue
     return path.stem
+
+
+def _read_sample_thickness(path: Path) -> Optional[float]:
+    """Extract the optional sample thickness from a raw or converted NeXus file."""
+    with h5py.File(path, "r") as handle:
+        for entry_path in ("/raw_data", "/entry", "/entry0", "/entry1"):
+            dataset_path = f"{entry_path}/sample/thickness"
+            if dataset_path not in handle:
+                continue
+            try:
+                value = float(np.asarray(handle[dataset_path][()]).reshape(()))
+            except Exception:
+                continue
+            if np.isfinite(value):
+                return value
+    return None
 
 
 def _read_beam_centers_from_file(path: Path) -> dict[int, BeamCenter]:
@@ -764,6 +1135,8 @@ def _classify_entity_from_sample_name(sample_name: str) -> Entity:
         return "empty_beam"
     if normalized == "emptycell":
         return "empty_cell"
+    if normalized.startswith("water") or normalized == "h2o":
+        return "water"
     if normalized in {"cd", "cadmium", "b4c", "dark"}:
         return "dark"
     return "sample"
@@ -965,6 +1338,7 @@ def _ingest_raw_directory_into_workflow_context(
 
         sample_name = _read_sample_name(converted_path)
         entity = _classify_entity_from_sample_name(sample_name)
+        sample_thickness = _read_sample_thickness(converted_path)
         mode_guess = guess_measurement_mode_from_nexus_image(converted_path)
         if mode_guess.mode == "transmission":
             mode: Mode = "transmission"
@@ -995,6 +1369,8 @@ def _ingest_raw_directory_into_workflow_context(
                 new_path=str(converted_path),
             )
         ctx.add_run(run_key, converted_path)
+        if sample_thickness is not None and entity in {"sample", "water"}:
+            ctx.set_sample_thickness(sample_name, config_id, sample_thickness)
         existing_run_paths.add(converted_path)
 
     _initialize_transmission_geometry(ctx, where=where)
@@ -1057,58 +1433,3 @@ def initialize_workflow_context_from_raw_directory(
         overwrite=overwrite,
         where="initialize_workflow_context_from_raw_directory",
     )
-
-
-def _legacy_context_api_removed(name: str) -> NotImplementedError:
-    """Build a consistent error for legacy context APIs removed by the migration."""
-    return NotImplementedError(
-        f"{name} is not available in the current workflow context API. "
-        "Use WorkflowContext and initialize_workflow_context_from_raw_directory() "
-        "from scarlet.workflow.context instead."
-    )
-
-
-def save_workflow_context(*args: Any, **kwargs: Any) -> WorkflowContext:
-    raise _legacy_context_api_removed("save_workflow_context")
-
-
-def load_workflow_context(*args: Any, **kwargs: Any) -> WorkflowContext:
-    raise _legacy_context_api_removed("load_workflow_context")
-
-
-def update_workflow_context_from_raw_directory(*args: Any, **kwargs: Any) -> WorkflowContext:
-    raise _legacy_context_api_removed("update_workflow_context_from_raw_directory")
-
-
-def write_runs_report_csv(*args: Any, **kwargs: Any) -> Path:
-    raise _legacy_context_api_removed("write_runs_report_csv")
-
-
-def update_workflow_context_from_runs_report_csv(*args: Any, **kwargs: Any) -> WorkflowContext:
-    if not args:
-        raise TypeError("update_workflow_context_from_runs_report_csv requires a WorkflowContext instance")
-    workflow_context = args[0]
-    if not isinstance(workflow_context, WorkflowContext):
-        raise TypeError("First argument must be a WorkflowContext")
-    csv_path = args[1] if len(args) > 1 else kwargs.get("csv_path")
-    return workflow_context.update_from_runs_table_csv(csv_path)
-
-
-def generate_reference_files_from_workflow_context(*args: Any, **kwargs: Any) -> WorkflowContext:
-    raise _legacy_context_api_removed("generate_reference_files_from_workflow_context")
-
-
-def update_transmissions_from_workflow_context(*args: Any, **kwargs: Any) -> WorkflowContext:
-    raise _legacy_context_api_removed("update_transmissions_from_workflow_context")
-
-
-def update_reference_masks_from_workflow_context(*args: Any, **kwargs: Any) -> WorkflowContext:
-    raise _legacy_context_api_removed("update_reference_masks_from_workflow_context")
-
-
-def integrate_scattering_from_workflow_context(*args: Any, **kwargs: Any) -> list[Any]:
-    raise _legacy_context_api_removed("integrate_scattering_from_workflow_context")
-
-
-def run_reduction_pipeline_from_workflow_context(*args: Any, **kwargs: Any) -> Any:
-    raise _legacy_context_api_removed("run_reduction_pipeline_from_workflow_context")
