@@ -13,6 +13,7 @@ from scarlet.io.nexus_reader import read_configuration, resolve_entry_path
 from scarlet.reduction.correction import normalize_by_solid_angle, subtract_scattering_references
 from scarlet.reduction.geometry import compute_q_norm_map
 from scarlet.reduction.integration import azimuthal_average
+from scarlet.reduction.resolution import compute_beam_divergence, compute_q_resolution_circular, compute_q_resolution_rectangular
 from scarlet.workflow.configuration import Configuration
 from scarlet.workflow.context import RunKey, WorkflowContext
 from scarlet.workflow.normalization import load_flatfield_file
@@ -105,6 +106,83 @@ def _get_wavelength(configuration: Configuration) -> float:
     if not np.isfinite(wavelength) or wavelength <= 0.0:
         raise ValueError(f"Invalid wavelength in configuration {configuration.config_id!r}: {wavelength!r}")
     return wavelength
+
+
+def _spread_to_wavelength_uncertainty(wavelength: float, spread: float) -> float:
+    spread_value = abs(float(spread))
+    if spread_value < 1.0:
+        return wavelength * spread_value
+    if spread_value <= 100.0:
+        return wavelength * (spread_value / 100.0)
+    return spread_value
+
+
+def _read_wavelength_uncertainty(
+    file_path: str | Path,
+    *,
+    wavelength: float,
+) -> float:
+    file_path = Path(file_path).resolve()
+    entry_path = resolve_entry_path(file_path)
+
+    with h5py.File(file_path, "r") as handle:
+        for dataset_path in (
+            f"{entry_path}/instrument/monochromator/wavelength_error",
+            f"{entry_path}/instrument/source/incident_wavelength_spread",
+            f"{entry_path}/instrument/velocity_selector/wavelength_spread",
+        ):
+            if dataset_path not in handle:
+                continue
+            raw_value = float(np.asarray(handle[dataset_path][()]).reshape(()))
+            if not np.isfinite(raw_value):
+                continue
+            if dataset_path.endswith("wavelength_error"):
+                return abs(raw_value)
+            return _spread_to_wavelength_uncertainty(wavelength, raw_value)
+    return 0.0
+
+
+def _aperture_opening(aperture: Any) -> tuple[float, float] | None:
+    aperture_type = getattr(aperture, "type", None)
+    if aperture_type == "slit":
+        x_gap = getattr(aperture, "x_gap", None)
+        y_gap = getattr(aperture, "y_gap", None)
+        if x_gap is None or y_gap is None:
+            return None
+        return float(x_gap), float(y_gap)
+    if aperture_type == "pinhole":
+        diameter = getattr(aperture, "diameter", None)
+        if diameter is None:
+            return None
+        diameter_value = float(diameter)
+        return diameter_value, diameter_value
+    return None
+
+def _aperture_type(aperture: Any) -> str | None:
+    aperture_type = getattr(aperture, "type", None)
+    if aperture_type == "slit":
+        return "slit"
+    if aperture_type == "pinhole":
+        return "pinhole"
+    return None
+
+
+def _get_beam_divergence(configuration: Configuration) -> float:
+    collimation = configuration.collimation
+    if collimation is None:
+        return 0.0
+
+    entry_slit_size = _aperture_opening(collimation.aperture1)
+    exit_slit_size = _aperture_opening(collimation.aperture2)
+    if entry_slit_size is None or exit_slit_size is None:
+        return 0.0
+
+    sigma_div_x, sigma_div_y = compute_beam_divergence(
+        entry_slit_size=entry_slit_size,
+        exit_slit_size=exit_slit_size,
+        collimation_distance=float(collimation.collimation_distance),
+    )
+    return max(abs(float(sigma_div_x)), abs(float(sigma_div_y)))
 
 
 def _read_detector_beam_center(
@@ -270,6 +348,7 @@ def write_azimuthal_text_file(
     sample_name: str,
     config_id: str,
     transmission: float | None,
+    source_nexus_file: str | Path | None = None,
 ) -> Path:
     """Write one azimuthal average curve to a 4-column text file."""
     output_path = Path(file_path).resolve()
@@ -295,15 +374,17 @@ def write_azimuthal_text_file(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     matrix = np.column_stack((q_values, intensity_values, intensity_error_values, q_error_values))
     transmission_text = "nan" if transmission is None else f"{float(transmission):.6g}"
+    source_nexus_file_text = "unknown" if source_nexus_file is None else Path(source_nexus_file).name
     header = "\n".join(
         (
             f"sample_name: {sample_name}",
             f"config_id: {config_id}",
             f"transmission: {transmission_text}",
+            f"source_nexus_file: {source_nexus_file_text}",
             "q I I_error q_error",
         )
     )
-    np.savetxt(output_path, matrix, header=header, comments="")
+    np.savetxt(output_path, matrix, header=header)
     return output_path
 
 
@@ -327,6 +408,8 @@ def write_azimuthal_average_text_outputs(
         if "q" not in detector.coords:
             raise ValueError(f"Missing q coordinate for detector{detector_number} azimuthal output")
         q_coord = detector.coords["q"]
+        q_error_coord = detector.coords.get("q_error")
+        q_error = None if q_error_coord is None else np.asarray(q_error_coord.values, dtype=np.float64)
         file_path = _build_azimuthal_text_output_path(
             output_dir=target_dir,
             sample_name=state.sample_name,
@@ -339,10 +422,11 @@ def write_azimuthal_average_text_outputs(
                 q=q_coord.values,
                 intensity=detector.data.values,
                 intensity_error=None if detector.data.variances is None else np.sqrt(np.asarray(detector.data.variances, dtype=np.float64)),
-                q_error=None if q_coord.variances is None else np.sqrt(np.asarray(q_coord.variances, dtype=np.float64)),
+                q_error=q_error,
                 sample_name=state.sample_name,
                 config_id=state.config_id,
                 transmission=state.transmission,
+                source_nexus_file=state.file_path,
             )
         )
     return output_paths
@@ -565,7 +649,10 @@ def normalization_step(state: ReductionState) -> ReductionState:
 def azimuthal_averaging_step(state: ReductionState) -> ReductionState:
     configuration = _read_state_configuration(state)
     wavelength = _get_wavelength(configuration)
-
+    wavelength_uncertainty = 0.0 if not state.file_path else _read_wavelength_uncertainty(state.file_path, wavelength=wavelength)
+    aperture_type = _aperture_type(configuration.collimation.aperture2)
+    aperture2_opening = _aperture_opening(configuration.collimation.aperture2)
+    aperture1_opening = _aperture_opening(configuration.collimation.aperture1)
     integrated: dict[int, Any] = {}
     for detector_number, detector in state.detectors.items():
         detector_array = _require_dataarray(detector, name=f"detector{detector_number}", ndim=2)
@@ -579,6 +666,30 @@ def azimuthal_averaging_step(state: ReductionState) -> ReductionState:
             pixel_size=pixel_size,
             wavelength=wavelength,
         )
+        if aperture_type == "circular":
+            q_error = compute_q_resolution_circular(
+                q_map,
+                r1=aperture1_opening[0]/2,
+                r2=aperture2_opening[0]/2,
+                collimation_distance=configuration.collimation.collimation_distance,
+                distance=detector_distance,
+                wavelength_spread=wavelength_uncertainty,
+                wavelength=wavelength,
+                pixel_size=pixel_size,
+            )
+        elif aperture_type == "slit":
+            q_error = compute_q_resolution_rectangular(
+                q_map,
+                x1=aperture1_opening[0],
+                y1=aperture1_opening[1],
+                x2=aperture2_opening[0],
+                y2=aperture2_opening[1],
+                collimation_distance=configuration.collimation.collimation_distance,
+                distance=detector_distance,     
+                wavelength_spread=wavelength_uncertainty,
+                wavelength=wavelength,
+                pixel_size=pixel_size,
+            )
 
         mask = state.workflow.get_mask(state.config_id, detector_number)
         if mask is not None and mask.shape != detector_array.shape:
@@ -591,6 +702,7 @@ def azimuthal_averaging_step(state: ReductionState) -> ReductionState:
             detector_array,
             q_map,
             mask=mask,
+            q_error=q_error,
             n_bins=state.azimuthal_n_bins,
             q_scale=state.azimuthal_q_scale,
         )
@@ -626,46 +738,25 @@ class ReductionPipeline:
     steps: tuple[ReductionStep, ...] = field(default_factory=tuple)
 
     @classmethod
-    def default(cls) -> "ReductionPipeline":
-        return cls(steps=(as_reduction_step(subtract_references_step),))
-
-    @classmethod
-    def with_water_normalization(cls) -> "ReductionPipeline":
-        return cls(
-            steps=(
-                as_reduction_step(subtract_references_step),
-                as_reduction_step(normalization_step),
-            )
-        )
-
-    @classmethod
-    def with_processed_output(cls) -> "ReductionPipeline":
-        return cls(
-            steps=(
-                as_reduction_step(subtract_references_step),
-                as_reduction_step(normalization_step),
-                as_reduction_step(save_processed_detectors_step),
-            )
-        )
-
-    @classmethod
     def with_azimuthal_text_output(cls) -> "ReductionPipeline":
         return cls(
             steps=(
                 as_reduction_step(subtract_references_step),
                 as_reduction_step(normalization_step),
                 as_reduction_step(azimuthal_averaging_step),
+                as_reduction_step(save_processed_detectors_step),
                 as_reduction_step(save_azimuthal_text_step),
             )
         )
 
     @classmethod
-    def with_azimuthal_averaging(cls) -> "ReductionPipeline":
+    def default(cls) -> "ReductionPipeline":
         return cls(
             steps=(
                 as_reduction_step(subtract_references_step),
                 as_reduction_step(normalization_step),
                 as_reduction_step(azimuthal_averaging_step),
+                as_reduction_step(save_processed_detectors_step),
             )
         )
 

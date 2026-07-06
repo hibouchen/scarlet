@@ -10,6 +10,7 @@ import numpy as np
 
 from scarlet.reduction.geometry import compute_q_norm_map
 from scarlet.reduction.integration import azimuthal_average
+from scarlet.reduction.resolution import compute_q_uncertainty_map
 from scarlet.workflow.configuration import Configuration
 from scarlet.workflow.context import RunKey, WorkflowContext
 from scarlet.workflow.pipeline import (
@@ -118,16 +119,18 @@ class TestAzimuthalTextWriter(unittest.TestCase):
                 sample_name="sample_a",
                 config_id="cfg",
                 transmission=0.5,
+                source_nexus_file="sample_scattering.nxs",
             )
 
             self.assertEqual(output_path.name, "sample_config_cfg.txt")
             lines = output_path.read_text(encoding="utf-8").splitlines()
-            self.assertEqual(lines[0], "sample_name: sample_a")
-            self.assertEqual(lines[1], "config_id: cfg")
-            self.assertEqual(lines[2], "transmission: 0.5")
-            self.assertEqual(lines[3], "q I I_error q_error")
-            self.assertEqual(len(lines[4].split()), 4)
+            self.assertEqual(lines[0], "# sample_name: sample_a")
+            self.assertEqual(lines[1], "# config_id: cfg")
+            self.assertEqual(lines[2], "# transmission: 0.5")
+            self.assertEqual(lines[3], "# source_nexus_file: sample_scattering.nxs")
+            self.assertEqual(lines[4], "# q I I_error q_error")
             self.assertEqual(len(lines[5].split()), 4)
+            self.assertEqual(len(lines[6].split()), 4)
 
 
 @unittest.skipIf(importlib.util.find_spec("scipp") is None, "scipp is required for workflow pipeline tests")
@@ -194,6 +197,13 @@ class TestWorkflowPipeline(unittest.TestCase):
                 original_detector,
                 q_map,
                 mask=np.asarray([[0, 1], [0, 0]], dtype=np.uint8),
+                q_error=compute_q_uncertainty_map(
+                    original_detector.data.values,
+                    beam_center=(0.5, 0.5),
+                    detector_distance=4.2,
+                    pixel_size=(0.001, 0.001),
+                    wavelength=6.0,
+                ),
                 n_bins=state.azimuthal_n_bins,
                 q_scale=state.azimuthal_q_scale,
             ).to_data_array()
@@ -201,6 +211,9 @@ class TestWorkflowPipeline(unittest.TestCase):
             self.assertEqual(updated.detectors[0].ndim, 1)
             np.testing.assert_allclose(updated.detectors[0].data.values, expected.data.values)
             np.testing.assert_allclose(updated.detectors[0].coords["q"].values, expected.coords["q"].values)
+            self.assertIsNone(updated.detectors[0].coords["q"].variances)
+            self.assertIsNone(expected.coords["q"].variances)
+            np.testing.assert_allclose(updated.detectors[0].coords["q_error"].values, expected.coords["q_error"].values)
             np.testing.assert_array_equal(updated.detectors[0].coords["counts"].values, expected.coords["counts"].values)
             self.assertIn("Computed azimuthal average", " ".join(updated.notes))
 
