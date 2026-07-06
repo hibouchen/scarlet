@@ -20,6 +20,124 @@ from scarlet.validation.schema_validator import validate_nexus_file
 
 @unittest.skipIf(h5py is None, "h5py/numpy not available")
 class TestSansLlbConverterSchema(unittest.TestCase):
+    @staticmethod
+    def _write_minimal_sansllb_input(
+        input_path: Path,
+        *,
+        sample_mask_shape: str = "square",
+        sample_mask_size: float = 8.0,
+        sample_mask_size_y: float | None = 8.0,
+    ) -> None:
+        raw0 = numpy.array([[10.0, 20.0], [30.0, 40.0]], dtype=numpy.float64)
+        with h5py.File(input_path, "w") as fin:
+            entry = fin.create_group("entry0")
+            entry.attrs["NX_class"] = b"NXentry"
+
+            sample = entry.create_group("sample")
+            sample.attrs["NX_class"] = b"NXsample"
+            sample.create_dataset("name", data=numpy.bytes_("sample"))
+
+            control = entry.create_group("control")
+            control.attrs["NX_class"] = b"NXmonitor"
+            control.create_dataset("count_time", data=10.0)
+
+            monitor2 = entry.create_group("monitor2")
+            monitor2.attrs["NX_class"] = b"NXmonitor"
+            monitor2.create_dataset("integral", data=500.0)
+
+            instrument = entry.create_group("SANS-LLB")
+            instrument.attrs["NX_class"] = b"NXinstrument"
+
+            source = instrument.create_group("source")
+            incident_wavelength = source.create_dataset("incident_wavelength", data=0.6)
+            incident_wavelength.attrs["units"] = b"nm"
+
+            aperture = instrument.create_group("aperture")
+            x_gap = aperture.create_dataset("x_gap", data=0.01)
+            x_gap.attrs["units"] = b"m"
+            y_gap = aperture.create_dataset("y_gap", data=0.01)
+            y_gap.attrs["units"] = b"m"
+
+            sample_mask = instrument.create_group("sample_mask")
+            sample_mask.create_dataset("shape", data=numpy.array([numpy.bytes_(sample_mask_shape)]))
+            size = sample_mask.create_dataset("size", data=numpy.array([sample_mask_size], dtype=numpy.float64))
+            size.attrs["units"] = b"mm"
+            if sample_mask_size_y is not None:
+                size_y = sample_mask.create_dataset(
+                    "size_y", data=numpy.array([sample_mask_size_y], dtype=numpy.float64)
+                )
+                size_y.attrs["units"] = b"mm"
+
+            collimator = instrument.create_group("collimator")
+            collimator_length = collimator.create_dataset("length", data=1.0)
+            collimator_length.attrs["units"] = b"m"
+            collimator_distance = collimator.create_dataset("distance", data=0.2)
+            collimator_distance.attrs["units"] = b"m"
+            for slit_name, distance in (("slit0", 1.2), ("slit1", 0.2)):
+                slit = collimator.create_group(slit_name)
+                slit_x_gap = slit.create_dataset("x_gap", data=0.01)
+                slit_x_gap.attrs["units"] = b"m"
+                slit_y_gap = slit.create_dataset("y_gap", data=0.01)
+                slit_y_gap.attrs["units"] = b"m"
+                slit_distance = slit.create_dataset("distance", data=distance)
+                slit_distance.attrs["units"] = b"m"
+
+            central_detector = instrument.create_group("central_detector")
+            central_detector.attrs["NX_class"] = b"NXdetector"
+            central_detector.create_dataset("data", data=raw0)
+            central_detector.create_dataset("x_pixel_size", data=0.005)
+            central_detector.create_dataset("y_pixel_size", data=0.005)
+            central_detector.create_dataset("beam_center_x", data=0.5)
+            central_detector.create_dataset("beam_center_y", data=0.5)
+            central_detector.create_dataset("dead_time", data=1.0e-3)
+
+    def test_sansllb_converter_maps_square_sample_mask_to_aperture2_slit(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            input_path = Path(td) / "sansllb_square_mask.hdf"
+            output_path = Path(td) / "sansllb_square_mask_out.h5"
+            self._write_minimal_sansllb_input(input_path, sample_mask_shape="square", sample_mask_size=8.0, sample_mask_size_y=6.0)
+
+            convert_sansllb_to_scarlet_nxsas_raw(input_path, output_path, overwrite=True)
+
+            with h5py.File(output_path, "r") as fout:
+                ap2 = fout["/raw_data/instrument/collimation/aperture2"]
+                self.assertEqual(ap2.attrs["NX_class"], b"NXslit")
+                self.assertAlmostEqual(float(ap2["x_gap"][()]), 0.008)
+                self.assertAlmostEqual(float(ap2["y_gap"][()]), 0.006)
+                self.assertEqual(ap2["x_gap"].attrs["units"], b"m")
+                self.assertEqual(ap2["y_gap"].attrs["units"], b"m")
+
+    def test_sansllb_converter_maps_circle_sample_mask_to_aperture2_pinhole(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            input_path = Path(td) / "sansllb_circle_mask.hdf"
+            output_path = Path(td) / "sansllb_circle_mask_out.h5"
+            self._write_minimal_sansllb_input(input_path, sample_mask_shape="circle", sample_mask_size=12.0, sample_mask_size_y=12.0)
+
+            convert_sansllb_to_scarlet_nxsas_raw(input_path, output_path, overwrite=True)
+
+            with h5py.File(output_path, "r") as fout:
+                ap2 = fout["/raw_data/instrument/collimation/aperture2"]
+                self.assertEqual(ap2.attrs["NX_class"], b"NXpinhole")
+                self.assertAlmostEqual(float(ap2["diameter"][()]), 0.012)
+                self.assertEqual(ap2["diameter"].attrs["units"], b"m")
+
+    def test_sansllb_converter_uses_collimator_length_for_collimation_distance(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            input_path = Path(td) / "sansllb_collimation_length.hdf"
+            output_path = Path(td) / "sansllb_collimation_length_out.h5"
+            self._write_minimal_sansllb_input(input_path)
+
+            with h5py.File(input_path, "a") as fin:
+                length = fin["/entry0/SANS-LLB/collimator/length"]
+                length[...] = 8_000.0
+                length.attrs["units"] = b"mm"
+
+            convert_sansllb_to_scarlet_nxsas_raw(input_path, output_path, overwrite=True)
+
+            with h5py.File(output_path, "r") as fout:
+                self.assertAlmostEqual(float(fout["/raw_data/instrument/collimation/collimation_distance"][()]), 8.0)
+                self.assertEqual(fout["/raw_data/instrument/collimation/collimation_distance"].attrs["units"], b"m")
+
     def test_sansllb_converter_deadtime_corrects_all_detector_views(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             input_path = Path(td) / "sansllb_input.hdf"
@@ -55,6 +173,13 @@ class TestSansLlbConverterSchema(unittest.TestCase):
                 x_gap.attrs["units"] = b"m"
                 y_gap = aperture.create_dataset("y_gap", data=0.01)
                 y_gap.attrs["units"] = b"m"
+
+                sample_mask = instrument.create_group("sample_mask")
+                sample_mask.create_dataset("shape", data=numpy.array([numpy.bytes_("square")]))
+                size = sample_mask.create_dataset("size", data=numpy.array([8.0], dtype=numpy.float64))
+                size.attrs["units"] = b"mm"
+                size_y = sample_mask.create_dataset("size_y", data=numpy.array([8.0], dtype=numpy.float64))
+                size_y.attrs["units"] = b"mm"
 
                 collimator = instrument.create_group("collimator")
                 collimator_length = collimator.create_dataset("length", data=1.0)
@@ -143,6 +268,13 @@ class TestSansLlbConverterSchema(unittest.TestCase):
                 x_gap.attrs["units"] = b"m"
                 y_gap = aperture.create_dataset("y_gap", data=0.01)
                 y_gap.attrs["units"] = b"m"
+
+                sample_mask = instrument.create_group("sample_mask")
+                sample_mask.create_dataset("shape", data=numpy.array([numpy.bytes_("square")]))
+                size = sample_mask.create_dataset("size", data=numpy.array([8.0], dtype=numpy.float64))
+                size.attrs["units"] = b"mm"
+                size_y = sample_mask.create_dataset("size_y", data=numpy.array([8.0], dtype=numpy.float64))
+                size_y.attrs["units"] = b"mm"
 
                 collimator = instrument.create_group("collimator")
                 collimator_length = collimator.create_dataset("length", data=1.0)
@@ -233,9 +365,19 @@ class TestSansLlbConverterSchema(unittest.TestCase):
                     self.assertAlmostEqual(actual, expected)
             self.assertEqual(fout["/raw_data/instrument/collimation/collimation_distance"].attrs["units"], b"m")
             self.assertEqual(fout["/raw_data/instrument/collimation/aperture2"].attrs["NX_class"], b"NXslit")
-            self.assertEqual(float(fout["/raw_data/instrument/collimation/aperture2/x_gap"][()]), 0.01)
+            expected_ap2_gap = 0.01
+            sample_mask_path = f"{entry}/SANS-LLB/sample_mask"
+            if sample_mask_path in fin:
+                size_ds = fin[f"{sample_mask_path}/size"]
+                expected_ap2_gap = float(size_ds[()].reshape(-1)[0])
+                units = size_ds.attrs.get("units")
+                if isinstance(units, (bytes, bytearray)):
+                    units = units.decode(errors="replace")
+                if str(units).lower() == "mm":
+                    expected_ap2_gap /= 1000.0
+            self.assertEqual(float(fout["/raw_data/instrument/collimation/aperture2/x_gap"][()]), expected_ap2_gap)
             self.assertEqual(fout["/raw_data/instrument/collimation/aperture2/x_gap"].attrs["units"], b"m")
-            self.assertEqual(float(fout["/raw_data/instrument/collimation/aperture2/y_gap"][()]), 0.01)
+            self.assertEqual(float(fout["/raw_data/instrument/collimation/aperture2/y_gap"][()]), expected_ap2_gap)
 
             expected_monitors = sorted(
                 key for key in fin[entry].keys() if key.startswith("monitor") and isinstance(fin[f"{entry}/{key}"], h5py.Group)

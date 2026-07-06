@@ -97,6 +97,8 @@ class TestIntegrationWithScippDataArray(unittest.TestCase):
         integrated = result.to_data_array()
         np.testing.assert_allclose(integrated.data.values, result.intensity)
         np.testing.assert_allclose(integrated.coords["q"].values, result.q)
+        self.assertIsNone(integrated.coords["q"].variances)
+        np.testing.assert_allclose(integrated.coords["q_error"].values, result.q_error)
         np.testing.assert_array_equal(integrated.coords["counts"].values, result.counts)
 
     def test_azimuthal_average_requires_q_coord_when_q_map_is_omitted(self) -> None:

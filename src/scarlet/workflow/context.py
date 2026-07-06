@@ -637,15 +637,55 @@ class WorkflowContext:
 
     def _find_matching_config_ids_for_mask_bundle(self, file_path: Path) -> list[str]:
         """Return workflow configuration ids compatible with one mask bundle snapshot."""
-        from scarlet.workflow.configuration import compare_configurations
+        matched_from_source = self._find_matching_config_ids_from_mask_bundle_source(file_path)
+        if matched_from_source:
+            return matched_from_source
+
+        from scarlet.workflow.configuration import compare_configurations, compare_configurations_detector_geometry
 
         bundle_configuration = _read_mask_bundle_configuration(file_path)
+        matched_config_ids: list[str] = []
+        for existing_config_id, existing_configuration in self.configurations.items():
+            same, _ = compare_configurations_detector_geometry(bundle_configuration, existing_configuration)
+            if same:
+                matched_config_ids.append(existing_config_id)
+        if matched_config_ids:
+            return matched_config_ids
+
         matched_config_ids: list[str] = []
         for existing_config_id, existing_configuration in self.configurations.items():
             same, _ = compare_configurations(bundle_configuration, existing_configuration)
             if same:
                 matched_config_ids.append(existing_config_id)
         return matched_config_ids
+
+    def _find_matching_config_ids_from_mask_bundle_source(self, file_path: Path) -> list[str]:
+        """Return configuration ids inferred from the optional mask-bundle source file metadata."""
+        source_file = _read_mask_bundle_source_file(file_path)
+        if source_file is None:
+            return []
+
+        exact_matches = sorted(
+            {
+                run_key.config_id
+                for run_key, run_path in self.runs.items()
+                if run_path.resolve() == source_file
+            }
+        )
+        if exact_matches:
+            return exact_matches
+
+        source_stem = source_file.stem
+        if not source_stem:
+            return []
+        stem_matches = sorted(
+            {
+                run_key.config_id
+                for run_key, run_path in self.runs.items()
+                if run_path.stem == source_stem
+            }
+        )
+        return stem_matches
 
     def get_mask(self, config_id: str, detector_number: int) -> Optional[np.ndarray]:
         """Return one detector mask for a configuration, loading a SCARLET_masks bundle when configured."""
@@ -1025,6 +1065,18 @@ def _read_mask_bundle_configuration(file_path: Path):
 
     configuration, _ = configuration_from_nexus(file_path, entry_path="/entry")
     return configuration
+
+
+def _read_mask_bundle_source_file(file_path: Path) -> Path | None:
+    """Read the optional source file metadata stored in one SCARLET_masks bundle."""
+    with h5py.File(file_path, "r") as handle:
+        source_file_path = "/entry/meta/source_file"
+        if source_file_path not in handle:
+            return None
+        raw = _read_text_dataset(handle[source_file_path]).strip()
+        if not raw:
+            return None
+        return Path(raw).resolve()
 
 
 def _load_masks_from_bundle(file_path: Path) -> DetectorMasks:

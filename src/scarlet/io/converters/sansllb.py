@@ -295,8 +295,8 @@ def _copy_aperture_snapshot(coll_out: h5py.Group, name: str, src: h5py.Group) ->
             _write_dataset(dst_tr, "translation", src_tr["translation"][()], units=units_s)
 
 
-def _derive_aperture_snapshots(coll_out: h5py.Group, element_names: List[str], warnings: List[str]) -> None:
-    """Derive SCARLET aperture1/aperture2 snapshots from the ordered collimation elements."""
+def _derive_aperture1_snapshot(coll_out: h5py.Group, element_names: List[str], warnings: List[str]) -> None:
+    """Derive the SCARLET aperture1 snapshot from the ordered collimation elements."""
     elements = coll_out["elements"]
     aperture_classes = {"NXslit", "NXpinhole", "NXaperture"}
     aperture_names = [name for name in element_names if _as_str(elements[name].attrs.get("NX_class")) in aperture_classes]
@@ -338,12 +338,49 @@ def _derive_aperture_snapshots(coll_out: h5py.Group, element_names: List[str], w
 
     _copy_aperture_snapshot(coll_out, "aperture1", elements[aperture1_name])
 
-    # SANS-LLB does not currently expose aperture2 in the raw file.
-    # Use a temporary default rectangular slit until the upstream metadata exists.
+
+def _write_aperture2_from_sample_mask(
+    fin: h5py.File,
+    inst_in: str,
+    coll_out: h5py.Group,
+    warnings: List[str],
+) -> None:
+    """Map the raw SANS-LLB sample_mask group to the SCARLET aperture2 snapshot."""
+    sample_mask_path = f"{inst_in}/sample_mask"
+    if sample_mask_path not in fin or not isinstance(fin[sample_mask_path], h5py.Group):
+        aperture2 = _ensure_group(coll_out, "aperture2", "NXslit")
+        _write_dataset(aperture2, "x_gap", 0.01, units="m")
+        _write_dataset(aperture2, "y_gap", 0.01, units="m")
+        warnings.append("Missing sample_mask in SANS-LLB raw data; using default aperture2 = NXslit 10 mm x 10 mm.")
+        return
+
+    sample_mask = fin[sample_mask_path]
+    raw_shape = _safe_get(sample_mask, "shape")
+    shape = _as_str(raw_shape).strip().lower() if raw_shape is not None else ""
+    size_m = _length_dataset_to_m(_safe_get_dataset(fin, f"{sample_mask_path}/size"))
+    size_y_m = _length_dataset_to_m(_safe_get_dataset(fin, f"{sample_mask_path}/size_y"))
+
+    if shape == "circle":
+        if size_m is None:
+            warnings.append(f"{sample_mask_path}: circle sample_mask missing size; using default aperture2.")
+        else:
+            aperture2 = _ensure_group(coll_out, "aperture2", "NXpinhole")
+            _write_dataset(aperture2, "diameter", size_m, units="m")
+            return
+
+    if size_m is not None and size_y_m is not None:
+        aperture2 = _ensure_group(coll_out, "aperture2", "NXslit")
+        _write_dataset(aperture2, "x_gap", size_m, units="m")
+        _write_dataset(aperture2, "y_gap", size_y_m, units="m")
+        return
+
     aperture2 = _ensure_group(coll_out, "aperture2", "NXslit")
     _write_dataset(aperture2, "x_gap", 0.01, units="m")
     _write_dataset(aperture2, "y_gap", 0.01, units="m")
-    warnings.append("Using default aperture2 = NXslit 10 mm x 10 mm; not yet available in SANS-LLB raw data.")
+    warnings.append(
+        f"{sample_mask_path}: incomplete sample_mask metadata (shape={shape or 'unknown'}); "
+        "using default aperture2 = NXslit 10 mm x 10 mm."
+    )
 
 
 def _write_collimation(
@@ -487,11 +524,12 @@ def _write_collimation(
     if last_aperture_to_sample_distance_m is None:
         last_aperture_to_sample_distance_m = 0.1
 
-    _derive_aperture_snapshots(
+    _derive_aperture1_snapshot(
         coll_out,
         [name.decode() if isinstance(name, (bytes, bytearray)) else str(name) for name in element_order],
         warnings,
     )
+    _write_aperture2_from_sample_mask(fin, inst_in, coll_out, warnings)
     _write_dataset(coll_out, "collimation_distance", float(collimation_distance_m), units="m")
     _write_dataset(coll_out, "last_aperture_to_sample_distance", float(last_aperture_to_sample_distance_m), units="m")
     _write_dataset(coll_out, "element_order", np.array(element_order, dtype="S"))

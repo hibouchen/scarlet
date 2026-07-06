@@ -200,3 +200,29 @@ def compute_q_resolution_circular(
     sigq2 = (2* np.pi / wavelength)**2 * (sigx + sigy) / distance**2
     sigq2 += q**2 * (wavelength_spread / wavelength)**2 * 1/6
     return np.sqrt(sigq2)
+
+def compute_q_resolution_rectangular(
+    q: np.ndarray,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    collimation_distance: float,
+    distance: float,
+    wavelength_spread: float,
+    wavelength: float,
+    pixel_size: tuple[float, float],
+) -> np.ndarray:
+    """Compute the q-resolution for a circular beam profile. The resolution is computed as the quadrature sum of contributions from beam divergence, wavelength spread, and pixel size."""
+    
+    sigx = (distance / collimation_distance)**2 * x1**2 / 6
+    sigx += ((distance+collimation_distance) / collimation_distance)**2 * x2**2 / 6
+    sigx += 1/3 * pixel_size[0]**2
+
+    sigy = (distance / collimation_distance)**2 * y1**2 / 6
+    sigy += ((distance+collimation_distance) / collimation_distance)**2 * y2**2 / 6
+    sigy += 1/3 * pixel_size[1]**2
+
+    sigq2 = (2* np.pi / wavelength)**2 * (sigx + sigy) / collimation_distance**2
+    sigq2 += q**2 * (wavelength_spread / wavelength)**2 * 1/6
+    return np.sqrt(sigq2)

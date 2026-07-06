@@ -197,6 +197,76 @@ class TestWorkflowNormalizationRegistry(unittest.TestCase):
             self.assertEqual(attached, {"cfg_a": mask_path.resolve()})
             self.assertEqual(ctx.get_mask_file("cfg_a"), mask_path.resolve())
 
+    def test_attach_mask_bundles_from_output_dir_matches_source_file_when_snapshot_is_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            sample_path = root / "sample_scattering.nxs"
+            _write_detector_file(sample_path, sample_name="sample_a", data=np.asarray([[1.0, 2.0], [3.0, 4.0]]))
+
+            ctx = WorkflowContext(output_dir=root)
+            ctx.add_run(
+                RunKey(config_id="cfg_a", entity="sample", mode="scattering", sample_name="sample_a"),
+                sample_path,
+            )
+            ctx.configurations["cfg_a"] = Configuration(
+                wavelength=9.0,
+                sample_detector_distance=8.0,
+                collimation=Collimation(
+                    aperture1=Aperture(type="slit", x_gap=0.06, y_gap=0.06),
+                    aperture2=Aperture(type="slit", x_gap=0.008, y_gap=0.008),
+                    collimation_distance=8.0,
+                    last_aperture_to_sample_distance=1.6,
+                ),
+                config_id="cfg_a",
+            )
+            mask_path = root / "cfg_a_masks.nxs"
+            _write_mask_bundle(mask_path, {0: np.asarray([[1, 0], [0, 1]], dtype=np.uint8)})
+            with h5py.File(mask_path, "r+") as handle:
+                del handle["/entry/meta/source_file"]
+                handle["/entry/meta"].create_dataset("source_file", data=np.bytes_(str(sample_path.resolve())))
+
+            attached = ctx.attach_mask_bundles_from_output_dir()
+
+            self.assertEqual(attached, {"cfg_a": mask_path.resolve()})
+            self.assertEqual(ctx.get_mask_file("cfg_a"), mask_path.resolve())
+
+    def test_attach_mask_bundles_from_output_dir_matches_detector_geometry_when_collimation_is_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ctx = WorkflowContext(output_dir=root)
+            ctx.configurations["cfg_a"] = Configuration(
+                wavelength=6.0,
+                sample_detector_distance=[8.0, 2.5],
+                collimation=Collimation(
+                    aperture1=Aperture(type="slit", x_gap=0.06, y_gap=0.06),
+                    aperture2=Aperture(type="slit", x_gap=0.008, y_gap=0.008),
+                    collimation_distance=8.0,
+                    last_aperture_to_sample_distance=1.6,
+                ),
+                config_id="cfg_a",
+            )
+            mask_path = root / "cfg_a_masks.nxs"
+            _write_mask_bundle(mask_path, {0: np.asarray([[1, 0], [0, 1]], dtype=np.uint8)})
+            with h5py.File(mask_path, "r+") as handle:
+                del handle["/entry/configuration/sample_detector_distance"]
+                handle["/entry/configuration"].create_dataset(
+                    "sample_detector_distance",
+                    data=np.asarray([8.0, 2.5], dtype=np.float64),
+                )
+                handle["/entry/configuration/collimation/collimation_distance"][...] = 1.5
+                handle["/entry/configuration/collimation/aperture1/x_gap"][...] = 0.02
+                handle["/entry/configuration/collimation/aperture1/y_gap"][...] = 0.02
+                del handle["/entry/configuration/collimation/aperture2"]
+                aperture2 = handle["/entry/configuration/collimation"].create_group("aperture2")
+                aperture2.attrs["NX_class"] = b"NXslit"
+                aperture2.create_dataset("x_gap", data=0.015)
+                aperture2.create_dataset("y_gap", data=0.015)
+
+            attached = ctx.attach_mask_bundles_from_output_dir()
+
+            self.assertEqual(attached, {"cfg_a": mask_path.resolve()})
+            self.assertEqual(ctx.get_mask_file("cfg_a"), mask_path.resolve())
+
     def test_attach_mask_bundles_from_output_dir_skips_incomplete_configuration_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

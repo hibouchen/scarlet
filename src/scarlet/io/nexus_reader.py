@@ -300,6 +300,13 @@ def _read_optional_scalar(handle: h5py.File, dataset_path: str) -> float | None:
     return value if np.isfinite(value) else None
 
 
+def _read_optional_bool(handle: h5py.File, dataset_path: str) -> bool | None:
+    """Read an optional scalar boolean dataset."""
+    if dataset_path not in handle:
+        return None
+    return bool(np.asarray(handle[dataset_path][()]).reshape(()))
+
+
 def _read_detector_deadtime(
     handle: h5py.File,
     entry_path: str,
@@ -435,9 +442,10 @@ def _read_detector_payload(
         raise ValueError(f"Detector data must be 2D at {data_path}, got shape {raw_data.shape}")
 
     corrected_data = raw_data
+    data_represents_rate = bool(_read_optional_bool(handle, f"{detector_path}/deadtime_corrected"))
     deadtime = _read_detector_deadtime(handle, entry_path, detector_number, file_path=Path(handle.filename).resolve())
     effective_deadtime = float(deadtime)
-    if correct_deadtime and effective_deadtime != 0.0:
+    if correct_deadtime and not data_represents_rate and effective_deadtime != 0.0:
         if count_time is None:
             raise ValueError(
                 f"Missing count_time in {Path(handle.filename).resolve()}: "
@@ -452,9 +460,14 @@ def _read_detector_payload(
             acq_time=float(count_time),
             deadtime=effective_deadtime,
         )
+        data_represents_rate = True
 
     data = corrected_data / monitor if normalize_by_monitor else corrected_data
-    error = np.sqrt(np.clip(corrected_data, 0.0, None))
+    error_source = np.clip(corrected_data, 0.0, None)
+    if data_represents_rate and count_time is not None and count_time > 0.0:
+        error = np.sqrt(error_source / float(count_time))
+    else:
+        error = np.sqrt(error_source)
     if normalize_by_monitor:
         error = error / monitor
 

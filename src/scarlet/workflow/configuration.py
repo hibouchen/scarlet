@@ -618,49 +618,63 @@ def configuration_from_nexus(
                 for detector_number in range(max_detector + 1)
             ]
 
-        # Attempt to infer collimation from /instrument/collimation elements:
+        # Prefer explicit collimation metadata when the converted file provides it.
         collimation_obj: Optional[Collimation] = None
         col = f"{inst}/collimation"
-        if col in f and isinstance(f[col], h5py.Group) and f"{col}/elements" in f:
-            elems = f[f"{col}/elements"]
-            # collect aperture-like elements with a z position
-            candidates = []
-            for name, g in elems.items():
-                if not isinstance(g, h5py.Group):
-                    continue
-                nx = g.attrs.get("NX_class", None)
-                nx = nx.decode() if isinstance(nx, (bytes, bytearray)) else str(nx) if nx is not None else ""
-                if nx not in ("NXslit", "NXpinhole", "NXaperture"):
-                    continue
-                z = None
-                tp = f"{col}/elements/{name}/transformations/translation"
-                if tp in f:
-                    try:
-                        t = np.array(f[tp][()], dtype=float).reshape(-1)
-                        if t.size >= 3:
-                            z = float(t[2])
-                    except Exception:
-                        pass
-                if z is not None:
-                    candidates.append((z, name, g))
-
-            # take two closest to sample on upstream side (z < 0), i.e., largest z values below 0
-            upstream = [(z, name, g) for (z, name, g) in candidates if z < 0]
-            upstream.sort(key=lambda x: x[0])  # increasing z
-            if len(upstream) >= 2:
-                z1, n1, g1 = upstream[-2]
-                z2, n2, g2 = upstream[-1]  # closest to sample
-                cd = float(z2 - z1)
-                lad = float(-z2)  # sample at z=0
-                ap1 = Aperture.from_group(g1, issues=issues, path=f"{col}/elements/{n1}")
-                ap2 = Aperture.from_group(g2, issues=issues, path=f"{col}/elements/{n2}")
+        if col in f and isinstance(f[col], h5py.Group):
+            cd = _read_scalar(f, f"{col}/collimation_distance")
+            lad = _read_scalar(f, f"{col}/last_aperture_to_sample_distance")
+            ap1_path = f"{col}/aperture1"
+            ap2_path = f"{col}/aperture2"
+            if ap1_path in f and ap2_path in f and cd is not None and lad is not None:
+                ap1 = Aperture.from_group(f[ap1_path], issues=issues, path=ap1_path)
+                ap2 = Aperture.from_group(f[ap2_path], issues=issues, path=ap2_path)
                 collimation_obj = Collimation(
-                    aperture1=ap1, aperture2=ap2,
-                    collimation_distance=cd,
-                    last_aperture_to_sample_distance=lad
+                    aperture1=ap1,
+                    aperture2=ap2,
+                    collimation_distance=float(cd),
+                    last_aperture_to_sample_distance=float(lad),
                 )
-            else:
-                issues.append("Could not infer 2 upstream apertures from instrument/collimation (need z positions)")
+            elif f"{col}/elements" in f:
+                elems = f[f"{col}/elements"]
+                # collect aperture-like elements with a z position
+                candidates = []
+                for name, g in elems.items():
+                    if not isinstance(g, h5py.Group):
+                        continue
+                    nx = g.attrs.get("NX_class", None)
+                    nx = nx.decode() if isinstance(nx, (bytes, bytearray)) else str(nx) if nx is not None else ""
+                    if nx not in ("NXslit", "NXpinhole", "NXaperture"):
+                        continue
+                    z = None
+                    tp = f"{col}/elements/{name}/transformations/translation"
+                    if tp in f:
+                        try:
+                            t = np.array(f[tp][()], dtype=float).reshape(-1)
+                            if t.size >= 3:
+                                z = float(t[2])
+                        except Exception:
+                            pass
+                    if z is not None:
+                        candidates.append((z, name, g))
+
+                # take two closest to sample on upstream side (z < 0), i.e., largest z values below 0
+                upstream = [(z, name, g) for (z, name, g) in candidates if z < 0]
+                upstream.sort(key=lambda x: x[0])  # increasing z
+                if len(upstream) >= 2:
+                    z1, n1, g1 = upstream[-2]
+                    z2, n2, g2 = upstream[-1]  # closest to sample
+                    cd = float(z2 - z1)
+                    lad = float(-z2)  # sample at z=0
+                    ap1 = Aperture.from_group(g1, issues=issues, path=f"{col}/elements/{n1}")
+                    ap2 = Aperture.from_group(g2, issues=issues, path=f"{col}/elements/{n2}")
+                    collimation_obj = Collimation(
+                        aperture1=ap1, aperture2=ap2,
+                        collimation_distance=cd,
+                        last_aperture_to_sample_distance=lad
+                    )
+                else:
+                    issues.append("Could not infer 2 upstream apertures from instrument/collimation (need z positions)")
 
         return Configuration(
             wavelength=float(wl),
@@ -715,6 +729,26 @@ def compare_configurations_wavelength(
     if ok:
         return True, []
     return False, [_fmt_diff("wavelength", a.wavelength, b.wavelength, diff, tol_a, "Å")]
+
+
+def compare_configurations_detector_geometry(
+    a: "Configuration",
+    b: "Configuration",
+    *,
+    tol: ConfigTolerance = ConfigTolerance(),
+) -> Tuple[bool, List[str]]:
+    """Compare two configurations using wavelength and sample-detector distances only."""
+    diffs: List[str] = []
+
+    ok, d = _close(a.wavelength, b.wavelength, tol.wavelength_a)
+    if not ok:
+        diffs.append(_fmt_diff("wavelength", a.wavelength, b.wavelength, d, tol.wavelength_a, "Å"))
+
+    ok, distance_diffs = _compare_distance_values(a.sample_detector_distance, b.sample_detector_distance, tol.distance_m)
+    if not ok:
+        diffs.extend(distance_diffs)
+
+    return (len(diffs) == 0), diffs
 
 
 def compare_configurations(

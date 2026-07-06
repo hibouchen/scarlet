@@ -33,21 +33,26 @@ class AzimuthalAverageResult:
         if self.intensity_unit is not None:
             data_kwargs["unit"] = self.intensity_unit
 
-        q_kwargs: dict[str, Any] = {
-            "dims": ["q"],
-            "values": self.q,
-        }
-        if self.q_error is not None:
-            q_kwargs["variances"] = np.square(self.q_error)
+        q_kwargs: dict[str, Any] = {"dims": ["q"], "values": self.q}
         if self.q_unit is not None:
             q_kwargs["unit"] = self.q_unit
 
+        coords: dict[str, Any] = {
+            "q": sc.array(**q_kwargs),
+            "counts": sc.array(dims=["q"], values=self.counts),
+        }
+        if self.q_error is not None:
+            q_error_kwargs: dict[str, Any] = {
+                "dims": ["q"],
+                "values": self.q_error,
+            }
+            if self.q_unit is not None:
+                q_error_kwargs["unit"] = self.q_unit
+            coords["q_error"] = sc.array(**q_error_kwargs)
+
         return sc.DataArray(
             data=sc.array(**data_kwargs),
-            coords={
-                "q": sc.array(**q_kwargs),
-                "counts": sc.array(dims=["q"], values=self.counts),
-            },
+            coords=coords,
         )
 
 
@@ -329,7 +334,7 @@ def azimuthal_average(
             minlength=int(n_bins) + 1,
         )[1:]
         binned_q_error = np.full(int(n_bins), np.nan, dtype=np.float64)
-        binned_q_error[non_empty] = np.sqrt(q_variance_sum[non_empty]) / counts[non_empty]
+        binned_q_error[non_empty] = np.sqrt(q_variance_sum[non_empty]/ counts[non_empty]) 
     else:
         binned_q_error = None
 
