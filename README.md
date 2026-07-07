@@ -17,6 +17,37 @@ Some workflow pieces around `refs_*`, flatfields, and 2D reduction are present i
 
 ---
 
+## Installation
+
+Create a python virtual environment and activate it:
+
+```
+# On linux
+python3 -m venv <venv_path>
+source <venv_path>/bin/activate
+
+#on windows
+python3 -m venv <venv_path>
+<venv_path>\Scripts\activate
+```
+
+The repository can be downloaded on GithHub (`https://github.com/hibouchen/scarlet.git`) or clone directly with the following command:
+
+```
+git clone https://github.com/hibouchen/scarlet.git
+```
+
+```
+pip install <scarlet_folder_path>
+```
+
+The repository contains ad requirements.txt file allowing to install all the required python packages. To install it:
+
+```
+pip install -r requirements.txt
+```
+
+
 ## Installation for development
 
 From the project root:
@@ -251,6 +282,18 @@ print(config_id)
 # When the corresponding water / dark / empty-cell references are registered
 # in the workflow context, a flatfield artifact can be built on demand.
 # flatfield_path = ctx.build_water_flatfield(config_id)
+```
+
+### Save and reload a workflow context
+
+```python
+from scarlet.workflow import WorkflowContext
+
+ctx = WorkflowContext(output_dir="data/SANSLLB/processed")
+ctx.save("data/SANSLLB/processed/workflow_context.nxs", overwrite=True)
+
+reloaded = WorkflowContext.load("data/SANSLLB/processed/workflow_context.nxs")
+print(len(reloaded.runs))
 ```
 
 ### Compute a transmission from two images

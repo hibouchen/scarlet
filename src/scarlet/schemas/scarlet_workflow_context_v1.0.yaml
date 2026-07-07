@@ -4,6 +4,10 @@ schema:
   profile: "mono"
   entry_path: /entry
 
+conventions:
+  mask_convention: "1=masked, 0=valid"
+  transmission_roi_convention: "x1 and y1 are exclusive"
+
 nodes:
 
   - path: /entry
@@ -30,11 +34,13 @@ nodes:
         - instrument_name
         - root_dir
         - output_dir
+        - created_utc
+      optional_datasets:
+        - scarlet_version
         - schema_raw
         - schema_refs_sub
         - schema_refs_norm
         - schema_masks
-        - created_utc
 
   - path: /entry/runs
     kind: group
@@ -45,6 +51,7 @@ nodes:
         - config_id
         - mode
         - entity
+        - duplicate_index
         - file_path
 
   - path: /entry/configurations
@@ -64,14 +71,155 @@ nodes:
       optional_groups:
         - collimation
 
+  - path_pattern: ^/entry/configurations/[^/]+/collimation$
+    kind: group
+    required: false
+    rules:
+      optional_datasets:
+        - collimation_distance
+        - last_aperture_to_sample_distance
+      optional_groups:
+        - aperture1
+        - aperture2
+
+  - path_pattern: ^/entry/configurations/[^/]+/collimation/aperture[12]$
+    kind: group
+    required: false
+    rules:
+      required_datasets:
+        - type
+      optional_datasets:
+        - x_gap
+        - y_gap
+        - diameter
+
+  - path: /entry/beam_centers
+    kind: group
+    required: false
+
+  - path_pattern: ^/entry/beam_centers/[^/]+/detector\d+$
+    kind: group
+    required: false
+    rules:
+      required_datasets:
+        - beam_center_x
+        - beam_center_y
+
+  - path: /entry/rois
+    kind: group
+    required: false
+
+  - path_pattern: ^/entry/rois/[^/]+$
+    kind: group
+    required: false
+    rules:
+      required_datasets:
+        - x0
+        - x1
+        - y0
+        - y1
+      optional_datasets:
+        - detector_number
+        - method
+        - notes
+
   - path: /entry/references
     kind: group
-    required: true
+    required: false
+
+  - path: /entry/references/dark
+    kind: group
+    required: false
+
+  - path_pattern: ^/entry/references/dark/[^/]+$
+    kind: dataset
+    required: false
+
+  - path: /entry/references/empty_beam
+    kind: group
+    required: false
+
+  - path_pattern: ^/entry/references/empty_beam/[^/]+$
+    kind: group
+    required: false
     rules:
-      required_groups:
-        - refs_sub_files
-        - refs_norm_files
-        - masks_files
+      optional_datasets:
+        - scattering
+        - transmission
+
+  - path: /entry/references/empty_cell
+    kind: group
+    required: false
+
+  - path_pattern: ^/entry/references/empty_cell/[^/]+$
+    kind: group
+    required: false
+    rules:
+      optional_datasets:
+        - scattering
+        - transmission
+
+  - path: /entry/references/water
+    kind: group
+    required: false
+
+  - path_pattern: ^/entry/references/water/[^/]+$
+    kind: group
+    required: false
+    rules:
+      optional_datasets:
+        - scattering
+        - transmission
+
+  - path: /entry/references/mask_files
+    kind: group
+    required: false
+
+  - path_pattern: ^/entry/references/mask_files/[^/]+$
+    kind: dataset
+    required: false
+
+  - path: /entry/references/flatfields
+    kind: group
+    required: false
+
+  - path_pattern: ^/entry/references/flatfields/[^/]+$
+    kind: dataset
+    required: false
+
+  - path: /entry/transmissions
+    kind: group
+    required: true
+
+  - path: /entry/transmissions/sample
+    kind: group
+    required: false
+    rules:
+      required_datasets:
+        - sample_name
+        - config_id
+        - value
+
+  - path: /entry/transmissions/empty_cell
+    kind: group
+    required: false
+    rules:
+      required_datasets:
+        - config_id
+        - value
+
+  - path: /entry/sample_thicknesses
+    kind: group
+    required: false
+
+  - path: /entry/sample_thicknesses/sample
+    kind: group
+    required: false
+    rules:
+      required_datasets:
+        - sample_name
+        - config_id
+        - value
 
   - path: /entry/masks
     kind: group
@@ -81,14 +229,21 @@ nodes:
     kind: dataset
     required: false
 
-  - path: /entry/transmissions
+  - path: /entry/flatfield_sources
     kind: group
-    required: true
-    rules:
-      required_datasets:
-        - sample_name
-        - config_id
-        - value
+    required: false
+
+  - path_pattern: ^/entry/flatfield_sources/[^/]+$
+    kind: dataset
+    required: false
+
+  - path: /entry/stale_flatfields
+    kind: group
+    required: false
+
+  - path_pattern: ^/entry/stale_flatfields/[^/]+$
+    kind: dataset
+    required: false
 
   - path: /entry/artifacts
     kind: group

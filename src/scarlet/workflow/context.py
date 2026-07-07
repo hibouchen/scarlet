@@ -4,6 +4,7 @@ import csv
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from html import escape
+import json
 from pathlib import Path
 import re
 from typing import Any, Dict, Iterable, Iterator, Literal, Mapping, Optional, cast
@@ -439,6 +440,552 @@ class WorkflowContext:
         _initialize_transmission_geometry(self, where="update_from_runs_table_csv")
         self.set("runs_table_csv", csv_path)
         return self
+
+    def save(self, file_path: str | Path, *, overwrite: bool = False) -> Path:
+        """Serialize the workflow context to one SCARLET_workflow_context NeXus file."""
+        from scarlet import __version__
+
+        output_path = Path(file_path).resolve()
+        if output_path.exists() and not overwrite:
+            raise FileExistsError(f"File already exists: {output_path}")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if not any(artifact.path.resolve() == output_path for artifact in self.artifacts):
+            self.add_artifact(output_path.name, output_path, kind="workflow_context")
+        self.set("workflow_context_file", output_path)
+
+        created_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        with h5py.File(output_path, "w") as handle:
+            entry = handle.create_group("entry")
+            entry.attrs["NX_class"] = np.bytes_("NXentry")
+            _write_hdf5_dataset(entry, "definition", "SCARLET_workflow_context")
+            _write_hdf5_dataset(entry, "schema_version", "1.0")
+
+            metadata = entry.create_group("metadata")
+            metadata.attrs["NX_class"] = np.bytes_("NXcollection")
+            _write_hdf5_dataset(metadata, "experiment_id", self.experiment_id)
+            _write_hdf5_dataset(metadata, "instrument_name", self.instrument_name)
+            _write_hdf5_dataset(metadata, "root_dir", str(self.root_dir))
+            _write_hdf5_dataset(metadata, "output_dir", str(self.output_dir))
+            _write_hdf5_dataset(metadata, "created_utc", created_utc)
+            _write_hdf5_dataset(metadata, "scarlet_version", __version__)
+            _write_hdf5_dataset(metadata, "schema_raw", "scarlet_nxsas_raw_v1.3_mono.yaml")
+            _write_hdf5_dataset(metadata, "schema_refs_sub", "scarlet_refs_sub_v1.0.yaml")
+            _write_hdf5_dataset(metadata, "schema_refs_norm", "scarlet_refs_norm_v1.0.yaml")
+            _write_hdf5_dataset(metadata, "schema_masks", "scarlet_masks_v1.0.yaml")
+
+            runs_group = entry.create_group("runs")
+            runs_group.attrs["NX_class"] = np.bytes_("NXcollection")
+            run_rows = list(self.runs.items())
+            _write_string_array_dataset(runs_group, "sample_name", [key.sample_name or "" for key, _ in run_rows])
+            _write_string_array_dataset(runs_group, "config_id", [key.config_id for key, _ in run_rows])
+            _write_string_array_dataset(runs_group, "mode", [key.mode for key, _ in run_rows])
+            _write_string_array_dataset(runs_group, "entity", [key.entity for key, _ in run_rows])
+            runs_group.create_dataset(
+                "duplicate_index",
+                data=np.asarray([key.duplicate_index for key, _ in run_rows], dtype=np.int64),
+            )
+            _write_string_array_dataset(runs_group, "file_path", [str(path) for _, path in run_rows])
+
+            configurations_group = entry.create_group("configurations")
+            configurations_group.attrs["NX_class"] = np.bytes_("NXcollection")
+            for config_id, configuration in sorted(self.configurations.items()):
+                _write_serialized_configuration_group(configurations_group, str(config_id), configuration)
+
+            beam_centers_group = entry.create_group("beam_centers")
+            beam_centers_group.attrs["NX_class"] = np.bytes_("NXcollection")
+            for config_id, centers in sorted(self.beam_centers.items()):
+                config_group = beam_centers_group.create_group(str(config_id))
+                config_group.attrs["NX_class"] = np.bytes_("NXcollection")
+                for detector_number, center in sorted(centers.items()):
+                    detector_group = config_group.create_group(f"detector{int(detector_number)}")
+                    detector_group.attrs["NX_class"] = np.bytes_("NXcollection")
+                    _write_hdf5_dataset(detector_group, "beam_center_x", float(center[0]))
+                    _write_hdf5_dataset(detector_group, "beam_center_y", float(center[1]))
+
+            rois_group = entry.create_group("rois")
+            rois_group.attrs["NX_class"] = np.bytes_("NXcollection")
+            for config_id, roi in sorted(self.rois.items()):
+                config_group = rois_group.create_group(str(config_id))
+                config_group.attrs["NX_class"] = np.bytes_("NXcollection")
+                _write_hdf5_dataset(config_group, "x0", int(roi[0]))
+                _write_hdf5_dataset(config_group, "x1", int(roi[1]))
+                _write_hdf5_dataset(config_group, "y0", int(roi[2]))
+                _write_hdf5_dataset(config_group, "y1", int(roi[3]))
+
+            references_group = entry.create_group("references")
+            references_group.attrs["NX_class"] = np.bytes_("NXcollection")
+            dark_group = references_group.create_group("dark")
+            dark_group.attrs["NX_class"] = np.bytes_("NXcollection")
+            for config_id, path in sorted(self.dark.items()):
+                _write_hdf5_dataset(dark_group, str(config_id), str(path))
+
+            for name, mapping in (
+                ("empty_beam", self.empty_beam),
+                ("empty_cell", self.empty_cell),
+                ("water", self.water),
+            ):
+                group = references_group.create_group(name)
+                group.attrs["NX_class"] = np.bytes_("NXcollection")
+                for config_id, files_by_mode in sorted(mapping.items()):
+                    config_group = group.create_group(str(config_id))
+                    config_group.attrs["NX_class"] = np.bytes_("NXcollection")
+                    for mode, path in sorted(files_by_mode.items()):
+                        _write_hdf5_dataset(config_group, str(mode), str(path))
+
+            mask_files_group = references_group.create_group("mask_files")
+            mask_files_group.attrs["NX_class"] = np.bytes_("NXcollection")
+            for config_id, path in sorted(self.mask_files.items()):
+                _write_hdf5_dataset(mask_files_group, str(config_id), str(path))
+
+            flatfields_group = references_group.create_group("flatfields")
+            flatfields_group.attrs["NX_class"] = np.bytes_("NXcollection")
+            for config_id, path in sorted(self.flatfields.items()):
+                _write_hdf5_dataset(flatfields_group, str(config_id), str(path))
+
+            transmissions_group = entry.create_group("transmissions")
+            transmissions_group.attrs["NX_class"] = np.bytes_("NXcollection")
+            sample_transmissions_group = transmissions_group.create_group("sample")
+            sample_transmissions_group.attrs["NX_class"] = np.bytes_("NXcollection")
+            sample_transmission_rows = sorted(self.transmissions.items())
+            _write_string_array_dataset(
+                sample_transmissions_group,
+                "sample_name",
+                [sample_name for (sample_name, _), _ in sample_transmission_rows],
+            )
+            _write_string_array_dataset(
+                sample_transmissions_group,
+                "config_id",
+                [config_id for (_, config_id), _ in sample_transmission_rows],
+            )
+            sample_transmissions_group.create_dataset(
+                "value",
+                data=np.asarray([float(value) for _, value in sample_transmission_rows], dtype=np.float64),
+            )
+
+            empty_cell_transmissions_group = transmissions_group.create_group("empty_cell")
+            empty_cell_transmissions_group.attrs["NX_class"] = np.bytes_("NXcollection")
+            empty_cell_rows = sorted(self.empty_cell_transmissions.items())
+            _write_string_array_dataset(
+                empty_cell_transmissions_group,
+                "config_id",
+                [config_id for config_id, _ in empty_cell_rows],
+            )
+            empty_cell_transmissions_group.create_dataset(
+                "value",
+                data=np.asarray([float(value) for _, value in empty_cell_rows], dtype=np.float64),
+            )
+
+            sample_thicknesses_group = entry.create_group("sample_thicknesses")
+            sample_thicknesses_group.attrs["NX_class"] = np.bytes_("NXcollection")
+            sample_thicknesses_sample_group = sample_thicknesses_group.create_group("sample")
+            sample_thicknesses_sample_group.attrs["NX_class"] = np.bytes_("NXcollection")
+            thickness_rows = sorted(self.sample_thicknesses.items())
+            _write_string_array_dataset(
+                sample_thicknesses_sample_group,
+                "sample_name",
+                [sample_name for (sample_name, _), _ in thickness_rows],
+            )
+            _write_string_array_dataset(
+                sample_thicknesses_sample_group,
+                "config_id",
+                [config_id for (_, config_id), _ in thickness_rows],
+            )
+            sample_thicknesses_sample_group.create_dataset(
+                "value",
+                data=np.asarray([float(value) for _, value in thickness_rows], dtype=np.float64),
+            )
+
+            masks_group = entry.create_group("masks")
+            masks_group.attrs["NX_class"] = np.bytes_("NXcollection")
+            for config_id, masks in sorted(self.masks.items()):
+                config_group = masks_group.create_group(str(config_id))
+                config_group.attrs["NX_class"] = np.bytes_("NXcollection")
+                for detector_number, mask in sorted(masks.items()):
+                    config_group.create_dataset(f"detector{int(detector_number)}", data=np.asarray(mask, dtype=np.uint8))
+
+            flatfield_sources_group = entry.create_group("flatfield_sources")
+            flatfield_sources_group.attrs["NX_class"] = np.bytes_("NXcollection")
+            for config_id, source_config_id in sorted(self.flatfield_sources.items()):
+                _write_hdf5_dataset(flatfield_sources_group, str(config_id), str(source_config_id))
+
+            stale_flatfields_group = entry.create_group("stale_flatfields")
+            stale_flatfields_group.attrs["NX_class"] = np.bytes_("NXcollection")
+            for config_id in sorted(self.stale_flatfields):
+                stale_flatfields_group.create_dataset(str(config_id), data=np.bool_(True))
+
+            artifacts_group = entry.create_group("artifacts")
+            artifacts_group.attrs["NX_class"] = np.bytes_("NXcollection")
+            _write_string_array_dataset(artifacts_group, "name", [artifact.name for artifact in self.artifacts])
+            _write_string_array_dataset(artifacts_group, "path", [str(artifact.path) for artifact in self.artifacts])
+            _write_string_array_dataset(artifacts_group, "kind", [artifact.kind for artifact in self.artifacts])
+            _write_string_array_dataset(
+                artifacts_group,
+                "created_utc",
+                [artifact.created_utc for artifact in self.artifacts],
+            )
+
+            logs_group = entry.create_group("logs")
+            logs_group.attrs["NX_class"] = np.bytes_("NXcollection")
+            _write_string_array_dataset(logs_group, "level", [log.level for log in self.logs])
+            _write_string_array_dataset(logs_group, "message", [log.message for log in self.logs])
+            _write_string_array_dataset(logs_group, "where", [log.where or "" for log in self.logs])
+            _write_string_array_dataset(logs_group, "when_utc", [log.when_utc for log in self.logs])
+            _write_string_array_dataset(logs_group, "meta_json", [_json_dumps(log.meta) for log in self.logs])
+
+            issues_group = entry.create_group("issues")
+            issues_group.attrs["NX_class"] = np.bytes_("NXcollection")
+            _write_string_array_dataset(issues_group, "level", [issue.level for issue in self.issues])
+            _write_string_array_dataset(issues_group, "message", [issue.message for issue in self.issues])
+            _write_string_array_dataset(issues_group, "where", [issue.where or "" for issue in self.issues])
+            _write_string_array_dataset(issues_group, "key", [issue.key or "" for issue in self.issues])
+            _write_string_array_dataset(issues_group, "when_utc", [issue.when_utc for issue in self.issues])
+            _write_string_array_dataset(issues_group, "meta_json", [_json_dumps(issue.meta) for issue in self.issues])
+
+            timings_group = entry.create_group("timings")
+            timings_group.attrs["NX_class"] = np.bytes_("NXcollection")
+            for key, value in sorted(self.timings.items()):
+                if not key or "/" in key:
+                    continue
+                _write_hdf5_dataset(timings_group, key, float(value))
+
+            store_group = entry.create_group("store")
+            store_group.attrs["NX_class"] = np.bytes_("NXcollection")
+            skipped_store_keys: list[str] = []
+            for raw_key, value in sorted(self.store.items(), key=lambda item: str(item[0])):
+                key = str(raw_key)
+                if not key or "/" in key:
+                    skipped_store_keys.append(key)
+                    continue
+                try:
+                    serialized = _serialize_store_value(value)
+                except TypeError:
+                    skipped_store_keys.append(key)
+                    continue
+                _write_hdf5_dataset(store_group, key, _json_dumps(serialized))
+            if skipped_store_keys:
+                _write_hdf5_dataset(store_group, "_skipped_keys", _json_dumps(sorted(skipped_store_keys)))
+
+        return output_path
+
+    @classmethod
+    def load(cls, file_path: str | Path) -> WorkflowContext:
+        """Load a workflow context previously saved with ``save()``."""
+        from scarlet.workflow.configuration import Aperture, Collimation, Configuration
+
+        input_path = Path(file_path).resolve()
+        base_dir = input_path.parent
+
+        with h5py.File(input_path, "r") as handle:
+            if "/entry" not in handle or not isinstance(handle["/entry"], h5py.Group):
+                raise ValueError(f"Missing /entry group in workflow context file: {input_path}")
+            entry = handle["/entry"]
+            if "/entry/definition" not in handle:
+                raise ValueError(f"Missing /entry/definition in workflow context file: {input_path}")
+            definition = _read_text_dataset(handle["/entry/definition"]).strip()
+            if definition != "SCARLET_workflow_context":
+                raise ValueError(f"Unsupported workflow context definition in {input_path}: {definition!r}")
+
+            metadata = entry.get("metadata")
+            if not isinstance(metadata, h5py.Group):
+                raise ValueError(f"Missing /entry/metadata in workflow context file: {input_path}")
+
+            ctx = cls(
+                experiment_id=_read_required_text_field(metadata, "experiment_id"),
+                instrument_name=_read_required_text_field(metadata, "instrument_name"),
+                root_dir=_resolve_loaded_path(_read_required_text_field(metadata, "root_dir"), base_dir=base_dir),
+                output_dir=_resolve_loaded_path(_read_required_text_field(metadata, "output_dir"), base_dir=base_dir),
+            )
+
+            runs_group = entry.get("runs")
+            if not isinstance(runs_group, h5py.Group):
+                raise ValueError(f"Missing /entry/runs in workflow context file: {input_path}")
+            sample_names = _read_text_array_dataset(runs_group, "sample_name")
+            config_ids = _read_text_array_dataset(runs_group, "config_id")
+            modes = _read_text_array_dataset(runs_group, "mode")
+            entities = _read_text_array_dataset(runs_group, "entity")
+            duplicate_indices = _read_int_array_dataset(runs_group, "duplicate_index")
+            file_paths = _read_text_array_dataset(runs_group, "file_path")
+            row_count = _require_parallel_lengths(
+                "/entry/runs",
+                sample_name=sample_names,
+                config_id=config_ids,
+                mode=modes,
+                entity=entities,
+                duplicate_index=duplicate_indices,
+                file_path=file_paths,
+            )
+            for row_index in range(row_count):
+                sample_name = sample_names[row_index].strip() or None
+                run_key = RunKey(
+                    config_id=config_ids[row_index].strip(),
+                    entity=cast(Entity, entities[row_index].strip()),
+                    mode=cast(Mode, modes[row_index].strip()),
+                    sample_name=sample_name,
+                    duplicate_index=int(duplicate_indices[row_index]),
+                )
+                run_path = _resolve_loaded_path(file_paths[row_index], base_dir=base_dir)
+                ctx.runs[run_key] = run_path
+                ctx._sync_reference_store(run_key, run_path)
+
+            configurations_group = entry.get("configurations")
+            if isinstance(configurations_group, h5py.Group):
+                for config_id in configurations_group.keys():
+                    obj = configurations_group[config_id]
+                    if not isinstance(obj, h5py.Group):
+                        continue
+                    ctx.configurations[config_id] = _read_serialized_configuration_group(
+                        obj,
+                        config_id=config_id,
+                        aperture_cls=Aperture,
+                        collimation_cls=Collimation,
+                        configuration_cls=Configuration,
+                    )
+
+            beam_centers_group = entry.get("beam_centers")
+            if isinstance(beam_centers_group, h5py.Group):
+                for config_id, config_group in beam_centers_group.items():
+                    if not isinstance(config_group, h5py.Group):
+                        continue
+                    centers: DetectorBeamCenters = {}
+                    for detector_name, detector_group in config_group.items():
+                        if not isinstance(detector_group, h5py.Group):
+                            continue
+                        match = re.fullmatch(r"detector(\d+)", detector_name)
+                        if match is None:
+                            continue
+                        centers[int(match.group(1))] = (
+                            float(np.asarray(detector_group["beam_center_x"][()]).reshape(())),
+                            float(np.asarray(detector_group["beam_center_y"][()]).reshape(())),
+                        )
+                    if centers:
+                        ctx.beam_centers[config_id] = centers
+
+            rois_group = entry.get("rois")
+            if isinstance(rois_group, h5py.Group):
+                for config_id, config_group in rois_group.items():
+                    if not isinstance(config_group, h5py.Group):
+                        continue
+                    ctx.rois[config_id] = (
+                        int(np.asarray(config_group["x0"][()]).reshape(())),
+                        int(np.asarray(config_group["x1"][()]).reshape(())),
+                        int(np.asarray(config_group["y0"][()]).reshape(())),
+                        int(np.asarray(config_group["y1"][()]).reshape(())),
+                    )
+
+            references_group = entry.get("references")
+            if isinstance(references_group, h5py.Group):
+                dark_group = references_group.get("dark")
+                if isinstance(dark_group, h5py.Group):
+                    for config_id, dataset in dark_group.items():
+                        if not isinstance(dataset, h5py.Dataset):
+                            continue
+                        ctx.dark[config_id] = _resolve_loaded_path(_read_text_dataset(dataset), base_dir=base_dir)
+
+                for name, target in (
+                    ("empty_beam", ctx.empty_beam),
+                    ("empty_cell", ctx.empty_cell),
+                    ("water", ctx.water),
+                ):
+                    group = references_group.get(name)
+                    if not isinstance(group, h5py.Group):
+                        continue
+                    for config_id, config_group in group.items():
+                        if not isinstance(config_group, h5py.Group):
+                            continue
+                        modes_by_path: ReferenceFilesByMode = {}
+                        for mode_name, dataset in config_group.items():
+                            if not isinstance(dataset, h5py.Dataset):
+                                continue
+                            modes_by_path[cast(Mode, mode_name)] = _resolve_loaded_path(
+                                _read_text_dataset(dataset),
+                                base_dir=base_dir,
+                            )
+                        if modes_by_path:
+                            target[config_id] = modes_by_path
+
+                mask_files_group = references_group.get("mask_files")
+                if isinstance(mask_files_group, h5py.Group):
+                    for config_id, dataset in mask_files_group.items():
+                        if not isinstance(dataset, h5py.Dataset):
+                            continue
+                        ctx.mask_files[config_id] = _resolve_loaded_path(_read_text_dataset(dataset), base_dir=base_dir)
+
+                flatfields_group = references_group.get("flatfields")
+                if isinstance(flatfields_group, h5py.Group):
+                    for config_id, dataset in flatfields_group.items():
+                        if not isinstance(dataset, h5py.Dataset):
+                            continue
+                        ctx.flatfields[config_id] = _resolve_loaded_path(_read_text_dataset(dataset), base_dir=base_dir)
+
+            transmissions_group = entry.get("transmissions")
+            if isinstance(transmissions_group, h5py.Group):
+                sample_group = transmissions_group.get("sample")
+                if isinstance(sample_group, h5py.Group):
+                    sample_names = _read_text_array_dataset(sample_group, "sample_name")
+                    config_ids = _read_text_array_dataset(sample_group, "config_id")
+                    values = _read_float_array_dataset(sample_group, "value")
+                    row_count = _require_parallel_lengths(
+                        "/entry/transmissions/sample",
+                        sample_name=sample_names,
+                        config_id=config_ids,
+                        value=values,
+                    )
+                    for row_index in range(row_count):
+                        ctx.transmissions[(sample_names[row_index], config_ids[row_index])] = float(values[row_index])
+
+                empty_cell_group = transmissions_group.get("empty_cell")
+                if isinstance(empty_cell_group, h5py.Group):
+                    config_ids = _read_text_array_dataset(empty_cell_group, "config_id")
+                    values = _read_float_array_dataset(empty_cell_group, "value")
+                    row_count = _require_parallel_lengths(
+                        "/entry/transmissions/empty_cell",
+                        config_id=config_ids,
+                        value=values,
+                    )
+                    for row_index in range(row_count):
+                        ctx.empty_cell_transmissions[config_ids[row_index]] = float(values[row_index])
+
+            sample_thicknesses_group = entry.get("sample_thicknesses")
+            if isinstance(sample_thicknesses_group, h5py.Group):
+                sample_group = sample_thicknesses_group.get("sample")
+                if isinstance(sample_group, h5py.Group):
+                    sample_names = _read_text_array_dataset(sample_group, "sample_name")
+                    config_ids = _read_text_array_dataset(sample_group, "config_id")
+                    values = _read_float_array_dataset(sample_group, "value")
+                    row_count = _require_parallel_lengths(
+                        "/entry/sample_thicknesses/sample",
+                        sample_name=sample_names,
+                        config_id=config_ids,
+                        value=values,
+                    )
+                    for row_index in range(row_count):
+                        ctx.sample_thicknesses[(sample_names[row_index], config_ids[row_index])] = float(values[row_index])
+
+            masks_group = entry.get("masks")
+            if isinstance(masks_group, h5py.Group):
+                for config_id, config_group in masks_group.items():
+                    if not isinstance(config_group, h5py.Group):
+                        continue
+                    detector_masks: DetectorMasks = {}
+                    for detector_name, dataset in config_group.items():
+                        match = re.fullmatch(r"detector(\d+)", detector_name)
+                        if match is None or not isinstance(dataset, h5py.Dataset):
+                            continue
+                        detector_masks[int(match.group(1))] = np.asarray(dataset[()], dtype=np.uint8)
+                    if detector_masks:
+                        ctx.masks[config_id] = detector_masks
+
+            flatfield_sources_group = entry.get("flatfield_sources")
+            if isinstance(flatfield_sources_group, h5py.Group):
+                for config_id, dataset in flatfield_sources_group.items():
+                    if not isinstance(dataset, h5py.Dataset):
+                        continue
+                    ctx.flatfield_sources[config_id] = _read_text_dataset(dataset).strip()
+
+            stale_flatfields_group = entry.get("stale_flatfields")
+            if isinstance(stale_flatfields_group, h5py.Group):
+                ctx.stale_flatfields = {
+                    config_id
+                    for config_id, dataset in stale_flatfields_group.items()
+                    if isinstance(dataset, h5py.Dataset)
+                }
+
+            artifacts_group = entry.get("artifacts")
+            if isinstance(artifacts_group, h5py.Group):
+                names = _read_text_array_dataset(artifacts_group, "name")
+                paths = _read_text_array_dataset(artifacts_group, "path")
+                kinds = _read_text_array_dataset(artifacts_group, "kind")
+                created_values = _read_text_array_dataset(artifacts_group, "created_utc")
+                row_count = _require_parallel_lengths(
+                    "/entry/artifacts",
+                    name=names,
+                    path=paths,
+                    kind=kinds,
+                    created_utc=created_values,
+                )
+                for row_index in range(row_count):
+                    ctx.artifacts.append(
+                        Artifact(
+                            name=names[row_index],
+                            path=_resolve_loaded_path(paths[row_index], base_dir=base_dir),
+                            kind=kinds[row_index],
+                            created_utc=created_values[row_index],
+                        )
+                    )
+
+            logs_group = entry.get("logs")
+            if isinstance(logs_group, h5py.Group):
+                levels = _read_text_array_dataset(logs_group, "level")
+                messages = _read_text_array_dataset(logs_group, "message")
+                wheres = _read_text_array_dataset(logs_group, "where")
+                when_values = _read_text_array_dataset(logs_group, "when_utc")
+                meta_values = _read_text_array_dataset(logs_group, "meta_json")
+                row_count = _require_parallel_lengths(
+                    "/entry/logs",
+                    level=levels,
+                    message=messages,
+                    where=wheres,
+                    when_utc=when_values,
+                    meta_json=meta_values,
+                )
+                for row_index in range(row_count):
+                    ctx.logs.append(
+                        LogMessage(
+                            level=cast(Level, levels[row_index]),
+                            message=messages[row_index],
+                            where=wheres[row_index] or None,
+                            when_utc=when_values[row_index],
+                            meta=_json_loads(meta_values[row_index], default={}),
+                        )
+                    )
+
+            issues_group = entry.get("issues")
+            if isinstance(issues_group, h5py.Group):
+                levels = _read_text_array_dataset(issues_group, "level")
+                messages = _read_text_array_dataset(issues_group, "message")
+                wheres = _read_text_array_dataset(issues_group, "where")
+                keys = _read_text_array_dataset(issues_group, "key")
+                when_values = _read_text_array_dataset(issues_group, "when_utc")
+                meta_values = _read_text_array_dataset(issues_group, "meta_json")
+                row_count = _require_parallel_lengths(
+                    "/entry/issues",
+                    level=levels,
+                    message=messages,
+                    where=wheres,
+                    key=keys,
+                    when_utc=when_values,
+                    meta_json=meta_values,
+                )
+                for row_index in range(row_count):
+                    ctx.issues.append(
+                        Issue(
+                            level=cast(Literal["WARN", "ERROR"], levels[row_index]),
+                            message=messages[row_index],
+                            where=wheres[row_index] or None,
+                            key=keys[row_index] or None,
+                            when_utc=when_values[row_index],
+                            meta=_json_loads(meta_values[row_index], default={}),
+                        )
+                    )
+
+            timings_group = entry.get("timings")
+            if isinstance(timings_group, h5py.Group):
+                for key, dataset in timings_group.items():
+                    if not isinstance(dataset, h5py.Dataset):
+                        continue
+                    ctx.timings[key] = float(np.asarray(dataset[()]).reshape(()))
+
+            store_group = entry.get("store")
+            if isinstance(store_group, h5py.Group):
+                for key, dataset in store_group.items():
+                    if key == "_skipped_keys" or not isinstance(dataset, h5py.Dataset):
+                        continue
+                    raw_json = _read_text_dataset(dataset)
+                    decoded = _json_loads(raw_json, default=None)
+                    ctx.store[key] = _deserialize_store_value(decoded, base_dir=base_dir)
+
+        return ctx
 
     def set_beam_center(self, config_id: str, detector_number: int, center: BeamCenter) -> None:
         """Store one detector beam center for a configuration."""
@@ -1045,6 +1592,263 @@ def _read_text_value(value: Any) -> str:
 def _read_text_dataset(dataset: h5py.Dataset) -> str:
     """Read a scalar text dataset and normalize its value to str."""
     return _read_text_value(dataset[()])
+
+
+def _write_hdf5_dataset(parent: h5py.Group, name: str, value: Any) -> h5py.Dataset:
+    """Write one scalar-like dataset, normalizing text to bytes."""
+    if isinstance(value, str):
+        return parent.create_dataset(name, data=np.bytes_(value))
+    return parent.create_dataset(name, data=value)
+
+
+def _write_string_array_dataset(parent: h5py.Group, name: str, values: Iterable[str]) -> h5py.Dataset:
+    """Write one string array dataset using fixed-width bytes."""
+    encoded = np.asarray([np.bytes_(str(value)) for value in values], dtype="S")
+    return parent.create_dataset(name, data=encoded)
+
+
+def _json_dumps(value: Any) -> str:
+    """Serialize one JSON-compatible value with stable formatting."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _json_loads(value: str, *, default: Any) -> Any:
+    """Decode one JSON string, returning a default value on parse failure."""
+    try:
+        return json.loads(value)
+    except Exception:
+        return default
+
+
+def _serialize_store_value(value: Any) -> Any:
+    """Convert one WorkflowContext.store value to a JSON-compatible payload."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    if isinstance(value, Path):
+        return {"__type__": "path", "value": str(value)}
+    if isinstance(value, tuple):
+        return {"__type__": "tuple", "items": [_serialize_store_value(item) for item in value]}
+    if isinstance(value, list):
+        return [_serialize_store_value(item) for item in value]
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError(f"Unsupported non-string store key: {key!r}")
+            out[key] = _serialize_store_value(item)
+        return out
+    raise TypeError(f"Unsupported store value type: {type(value).__name__}")
+
+
+def _deserialize_store_value(value: Any, *, base_dir: Path) -> Any:
+    """Rebuild one WorkflowContext.store value from its JSON payload."""
+    if isinstance(value, list):
+        return [_deserialize_store_value(item, base_dir=base_dir) for item in value]
+    if isinstance(value, dict):
+        marker = value.get("__type__")
+        if marker == "path":
+            raw = value.get("value", "")
+            return _resolve_loaded_path(str(raw), base_dir=base_dir)
+        if marker == "tuple":
+            return tuple(_deserialize_store_value(item, base_dir=base_dir) for item in value.get("items", []))
+        return {
+            str(key): _deserialize_store_value(item, base_dir=base_dir)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _resolve_loaded_path(raw_path: str, *, base_dir: Path) -> Path:
+    """Resolve one serialized path, accepting absolute and file-relative values."""
+    path = Path(raw_path.strip())
+    if path.is_absolute():
+        return path.resolve()
+    return (base_dir / path).resolve()
+
+
+def _read_required_text_field(group: h5py.Group, name: str) -> str:
+    """Read one required scalar text field from an HDF5 group."""
+    if name not in group or not isinstance(group[name], h5py.Dataset):
+        raise ValueError(f"Missing required dataset {group.name}/{name}")
+    return _read_text_dataset(group[name]).strip()
+
+
+def _read_text_array_dataset(group: h5py.Group, name: str) -> list[str]:
+    """Read one 1D text dataset as a list of Python strings."""
+    if name not in group or not isinstance(group[name], h5py.Dataset):
+        raise ValueError(f"Missing required dataset {group.name}/{name}")
+    raw = np.asarray(group[name][()])
+    if raw.ndim == 0:
+        return [_read_text_value(raw.reshape(()).item()).strip()]
+    return [_read_text_value(item).strip() for item in raw.tolist()]
+
+
+def _read_int_array_dataset(group: h5py.Group, name: str) -> list[int]:
+    """Read one 1D integer dataset as a list of Python ints."""
+    if name not in group or not isinstance(group[name], h5py.Dataset):
+        raise ValueError(f"Missing required dataset {group.name}/{name}")
+    raw = np.asarray(group[name][()], dtype=np.int64)
+    if raw.ndim == 0:
+        return [int(raw.reshape(()))]
+    return [int(item) for item in raw.tolist()]
+
+
+def _read_float_array_dataset(group: h5py.Group, name: str) -> list[float]:
+    """Read one 1D float dataset as a list of Python floats."""
+    if name not in group or not isinstance(group[name], h5py.Dataset):
+        raise ValueError(f"Missing required dataset {group.name}/{name}")
+    raw = np.asarray(group[name][()], dtype=np.float64)
+    if raw.ndim == 0:
+        return [float(raw.reshape(()))]
+    return [float(item) for item in raw.tolist()]
+
+
+def _require_parallel_lengths(group_path: str, **columns: list[Any]) -> int:
+    """Ensure parallel datasets have the same length and return that length."""
+    lengths = {name: len(values) for name, values in columns.items()}
+    if not lengths:
+        return 0
+    expected = next(iter(lengths.values()))
+    for name, size in lengths.items():
+        if size != expected:
+            raise ValueError(f"Mismatched dataset lengths under {group_path}: {name} has {size}, expected {expected}")
+    return expected
+
+
+def _normalize_serialized_distance_value(value: Any) -> float | np.ndarray:
+    """Normalize one distance value to a scalar or 1D float array dataset payload."""
+    if isinstance(value, np.ndarray):
+        array = np.asarray(value, dtype=np.float64)
+        if array.ndim == 0 or array.size == 1:
+            return float(array.reshape(()))
+        return array
+    if isinstance(value, tuple):
+        value = list(value)
+    if isinstance(value, list):
+        array = np.asarray(value, dtype=np.float64)
+        if array.ndim != 1:
+            raise ValueError(f"sample_detector_distance must be scalar or 1D, got shape {array.shape}")
+        if array.size == 1:
+            return float(array[0])
+        return array
+    return float(value)
+
+
+def _write_serialized_configuration_group(parent: h5py.Group, config_id: str, configuration: Any) -> h5py.Group:
+    """Write one workflow configuration subgroup."""
+    config_group = parent.create_group(str(config_id))
+    config_group.attrs["NX_class"] = np.bytes_("NXcollection")
+
+    wavelength = _get_field_value(configuration, "wavelength")
+    sample_detector_distance = _get_field_value(configuration, "sample_detector_distance")
+    if wavelength is None or sample_detector_distance is None:
+        raise ValueError(f"Configuration {config_id!r} is missing required fields for serialization")
+    _write_hdf5_dataset(config_group, "wavelength", float(wavelength))
+    _write_hdf5_dataset(
+        config_group,
+        "sample_detector_distance",
+        _normalize_serialized_distance_value(sample_detector_distance),
+    )
+
+    stored_config_id = _get_field_value(configuration, "config_id")
+    if stored_config_id is not None:
+        _write_hdf5_dataset(config_group, "config_id", str(stored_config_id))
+    notes = _get_field_value(configuration, "notes")
+    if notes is not None:
+        _write_hdf5_dataset(config_group, "notes", str(notes))
+
+    collimation = _get_field_value(configuration, "collimation")
+    if collimation is None:
+        return config_group
+
+    collimation_group = config_group.create_group("collimation")
+    collimation_group.attrs["NX_class"] = np.bytes_("NXcollection")
+    collimation_distance = _get_field_value(collimation, "collimation_distance")
+    if collimation_distance is not None:
+        _write_hdf5_dataset(collimation_group, "collimation_distance", float(collimation_distance))
+    last_aperture_to_sample_distance = _get_field_value(collimation, "last_aperture_to_sample_distance")
+    if last_aperture_to_sample_distance is not None:
+        _write_hdf5_dataset(
+            collimation_group,
+            "last_aperture_to_sample_distance",
+            float(last_aperture_to_sample_distance),
+        )
+
+    for aperture_name in ("aperture1", "aperture2"):
+        aperture = _get_field_value(collimation, aperture_name)
+        if aperture is None:
+            continue
+        aperture_group = collimation_group.create_group(aperture_name)
+        aperture_group.attrs["NX_class"] = np.bytes_("NXcollection")
+        aperture_type = _get_field_value(aperture, "type")
+        if aperture_type is None:
+            raise ValueError(f"Configuration {config_id!r} has {aperture_name} without a type")
+        _write_hdf5_dataset(aperture_group, "type", str(aperture_type))
+        for field_name in ("x_gap", "y_gap", "diameter"):
+            field_value = _get_field_value(aperture, field_name)
+            if field_value is not None:
+                _write_hdf5_dataset(aperture_group, field_name, float(field_value))
+    return config_group
+
+
+def _read_serialized_configuration_group(
+    group: h5py.Group,
+    *,
+    config_id: str,
+    aperture_cls: Any,
+    collimation_cls: Any,
+    configuration_cls: Any,
+) -> Any:
+    """Read one workflow configuration subgroup."""
+    wavelength = float(np.asarray(group["wavelength"][()]).reshape(()))
+    sample_detector_distance_raw = np.asarray(group["sample_detector_distance"][()], dtype=np.float64)
+    if sample_detector_distance_raw.ndim == 0:
+        sample_detector_distance: float | list[float] = float(sample_detector_distance_raw.reshape(()))
+    else:
+        sample_detector_distance = [float(item) for item in sample_detector_distance_raw.tolist()]
+    notes = _read_text_dataset(group["notes"]).strip() if "notes" in group else None
+    stored_config_id = _read_text_dataset(group["config_id"]).strip() if "config_id" in group else config_id
+
+    collimation_obj = None
+    collimation_group = group.get("collimation")
+    if isinstance(collimation_group, h5py.Group):
+        aperture_values: dict[str, Any] = {}
+        for aperture_name in ("aperture1", "aperture2"):
+            aperture_group = collimation_group.get(aperture_name)
+            if not isinstance(aperture_group, h5py.Group):
+                continue
+            aperture_kwargs: dict[str, Any] = {"type": _read_required_text_field(aperture_group, "type")}
+            for field_name in ("x_gap", "y_gap", "diameter"):
+                if field_name in aperture_group:
+                    aperture_kwargs[field_name] = float(np.asarray(aperture_group[field_name][()]).reshape(()))
+            aperture_values[aperture_name] = aperture_cls(**aperture_kwargs)
+        if "aperture1" in aperture_values and "aperture2" in aperture_values:
+            collimation_obj = collimation_cls(
+                aperture1=aperture_values["aperture1"],
+                aperture2=aperture_values["aperture2"],
+                collimation_distance=float(np.asarray(collimation_group["collimation_distance"][()]).reshape(()))
+                if "collimation_distance" in collimation_group
+                else float("nan"),
+                last_aperture_to_sample_distance=float(
+                    np.asarray(collimation_group["last_aperture_to_sample_distance"][()]).reshape(())
+                )
+                if "last_aperture_to_sample_distance" in collimation_group
+                else float("nan"),
+            )
+
+    return configuration_cls(
+        wavelength=wavelength,
+        sample_detector_distance=sample_detector_distance,
+        collimation=collimation_obj,
+        config_id=stored_config_id,
+        notes=notes,
+    )
 
 
 def _read_bundle_definition_and_config_id(file_path: Path) -> tuple[str, Optional[str]]:
