@@ -25,12 +25,6 @@ From the project root:
 pip install -e .
 ```
 
-For notebooks:
-
-```bash
-pip install -e .[notebook]
-```
-
 For tests:
 
 ```bash
@@ -53,6 +47,8 @@ The mask editor currently uses `tkinter`.
 - on some Linux distributions you may need to install `python3-tk`
 
 For the most portable setup, the core package, CLI, and notebooks should be considered the primary interfaces; the `tkinter` GUI remains optional.
+
+`jupyterlab`, `silx`, and `PySide6` are installed with the base package and are no longer optional extras.
 
 ---
 
