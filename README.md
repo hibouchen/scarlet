@@ -4,16 +4,16 @@
 
 SCARLET is a NeXus-native framework for SANS data workflows.
 
-At the current stage, SCARLET provides the **infrastructure layer** needed before a full SANS reduction pipeline, plus a first deterministic 2D correction pass:
+At the current stage, SCARLET mainly provides:
 
 - conversion of selected instrument files to a common SCARLET `NXsas_raw` profile;
 - YAML-driven validation of SCARLET NeXus/HDF5 files;
 - extraction and comparison of instrument configurations;
-- generation of subtraction-reference bundles, `SCARLET_refs_sub`;
-- generation of normalization-reference bundles, `SCARLET_refs_norm`, including water references that may come from another configuration;
-- first deterministic 2D correction with dark subtraction, transmission, empty-cell subtraction and optional water normalization.
+- a `WorkflowContext` API to organize converted runs, masks, beam centers, ROIs, transmissions, reference files, and flatfields;
+- low-level reduction helpers for dead-time correction, monitor normalization, transmission calculation, geometry, `Q`-resolution helpers, reference subtraction, and azimuthal averaging;
+- GUI tools for mask editing and NeXus inspection.
 
-The higher-level reduction API, for example `sc.load(...)`, `sc.Reduction(...)`, and full `scarlet reduce` workflows are still evolving. A first deterministic azimuthal integration to `I(Q)` is now available through the low-level reduction API and CLI.
+Some workflow pieces around `refs_*`, flatfields, and 2D reduction are present in the codebase, but the high-level public reduction interface is still evolving.
 
 ---
 
@@ -81,10 +81,10 @@ src/scarlet/
       sansllb.py
   schemas/                       # packaged YAML schemas and schema notes
   validation/                    # YAML schema loading and HDF5 validation
-  reduction/                     # first deterministic 2D correction pass
+  reduction/                     # low-level reduction helpers
   workflow/
-    configuration.py             # configuration extraction/comparison + refs files
-    context.py                   # early workflow state container
+    configuration.py             # configuration extraction/comparison
+    context.py                   # workflow state container
 ```
 
 The main schema currently used for converted monochromatic SANS files is:
@@ -96,8 +96,10 @@ scarlet_nxsas_raw_v1.3_mono.yaml
 Additional packaged schemas include:
 
 ```text
+scarlet_masks_v1.0.yaml
 scarlet_refs_sub_v1.0.yaml
 scarlet_refs_norm_v1.0.yaml
+scarlet_workflow_context_v1.0.yaml
 ```
 
 ---
@@ -144,47 +146,7 @@ The currently registered converters are:
 - `sansllb` with aliases `SANSLLB`, `sans-llb`, `sans_llb`;
 - `sam`.
 
-Generate subtraction-reference bundles from the run-configuration Excel file:
-
-```bash
-scarlet refs-sub from-excel \
-  data/SANSLLB/processed/run_configuration.xlsx \
-  data/SANSLLB/processed \
-  data/SANSLLB/processed \
-  --overwrite \
-  --validate
-```
-
-Generate normalization-reference bundles, including water references:
-
-```bash
-scarlet refs-norm from-excel \
-  data/SANSLLB/processed/run_configuration.xlsx \
-  data/SANSLLB/processed \
-  data/SANSLLB/processed \
-  --overwrite \
-  --validate
-```
-
-The normalization generator prefers water files measured in the same configuration. If no local water reference is available, it can borrow a water file from another configuration and records the corresponding `source_config_id` in the output file.
-
-Run the first deterministic 2D correction pass:
-
-```bash
-scarlet reduce-2d \
-  data/SANSLLB/processed/sample_scattering.nxs \
-  data/SANSLLB/processed/refs_sub_config_1.nxs \
-  data/SANSLLB/processed/sample_reduced_2d.nxs \
-  --sample-transmission data/SANSLLB/processed/sample_transmission.nxs \
-  --refs-norm data/SANSLLB/processed/refs_norm_config_1.nxs \
-  --overwrite
-```
-
-This first pass writes a `SCARLET_azimuthal_iq` entry under `/processed_data`.
-By default it reduces every detector found in the raw file. The main `/processed_data/data` group aliases the first reduced detector, and `/processed_data/data0`, `/processed_data/data1`, ... store one azimuthal `NXdata` per detector.
-The final `NXdata` groups contain `I(Q)`, `n_pixels` and `Q_edges`; the underlying 2D corrected images plus `Qx`/`Qy` axes are kept under `/processed_data/detector0`, `/processed_data/detector1`, ...
-
-Export or merge azimuthal detector curves from a reduced file:
+Export one azimuthal detector curve from a reduced file:
 
 ```bash
 scarlet azimuthal-average \
@@ -192,6 +154,30 @@ scarlet azimuthal-average \
   data/SANSLLB/processed/azimuthal_average/sample_iq.csv \
   --overwrite
 ```
+
+Open the mask editor GUI:
+
+```bash
+scarlet mask-gui data/SANSLLB/processed/sample_scattering.nxs
+```
+
+Open the NeXus viewer:
+
+```bash
+scarlet nxsas-gui data/SANSLLB/processed
+```
+
+Open the silx-based viewer:
+
+```bash
+scarlet viewer data/SANSLLB/processed --instrument sansllb
+```
+
+Notes on the current CLI state:
+
+- `scarlet azimuthal-average` currently exports one detector at a time from an existing reduced file.
+- The parser also exposes `scarlet reduce-2d`, but that path should still be treated as in-progress until the underlying public reduction API is finalized.
+- The repository ships `refs_*` schemas and workflow helpers, but it does not currently expose public `scarlet refs-sub ...` or `scarlet refs-norm ...` commands.
 
 ---
 
@@ -241,55 +227,68 @@ cfg_b, issues_b = configuration_from_nexus("run_b_scarlet.nxs")
 same, diffs = compare_configurations(cfg_a, cfg_b)
 ```
 
-### Generate reference bundles from Excel
+### Initialize a workflow context from a raw directory
 
 ```python
-from scarlet.workflow.configuration import (
-    write_refs_sub_files_from_excel,
-    write_refs_norm_files_from_excel,
+from scarlet.workflow import initialize_workflow_context_from_raw_directory
+
+ctx = initialize_workflow_context_from_raw_directory(
+    "data/SANSLLB/raw",
+    output_dir="data/SANSLLB/processed",
+    instrument_name="sansllb",
 )
 
-write_refs_sub_files_from_excel(
-    "run_configuration.xlsx",
-    data_dir="data/SANSLLB/processed",
-    output_dir="data/SANSLLB/processed",
-    overwrite=True,
-)
-
-write_refs_norm_files_from_excel(
-    "run_configuration.xlsx",
-    data_dir="data/SANSLLB/processed",
-    output_dir="data/SANSLLB/processed",
-    overwrite=True,
-)
+print(len(ctx.runs))
+print(len(ctx.configurations))
+print(ctx.runs_table())
 ```
 
-### Run the first 2D correction pass
+### Attach a mask bundle and prepare a flatfield
 
 ```python
-from scarlet.reduction import reduce_2d
+from scarlet.workflow import WorkflowContext
 
-result = reduce_2d(
-    "sample_scattering.nxs",
-    "refs_sub_config_1.nxs",
-    sample_transmission="sample_transmission.nxs",
-    refs_norm="refs_norm_config_1.nxs",
-    output_path="sample_reduced_2d.nxs",
-    overwrite=True,
-)
+ctx = WorkflowContext(output_dir="data/SANSLLB/processed")
+config_id = ctx.attach_mask_bundle("data/SANSLLB/processed/config_1_masks.nxs")
+print(config_id)
 
-print(result.sample_transmission.value)
-print(result.detector_indices)
-print(result.intensity.shape)
+# When the corresponding water / dark / empty-cell references are registered
+# in the workflow context, a flatfield artifact can be built on demand.
+# flatfield_path = ctx.build_water_flatfield(config_id)
 ```
 
-### Compute an azimuthal average
+### Compute a transmission from two images
 
 ```python
-from scarlet.reduction import azimuthal_average
+from scarlet.reduction import compute_transmission
 
+transmission = compute_transmission(
+    "sample_transmission.nxs",
+    "empty_beam_transmission.nxs",
+    roi=(100, 140, 95, 135),
+)
+
+print(transmission)
+```
+
+### Compute an azimuthal average from arrays
+
+```python
+import numpy as np
+
+from scarlet.reduction import azimuthal_average, compute_q_norm_map
+
+image = np.random.random((128, 128))
+q_map = compute_q_norm_map(
+    image,
+    beam_center=(63.5, 63.5),
+    detector_distance=4.2,
+    pixel_size=(0.001, 0.001),
+    wavelength=6.0,
+)
 iq = azimuthal_average(
-    "sample_reduced_2d.nxs",
+    image,
+    q_map,
     n_bins=200,
 )
 
@@ -297,7 +296,7 @@ print(iq.q.shape)
 print(iq.intensity.shape)
 ```
 
-Implemented operations currently cover deterministic 2D correction plus a first azimuthal average: monitor/time normalization, dark subtraction, optional empty-beam scattering subtraction, transmission from the stored ROI, empty-cell subtraction, optional water normalization, and radial regrouping to `I(Q)`.
+Implemented operations currently cover conversion, validation, workflow bookkeeping, mask-bundle attachment, flatfield preparation helpers, detector dead-time correction, monitor normalization, transmission calculation, geometry / `Q` helpers, and azimuthal regrouping to `I(Q)`.
 
 ---
 
@@ -318,9 +317,9 @@ The `data/` directory is ignored by git so that raw and processed experimental f
 
 Near-term priorities:
 
-1. stabilize the ROI convention used for transmission bundles;
-2. add formal uncertainty propagation to the 2D correction;
-3. compute detector geometry and `Q` maps;
+1. stabilize the higher-level workflow around references, flatfields, and reduced outputs;
+2. align the public CLI and Python API with the currently implemented reduction pieces;
+3. add formal uncertainty propagation to the correction chain;
 4. add multi-distance stitching and Q-resolution handling.
 
 Longer-term goals:
