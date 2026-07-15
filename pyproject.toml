@@ -7,7 +7,7 @@ name = "scarlet"
 version = "0.1.0"
 description = "NeXus-native, instrument-agnostic framework for SANS data reduction."
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 license = { file = "LICENSE" }
 authors = [{ name = "SCARLET Contributors" }]
 dependencies = [
