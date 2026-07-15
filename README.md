@@ -28,7 +28,7 @@ source <venv_path>/bin/activate
 
 #on windows
 python3 -m venv <venv_path>
-<venv_path>\Scripts\activate
+<venv_path>\Scripts\activate.bat
 ```
 
 The repository can be downloaded on GithHub (`https://github.com/hibouchen/scarlet.git`) or clone directly with the following command:
@@ -46,7 +46,6 @@ The repository contains ad requirements.txt file allowing to install all the req
 ```
 pip install -r requirements.txt
 ```
-
 
 ## Installation for development
 
