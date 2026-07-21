@@ -63,6 +63,14 @@ class SASCurve:
         object.__setattr__(self, "di", di)
         object.__setattr__(self, "dq", dq)
 
+    def __mul__(self, factor: float) -> "SASCurve":
+        """Return a copy with I and dI multiplied by ``factor``."""
+        return SASCurve(self.q, self.i * factor, self.di * factor, self.dq, self.name + "x%.1f" % factor, self.config_id)
+    
+    def __add__(self, factor: float) -> "SASCurve":
+        return SASCurve(self.q, self.i + factor, self.di, self.dq, self.name + "+%.1f" % factor, self.config_id)
+    
+
     @classmethod
     def from_array(cls, data: ArrayLike, *, name: str = "", config_id: str = "") -> "SASCurve":
         """Build a curve from a four-column array: Q, I, dI, dQ."""
@@ -121,6 +129,10 @@ class DegradedCurve:
     dq: FloatArray
     valid: BoolArray
     coverage: FloatArray
+
+    def __mul__(self, factor: float) -> "SASCurve":
+        """Return a copy with I and dI multiplied by ``factor``."""
+        return DegradedCurve(coverage=self.coverage, q=self.q, i=self.i * factor, di=self.di * factor, dq=self.dq, valid=self.valid)
 
 
 @dataclass(frozen=True)
@@ -292,7 +304,7 @@ def degrade_to_resolution(
     quadrature = _trapezoid_weights(source.q)
     local_step = PchipInterpolator(
         source.q,
-        np.gradient(source.q),
+        np.gradient(source.q),#(''),
         extrapolate=False,
     )(q_eval)
 
