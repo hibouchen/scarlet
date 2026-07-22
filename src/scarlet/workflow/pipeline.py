@@ -738,14 +738,13 @@ class ReductionPipeline:
     steps: tuple[ReductionStep, ...] = field(default_factory=tuple)
 
     @classmethod
-    def with_azimuthal_text_output(cls) -> "ReductionPipeline":
+    def without_azimuthal_text_output(cls) -> "ReductionPipeline":
         return cls(
             steps=(
                 as_reduction_step(subtract_references_step),
                 as_reduction_step(normalization_step),
                 as_reduction_step(azimuthal_averaging_step),
                 as_reduction_step(save_processed_detectors_step),
-                as_reduction_step(save_azimuthal_text_step),
             )
         )
 
