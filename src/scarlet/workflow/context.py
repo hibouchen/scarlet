@@ -1987,9 +1987,9 @@ def _read_beam_centers_from_file(path: Path) -> dict[int, BeamCenter]:
 def _classify_entity_from_sample_name(sample_name: str) -> Entity:
     """Infer the workflow entity type from the sample name."""
     normalized = re.sub(r"[^a-z0-9]+", "", sample_name.strip().lower())
-    if "emptybeam" in normalized:
+    if normalized in {"emptybeam", "empty_beam", "empty beam", "eb"}:
         return "empty_beam"
-    if normalized == "emptycell":
+    if normalized in {"emptycell", "empty_cell", "empty cell", "ec"}:
         return "empty_cell"
     if normalized.startswith("water") or normalized == "h2o":
         return "water"

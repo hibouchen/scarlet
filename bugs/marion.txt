@@ -1,0 +1,17 @@
+Hello,
+
+J’ai essayé de réutiliser scarlet pour traiter les data, après avoir réinstaller tout.
+
+Je te les notes à la volée, sans priorité :
+
+ 
+
+Problème de détection automatique de tranmission pour la config 7
+Workflow save ne marche pas
+EB et EC pas détecté en empty_beam et empty_cell : lligne 1987 à changer ?
+Get_roi ne marche pas quand on n’a pas de ‘empty_beam’ à mettre un message d’erreur qu’on n’a pas de empty beam ? j’ai passé longtemps à comprendre
+Sur set_roi, préciser coin bas gauche et haut droit plutôt que x0,x1,y0,y1
+J’ai des transmission >1 pour la config 7. Je ne comprends pas pourquoi, même si la gueule du faisceau est moche. 
+Le fichier workflow est bien updaté dans src/scarlet/workflow/ mais il faut aussi l’updater dans venv_scarlet/Lib/site-packages/scarlet/workflow/ à j’ai copié collé manuellement les dernières lignes et ça a tourné
+Je pense que tant qu’on ne peut pas sauver le workflow, je n’ai pas les fichier .txt sauvegardés donc pour le moment, je ne sais pas si tout marche bien
+Une fois que tu as tes ;txt, tu les ouvres avec sasview ?
