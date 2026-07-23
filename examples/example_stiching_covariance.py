@@ -7,7 +7,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 
-from scarlet.reduction.stitching import (
+from scarlet.reduction.stitchingbis import (
     SASCurve,
     common_resolution_overlap,
     stitch_many,

@@ -1,6 +1,6 @@
 import numpy as np
 
-from scarlet.reduction.stitching import SASCurve, stitch_pair
+from scarlet.reduction.stitchingbis import SASCurve, stitch_pair
 
 
 def _make_curve(

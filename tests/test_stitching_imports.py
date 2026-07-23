@@ -1,5 +1,5 @@
-from scarlet.reduction import SASCurve, stitch_many, stitch_pair
-from scarlet.reduction import stiching, stitching
+from scarlet.reduction import SASCurve, stitch_many, stitch_pair, stitchingbis
+from scarlet.reduction import stiching
 
 
 def test_package_reexports_stitching_api() -> None:
@@ -10,4 +10,4 @@ def test_package_reexports_stitching_api() -> None:
 
 def test_module_aliases_remain_importable() -> None:
     assert stiching.stitch_pair is stitch_pair
-    assert stitching.stitch_many is stitch_many
+    assert stitchingbis.stitch_many is stitch_many

@@ -17,6 +17,7 @@ from scarlet.reduction.resolution import compute_beam_divergence, compute_q_reso
 from scarlet.workflow.configuration import Configuration
 from scarlet.workflow.context import RunKey, WorkflowContext
 from scarlet.workflow.normalization import load_flatfield_file
+import scarlet.reduction.stiching as st
 
 if TYPE_CHECKING:
     import scipp as sc
@@ -770,6 +771,37 @@ class ReductionPipeline:
             state = step.fn(state)
             state.reductions_steps.append(step.name)
         return state
+    
+    def run_for_sample(self, workflow: WorkflowContext, sample_name: str, config_id: str) -> ReductionState:
+        state = ReductionState(sample_name=sample_name, config_id=config_id, workflow=workflow)
+        return self.run(state)
+    
+    def run_all(self, workflow: WorkflowContext):
+        for run in workflow.runs:
+            if run.entity=="sample" and run.mode=="scattering":
+                state = ReductionState(sample_name=run.sample_name, config_id=run.config_id,workflow=workflow)
+                self.run(state)
+
+@dataclass(frozen=True)
+class StichingPipeline():
+    workflow: WorkflowContext
+    scale_on: str
+
+    @classmethod
+    def default(cls) -> "ReductionPipeline":
+        return cls(
+            steps=(
+                as_reduction_step(subtract_references_step),
+                as_reduction_step(normalization_step),
+                as_reduction_step(azimuthal_averaging_step),
+                as_reduction_step(save_processed_detectors_step),
+                as_reduction_step(save_azimuthal_text_step),
+            )
+        )
+
+    @property
+    def step_names(self) -> tuple[str, ...]:
+        return tuple(step.name for step in self.steps)
     
     def run_for_sample(self, workflow: WorkflowContext, sample_name: str, config_id: str) -> ReductionState:
         state = ReductionState(sample_name=sample_name, config_id=config_id, workflow=workflow)
