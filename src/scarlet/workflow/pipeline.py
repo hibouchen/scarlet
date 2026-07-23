@@ -838,8 +838,10 @@ class StichingPipeline():
         return final_data
 
     
-    # def run_all(self, workflow: WorkflowContext):
-    #     for run in workflow.runs:
-    #         if run.entity=="sample" and run.mode=="scattering":
-    #             state = ReductionState(sample_name=run.sample_name, config_id=run.config_id,workflow=workflow)
-    #             self.run(state)
+    def run_all(self, scale_on: str | None= None):
+        sample_names = []
+        for run in self.workflow.runs:
+            if run.entity=="sample" and run.mode=="scattering":
+                sample_names.append(run.sample_name)
+        for sample in sample_names:
+            self.run_for_sample(sample, scale_on=scale_on)
