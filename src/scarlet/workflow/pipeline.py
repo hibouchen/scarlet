@@ -25,7 +25,6 @@ if TYPE_CHECKING:
 StepFunction = Callable[["ReductionState"], "ReductionState"]
 _F = TypeVar("_F", bound=StepFunction)
 
-
 @dataclass
 class ReductionState:
     sample_name: str
@@ -785,30 +784,62 @@ class ReductionPipeline:
 @dataclass(frozen=True)
 class StichingPipeline():
     workflow: WorkflowContext
-    scale_on: str
 
-    @classmethod
-    def default(cls) -> "ReductionPipeline":
-        return cls(
-            steps=(
-                as_reduction_step(subtract_references_step),
-                as_reduction_step(normalization_step),
-                as_reduction_step(azimuthal_averaging_step),
-                as_reduction_step(save_processed_detectors_step),
-                as_reduction_step(save_azimuthal_text_step),
+    def run_for_sample(self, sample_name: str, scale_on: str | None= None):
+        config = self.workflow.configurations
+        segments = []
+        for config_id in config:
+            file_path = self.workflow.get_run_path(RunKey(
+                config_id=config_id,
+                entity="sample",
+                mode="scattering",
+                sample_name=sample_name,
+                )
             )
-        )
+            if file_path:
+                segments += st.load_segment_from_nexus(file_path, config_id=config_id)
+        
+        result = st.stitch_segments_greedy(segments,
+                                            start_policy="lowest_q",
+                                            grid="common",
+                                            min_points=8,
+                                            min_log_width=0.10,
+                                            slope_weight=0.10,
+                                            width_weight=0.05,
+                                            resolution_weight=0.50,
+                                            rho_ref=0.20,
+                                            max_chi2_red=3.0,
+                                            max_slope_z=2.5,
+                                            min_new_log_coverage=0.05,
+                                            segment_quality_weight=4.0,
+                                            new_coverage_weight=1.5,
+                                            keep_fraction=0.25,
+                                        )
+        if scale_on in config:
+            result = st.rebase_result_to_reference(result, reference_config=scale_on, reference_detector="detector0")
+            
+            
+        
+        final_data = np.column_stack([
+                result.final_curve.q,
+                result.final_curve.i,
+                result.final_curve.di,
+                result.final_curve.dq,
+                result.origin_segment_id,
+            ])
+        
+        header = (
+                "q I I_error q_error origin_segment_id\n"
+                + "\n".join(f"origin_segment_id {idx}: {name}" for idx, name in result.origin_map.items())
+            )
+        
+        np.savetxt(self.workflow.output_dir / f"{sample_name}_merged.txt", final_data, header=header)
+        
+        return final_data
 
-    @property
-    def step_names(self) -> tuple[str, ...]:
-        return tuple(step.name for step in self.steps)
     
-    def run_for_sample(self, workflow: WorkflowContext, sample_name: str, config_id: str) -> ReductionState:
-        state = ReductionState(sample_name=sample_name, config_id=config_id, workflow=workflow)
-        return self.run(state)
-    
-    def run_all(self, workflow: WorkflowContext):
-        for run in workflow.runs:
-            if run.entity=="sample" and run.mode=="scattering":
-                state = ReductionState(sample_name=run.sample_name, config_id=run.config_id,workflow=workflow)
-                self.run(state)
+    # def run_all(self, workflow: WorkflowContext):
+    #     for run in workflow.runs:
+    #         if run.entity=="sample" and run.mode=="scattering":
+    #             state = ReductionState(sample_name=run.sample_name, config_id=run.config_id,workflow=workflow)
+    #             self.run(state)
