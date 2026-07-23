@@ -14,6 +14,7 @@ from .geometry import (
     compute_theta_map,
 )
 from .integration import AzimuthalAverageResult, azimuthal_average
+
 from .resolution import (
     compute_beam_divergence,
     compute_q_resolution_circular,
@@ -37,6 +38,7 @@ __all__ = [
     "compute_q_norm_map",
     "normalize_by_monitor",
     "normalize_by_solid_angle",
+    "CommonResolutionOverlap",
     "compute_q_resolution_circular",
     "compute_q_uncertainty_map",
     "compute_qx_vector",
@@ -45,6 +47,19 @@ __all__ = [
     "compute_qy_uncertainty_vector",
     "compute_theta_map",
     "crop_curve",
+    "choose_retained_overlap",
+    "common_resolution_overlap",
+    "DegradedCurve",
+    "degrade_to_resolution",
+    "fit_scale_factor",
+    "MultiStitchResult",
+    "overlap_bounds",
+    "SASCurve",
+    "ScaleFit",
+    "StitchedCurve",
+    "StitchResult",
+    "stitch_many",
+    "stitch_pair",
     "subtract_scattering_references",
     "compute_transmission",
 ]

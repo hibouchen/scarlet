@@ -17,6 +17,7 @@ from scarlet.io import (
     read_detector_error,
     read_detector_pixel_size,
     read_empty_beam_transmission_source_file,
+    read_processed_data,
 )
 from scarlet.reduction.correction import correct_detector_dead_time
 
@@ -67,6 +68,32 @@ def _write_test_refs_file(path: Path, *, definition: str, source_file: str | Non
         transmission_roi.create_dataset("x1", data=5)
         transmission_roi.create_dataset("y0", data=2)
         transmission_roi.create_dataset("y1", data=7)
+
+
+def _write_test_processed_file(path: Path) -> None:
+    with h5py.File(path, "w") as f:
+        entry = f.create_group("processed")
+        entry.attrs["NX_class"] = b"NXentry"
+
+        data0 = entry.create_group("data0")
+        data0.attrs["NX_class"] = b"NXdata"
+        data0.create_dataset("q", data=np.asarray([0.1, 0.2], dtype=np.float64))
+        data0.create_dataset("data", data=np.asarray([10.0, 20.0], dtype=np.float64))
+        data0.create_dataset("errors", data=np.asarray([1.0, 2.0], dtype=np.float64))
+        data0.create_dataset("q_error", data=np.asarray([0.01, 0.02], dtype=np.float64))
+
+        data2 = entry.create_group("data2")
+        data2.attrs["NX_class"] = b"NXdata"
+        data2.create_dataset(
+            "data",
+            data=np.asarray(
+                [
+                    [0.3, 30.0, 3.0, 0.03],
+                    [0.4, 40.0, 4.0, 0.04],
+                ],
+                dtype=np.float64,
+            ),
+        )
 
 
 class TestNexusReader(unittest.TestCase):
@@ -355,6 +382,53 @@ class TestNexusReader(unittest.TestCase):
 
             self.assertEqual(roi, [1, 5, 2, 7])
             self.assertEqual(detector, 2)
+
+    def test_read_processed_data_returns_detector_indexed_four_column_arrays(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            file_path = Path(td) / "processed.nxs"
+            _write_test_processed_file(file_path)
+
+            processed = read_processed_data(file_path)
+
+            self.assertEqual(len(processed), 3)
+            np.testing.assert_allclose(
+                processed[0],
+                np.asarray(
+                    [
+                        [0.1, 10.0, 1.0, 0.01],
+                        [0.2, 20.0, 2.0, 0.02],
+                    ],
+                    dtype=np.float64,
+                ),
+            )
+            self.assertIsNone(processed[1])
+            np.testing.assert_allclose(
+                processed[2],
+                np.asarray(
+                    [
+                        [0.3, 30.0, 3.0, 0.03],
+                        [0.4, 40.0, 4.0, 0.04],
+                    ],
+                    dtype=np.float64,
+                ),
+            )
+
+    def test_read_processed_data_fills_missing_optional_columns_with_nan(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            file_path = Path(td) / "processed_missing_optional.nxs"
+            with h5py.File(file_path, "w") as handle:
+                entry = handle.create_group("processed")
+                entry.attrs["NX_class"] = b"NXentry"
+                data0 = entry.create_group("data0")
+                data0.attrs["NX_class"] = b"NXdata"
+                data0.create_dataset("q", data=np.asarray([0.1, 0.2], dtype=np.float64))
+                data0.create_dataset("data", data=np.asarray([10.0, 20.0], dtype=np.float64))
+
+            processed = read_processed_data(file_path)
+
+            np.testing.assert_allclose(processed[0][:, 0], np.asarray([0.1, 0.2], dtype=np.float64))
+            np.testing.assert_allclose(processed[0][:, 1], np.asarray([10.0, 20.0], dtype=np.float64))
+            self.assertTrue(np.isnan(processed[0][:, 2:]).all())
 
 
 if __name__ == "__main__":
