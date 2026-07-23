@@ -224,6 +224,33 @@ def read_all_detectors(
         }
 
 
+def read_processed_data(
+    file_path: Path | str,
+    *,
+    entry_name: str = "processed",
+) -> list[np.ndarray | None]:
+    """Read ``/processed/dataN`` entries as 4-column ``(q, I, dI, dQ)`` arrays."""
+    file_path = Path(file_path).resolve()
+    with h5py.File(file_path, "r") as handle:
+        entry_path = _normalize_top_level_entry_name(entry_name)
+        detector_numbers = _list_processed_detector_numbers_from_handle(
+            handle,
+            entry_path,
+            file_path=file_path,
+        )
+        processed_data: list[np.ndarray | None] = [None] * (max(detector_numbers) + 1)
+        for detector_number in detector_numbers:
+            processed_data[detector_number] = _read_processed_detector_data(
+                handle,
+                entry_path,
+                detector_number,
+                file_path=file_path,
+            )
+        return processed_data
+
+
+
+
 def read_configuration(file_path: Path | str) -> tuple[Configuration, list[str]]:
     """Extract the experimental configuration inferred from a SCARLET-compatible NeXus file."""
     from scarlet.workflow.configuration import configuration_from_nexus
@@ -279,6 +306,14 @@ def _resolve_entry_path(handle: h5py.File, *, file_path: Path) -> str:
         if entry_path in handle and isinstance(handle[entry_path], h5py.Group):
             return entry_path
     raise ValueError(f"No raw-data entry group found in {file_path}")
+
+
+def _normalize_top_level_entry_name(entry_name: str) -> str:
+    """Normalize a top-level entry name to an absolute HDF5 path."""
+    normalized = entry_name.strip()
+    if not normalized:
+        raise ValueError("entry name must not be empty")
+    return normalized if normalized.startswith("/") else f"/{normalized}"
 
 
 def _read_monitor_value(handle: h5py.File, entry_path: str, *, file_path: Path) -> float:
@@ -390,6 +425,107 @@ def _list_detector_numbers_from_handle(
     if not detector_numbers:
         raise ValueError(f"No detectorN/data datasets found in {file_path}")
     return sorted(detector_numbers)
+
+
+def _list_processed_detector_numbers_from_handle(
+    handle: h5py.File,
+    entry_path: str,
+    *,
+    file_path: Path,
+) -> list[int]:
+    """List detector indices from ``/processed/dataN`` groups."""
+    if entry_path not in handle or not isinstance(handle[entry_path], h5py.Group):
+        raise ValueError(f"Missing processed entry in {file_path}: {entry_path}")
+
+    detector_numbers: list[int] = []
+    for name, group in handle[entry_path].items():
+        if not isinstance(group, h5py.Group):
+            continue
+        match = re.fullmatch(r"data(\d+)", name)
+        if match is None:
+            continue
+        detector_numbers.append(int(match.group(1)))
+    if not detector_numbers:
+        raise ValueError(f"No dataN groups found in {file_path}: {entry_path}")
+    return sorted(detector_numbers)
+
+
+def _read_processed_detector_data(
+    handle: h5py.File,
+    entry_path: str,
+    detector_number: int,
+    *,
+    file_path: Path,
+) -> np.ndarray:
+    """Read one processed detector curve as a ``(n, 4)`` array."""
+    group_path = f"{entry_path}/data{detector_number}"
+    if group_path not in handle or not isinstance(handle[group_path], h5py.Group):
+        raise ValueError(f"Missing processed detector group in {file_path}: {group_path}")
+
+    group = handle[group_path]
+    if "data" in group:
+        raw_data = np.asarray(group["data"][()], dtype=np.float64)
+        if raw_data.ndim == 2 and raw_data.shape[1] == 4 and "q" not in group and "Q" not in group:
+            return raw_data
+
+    q = _read_required_processed_vector(group, file_path=file_path, group_path=group_path, dataset_names=("q", "Q"))
+    intensity = _read_required_processed_vector(
+        group,
+        file_path=file_path,
+        group_path=group_path,
+        dataset_names=("data", "I", "intensity"),
+    )
+    intensity_error = _read_optional_processed_vector(
+        group,
+        size=q.size,
+        dataset_names=("errors", "I_error", "dI", "di"),
+    )
+    q_error = _read_optional_processed_vector(
+        group,
+        size=q.size,
+        dataset_names=("q_error", "Q_error", "dQ", "dq"),
+    )
+    return np.column_stack((q, intensity, intensity_error, q_error))
+
+
+def _read_required_processed_vector(
+    group: h5py.Group,
+    *,
+    file_path: Path,
+    group_path: str,
+    dataset_names: tuple[str, ...],
+) -> np.ndarray:
+    """Read one required 1D processed dataset using fallback names."""
+    data = _read_optional_processed_vector(group, size=None, dataset_names=dataset_names)
+    if data is None:
+        choices = ", ".join(f"{group_path}/{name}" for name in dataset_names)
+        raise ValueError(f"Missing required processed dataset in {file_path}: expected one of {choices}")
+    return data
+
+
+def _read_optional_processed_vector(
+    group: h5py.Group,
+    *,
+    size: int | None,
+    dataset_names: tuple[str, ...],
+) -> np.ndarray | None:
+    """Read one optional 1D processed dataset or return ``NaN`` when absent."""
+    for dataset_name in dataset_names:
+        if dataset_name not in group:
+            continue
+        values = np.asarray(group[dataset_name][()], dtype=np.float64)
+        if values.ndim != 1:
+            raise ValueError(
+                f"Processed dataset {group.name}/{dataset_name} must be 1D, got shape {values.shape}"
+            )
+        if size is not None and values.shape != (size,):
+            raise ValueError(
+                f"Processed dataset {group.name}/{dataset_name} must have shape {(size,)}, got {values.shape}"
+            )
+        return values
+    if size is None:
+        return None
+    return np.full(size, np.nan, dtype=np.float64)
 
 
 def _read_detector(
@@ -568,6 +704,7 @@ __all__ = [
     "get_roi",
     "list_detector_numbers",
     "load_nxsas_raw",
+    "read_processed_data",
     "read_all_detectors",
     "read_configuration",
     "read_count_time_value",

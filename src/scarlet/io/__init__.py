@@ -14,6 +14,7 @@ from .nexus_reader import (
     read_detector_error,
     read_detector_pixel_size,
     read_monitor_value,
+    read_processed_data,
     resolve_entry_path,
 )
 
@@ -33,5 +34,6 @@ __all__ = [
     "read_detector_error",
     "read_detector_pixel_size",
     "read_monitor_value",
+    "read_processed_data",
     "resolve_entry_path",
 ]
