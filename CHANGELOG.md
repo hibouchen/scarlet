@@ -10,6 +10,8 @@ The project follows a simple Semantic Versioning policy:
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-24
+
 - Documentation: README aligned with the currently exposed CLI and Python API.
 - Project metadata: package version is now exposed as `scarlet.__version__`.
 - Process: added a project changelog and a minimal release checklist.
