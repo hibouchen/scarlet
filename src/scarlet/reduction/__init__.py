@@ -14,6 +14,22 @@ from .geometry import (
     compute_theta_map,
 )
 from .integration import AzimuthalAverageResult, azimuthal_average
+from .stitching import (
+    CommonResolutionOverlap,
+    DegradedCurve,
+    MultiStitchResult,
+    SASCurve,
+    ScaleFit,
+    StitchedCurve,
+    StitchResult,
+    choose_retained_overlap,
+    common_resolution_overlap,
+    degrade_to_resolution,
+    fit_scale_factor,
+    overlap_bounds,
+    stitch_many,
+    stitch_pair,
+)
 
 from .resolution import (
     compute_beam_divergence,

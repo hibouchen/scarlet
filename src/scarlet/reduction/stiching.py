@@ -1448,3 +1448,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+from .stitching import stitch_many, stitch_pair
