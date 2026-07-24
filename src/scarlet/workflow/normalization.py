@@ -320,9 +320,9 @@ def load_flatfield_file(file_path: str | Path) -> dict[int, "sc.DataArray"]:
         for detector_name, detector_group in instrument.items():
             if not isinstance(detector_group, h5py.Group):
                 continue
-            if not detector_name.startswith("detector") or not detector_name.removeprefix("detector").isdigit():
+            if not detector_name.startswith("detector") or not detector_name[len("detector"):].isdigit():
                 continue
-            detector_number = int(detector_name.removeprefix("detector"))
+            detector_number = int(detector_name[len("detector"):])
             dataset_path = f"{instrument_path}/{detector_name}/flatfield"
             error_path = f"{instrument_path}/{detector_name}/flatfield_errors"
             mask_path = f"{instrument_path}/{detector_name}/pixel_mask"

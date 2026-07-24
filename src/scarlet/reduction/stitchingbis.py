@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Literal, Sequence
 
@@ -310,9 +312,7 @@ def degrade_to_resolution(
 
     sqrt_two = np.sqrt(2.0)
 
-    for row_index, (q0, sigma, step) in enumerate(
-        zip(q_eval, sigma_add, local_step, strict=True)
-    ):
+    for row_index, (q0, sigma, step) in enumerate(zip(q_eval, sigma_add, local_step)):
         if not (finite_resolution[row_index] and correct_order[row_index]):
             continue
 
