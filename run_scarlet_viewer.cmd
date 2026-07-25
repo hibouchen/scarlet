@@ -1,22 +1,14 @@
 @echo off
 setlocal
 
-rem ==================================================
-rem Configuration
-rem ==================================================
-
-set "SCARLET_DIR=C:\Users\gac-sansllb\Document\SCARLET"
+set "SCARLET_DIR=C:\Users\gac-sansllb\Documents\SCARLET"
 set "VENV_DIR=%SCARLET_DIR%\scarlet_venv"
 
 title SCARLET Viewer
 
-rem ==================================================
-rem Verifications
-rem ==================================================
-
-if not exist "%VENV_DIR%\Scripts\python.exe" (
+if not exist "%VENV_DIR%\Scripts\activate.bat" (
     echo.
-    echo ERREUR : environnement Python introuvable.
+    echo ERREUR : environnement virtuel introuvable.
     echo.
     echo Chemin recherche :
     echo %VENV_DIR%
@@ -25,24 +17,15 @@ if not exist "%VENV_DIR%\Scripts\python.exe" (
     exit /b 1
 )
 
-rem ==================================================
-rem Lancement
-rem ==================================================
-
 cd /d "%SCARLET_DIR%"
 
-echo.
-echo Lancement de SCARLET Viewer...
-echo.
+call "%VENV_DIR%\Scripts\activate.bat"
 
-"%VENV_DIR%\Scripts\python.exe" -m scarlet viewer
+scarlet viewer
 
 if errorlevel 1 (
     echo.
     echo ERREUR : SCARLET Viewer n'a pas pu etre lance.
-    echo.
-    echo Testez eventuellement la commande suivante :
-    echo "%VENV_DIR%\Scripts\scarlet.exe" viewer
     echo.
     pause
 )
