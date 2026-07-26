@@ -30,6 +30,8 @@ def _write_detector_file(
     sample_name: str,
     data: np.ndarray,
     monitor_integral: float = 1.0,
+    count_time: float | None = None,
+    dead_time: float | None = None,
 ) -> None:
     with h5py.File(path, "w") as handle:
         entry = handle.create_group("entry")
@@ -43,12 +45,16 @@ def _write_detector_file(
         control = entry.create_group("control")
         control.attrs["NX_class"] = b"NXmonitor"
         control.create_dataset("integral", data=float(monitor_integral))
+        if count_time is not None:
+            control.create_dataset("count_time", data=float(count_time))
 
         instrument = entry.create_group("instrument")
         instrument.attrs["NX_class"] = b"NXinstrument"
         detector = instrument.create_group("detector0")
         detector.attrs["NX_class"] = b"NXdetector"
         detector.create_dataset("data", data=np.asarray(data, dtype=np.float64))
+        if dead_time is not None:
+            detector.create_dataset("dead_time", data=float(dead_time))
         detector.create_dataset("x_pixel_size", data=0.001)
         detector.create_dataset("y_pixel_size", data=0.001)
         detector.create_dataset("beam_center_x", data=0.5)
@@ -160,6 +166,45 @@ class TestWorkflowPipeline(unittest.TestCase):
                 updated.detectors[0].masks["workflow_config"].values,
                 np.asarray([[False, True], [False, False]], dtype=bool),
             )
+
+    def test_subtract_references_step_handles_empty_cell_with_different_count_time(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            sample_path = root / "sample_scattering.nxs"
+            empty_cell_path = root / "empty_cell_scattering.nxs"
+            dead_time = 1.0e-2
+            _write_detector_file(
+                sample_path,
+                sample_name="sample_a",
+                data=np.full((2, 2), 50.0, dtype=np.float64),
+                monitor_integral=20.0,
+                count_time=10.0,
+                dead_time=dead_time,
+            )
+            _write_detector_file(
+                empty_cell_path,
+                sample_name="EC",
+                data=np.full((2, 2), 25.0, dtype=np.float64),
+                monitor_integral=10.0,
+                count_time=5.0,
+                dead_time=dead_time,
+            )
+
+            ctx = WorkflowContext(output_dir=root / "out")
+            ctx.add_run(
+                RunKey(config_id="cfg", entity="sample", mode="scattering", sample_name="sample_a"),
+                sample_path,
+            )
+            ctx.add_run(
+                RunKey(config_id="cfg", entity="empty_cell", mode="scattering", sample_name="EC"),
+                empty_cell_path,
+            )
+            ctx.set_empty_cell_transmission("cfg", 1.0)
+
+            state = ReductionState(sample_name="sample_a", config_id="cfg", workflow=ctx, transmission=1.0)
+            updated = subtract_references_step(state)
+
+            np.testing.assert_allclose(updated.detectors[0].data.values, np.zeros((2, 2), dtype=np.float64))
 
     def test_azimuthal_averaging_step_integrates_detector_with_workflow_mask(self) -> None:
         with tempfile.TemporaryDirectory() as td:

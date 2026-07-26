@@ -598,14 +598,24 @@ def _read_detector_payload(
         )
         data_represents_rate = True
 
-    data = corrected_data / monitor if normalize_by_monitor else corrected_data
     error_source = np.clip(corrected_data, 0.0, None)
-    if data_represents_rate and count_time is not None and count_time > 0.0:
-        error = np.sqrt(error_source / float(count_time))
-    else:
-        error = np.sqrt(error_source)
     if normalize_by_monitor:
-        error = error / monitor
+        # Dead-time correction returns a count rate. Convert back to corrected
+        # counts before dividing by the monitor integral so reduced images stay
+        # on a consistent counts/monitor scale across different acquisition times.
+        if data_represents_rate and count_time is not None and count_time > 0.0:
+            normalized_counts = corrected_data * float(count_time)
+            data = normalized_counts / monitor
+            error = np.sqrt(np.clip(normalized_counts, 0.0, None)) / monitor
+        else:
+            data = corrected_data / monitor
+            error = np.sqrt(error_source) / monitor
+    else:
+        data = corrected_data
+        if data_represents_rate and count_time is not None and count_time > 0.0:
+            error = np.sqrt(error_source / float(count_time))
+        else:
+            error = np.sqrt(error_source)
 
     x_pixel_size = _read_optional_scalar(handle, f"{detector_path}/x_pixel_size")
     y_pixel_size = _read_optional_scalar(handle, f"{detector_path}/y_pixel_size")

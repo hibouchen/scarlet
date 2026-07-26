@@ -182,7 +182,7 @@ class TestNexusReader(unittest.TestCase):
                 normalize_by_monitor=True,
             )
 
-            expected = correct_detector_dead_time(image, acq_time=10.0, deadtime=1.0e-2) / 10.0
+            expected = correct_detector_dead_time(image, acq_time=10.0, deadtime=1.0e-2)
             np.testing.assert_allclose(corrected, expected)
 
     def test_read_detector_error_uses_corrected_data_when_deadtime_is_applied(self) -> None:
@@ -206,7 +206,7 @@ class TestNexusReader(unittest.TestCase):
             )
 
             expected_data = correct_detector_dead_time(image, acq_time=10.0, deadtime=1.0e-2)
-            np.testing.assert_allclose(error, np.sqrt(expected_data / 10.0) / 10.0)
+            np.testing.assert_allclose(error, np.sqrt(expected_data / 10.0))
 
     def test_read_detector_data_skips_deadtime_recorrection_when_file_is_already_corrected(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -230,7 +230,7 @@ class TestNexusReader(unittest.TestCase):
                 normalize_by_monitor=True,
             )
 
-            np.testing.assert_allclose(loaded, corrected / 10.0)
+            np.testing.assert_allclose(loaded, corrected)
 
     def test_read_detector_error_uses_count_time_for_already_corrected_rate_data(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -254,7 +254,7 @@ class TestNexusReader(unittest.TestCase):
                 normalize_by_monitor=True,
             )
 
-            np.testing.assert_allclose(error, np.sqrt(corrected / 10.0) / 10.0)
+            np.testing.assert_allclose(error, np.sqrt(corrected / 10.0))
 
     def test_read_detector_data_requires_count_time_for_non_zero_deadtime_correction(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -283,8 +283,45 @@ class TestNexusReader(unittest.TestCase):
                 return
 
             detector = read_detector(file_path, 0, correct_deadtime=True, normalize_by_monitor=True)
-            expected = correct_detector_dead_time(image, acq_time=10.0, deadtime=1.0e-2) / 10.0
+            expected = correct_detector_dead_time(image, acq_time=10.0, deadtime=1.0e-2)
             np.testing.assert_allclose(detector.values, expected)
+
+    def test_read_detector_data_uses_monitor_rate_after_deadtime_correction(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            sample_path = Path(td) / "sample.nxs"
+            reference_path = Path(td) / "reference.nxs"
+            deadtime = 1.0e-2
+            _write_test_raw_file(
+                sample_path,
+                dataset_name="dead_time",
+                value=deadtime,
+                image_data=np.full((2, 2), 50.0, dtype=np.float64),
+                monitor=20.0,
+                count_time=10.0,
+            )
+            _write_test_raw_file(
+                reference_path,
+                dataset_name="dead_time",
+                value=deadtime,
+                image_data=np.full((2, 2), 25.0, dtype=np.float64),
+                monitor=10.0,
+                count_time=5.0,
+            )
+
+            sample = read_detector_data(
+                sample_path,
+                0,
+                correct_deadtime=True,
+                normalize_by_monitor=True,
+            )
+            reference = read_detector_data(
+                reference_path,
+                0,
+                correct_deadtime=True,
+                normalize_by_monitor=True,
+            )
+
+            np.testing.assert_allclose(sample, reference)
 
     def test_read_empty_beam_transmission_source_file_reads_refs_bundle_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as td:
