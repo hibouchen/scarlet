@@ -49,3 +49,18 @@ notebooks/workflow.nxs
 notebooks/runs_table.csv
 notebooks/workflow.nxs
 notebooks/workflow.nxs
+
+# Local stitched outputs
+stitched_011334_001__011344_002.dat
+stitched_011334_001__011344_002.png
+stitched_011344_002__011361_003.dat
+stitched_011344_002__011361_003.png
+stitched_all_3_configs.dat
+stitched_all_3_configs.png
+stitched_d11_002_003.dat
+stitched_d11_002_003.png
+stitched_light.dat
+stitched_light.png
+stitched_ludox_AM20_config_config_9_detector0__ludox_AM20_config_config_10_detector0.dat
+stitched_ludox_AM20_config_config_9_detector0__ludox_AM20_config_config_10_detector0.png
+workflow_context.nxs
