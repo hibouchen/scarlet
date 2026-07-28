@@ -42,6 +42,9 @@ SampleThicknessValues = Dict[tuple[str, str], float]
 # Per-detector masks indexed by detector number.
 DetectorMasks = Dict[int, np.ndarray]
 
+_THICKNESS_MM_PER_M = 1000.0
+_LEGACY_THICKNESS_METERS_MAX = 0.01
+
 
 @dataclass(frozen=True)
 class RunKey:
@@ -591,10 +594,11 @@ class WorkflowContext:
                 "config_id",
                 [config_id for (_, config_id), _ in thickness_rows],
             )
-            sample_thicknesses_sample_group.create_dataset(
+            thickness_values = sample_thicknesses_sample_group.create_dataset(
                 "value",
                 data=np.asarray([float(value) for _, value in thickness_rows], dtype=np.float64),
             )
+            thickness_values.attrs["units"] = np.bytes_("mm")
 
             masks_group = entry.create_group("masks")
             masks_group.attrs["NX_class"] = np.bytes_("NXcollection")
@@ -853,6 +857,11 @@ class WorkflowContext:
                     sample_names = _read_text_array_dataset(sample_group, "sample_name")
                     config_ids = _read_text_array_dataset(sample_group, "config_id")
                     values = _read_float_array_dataset(sample_group, "value")
+                    value_dataset = sample_group.get("value")
+                    value_units = ""
+                    if isinstance(value_dataset, h5py.Dataset):
+                        units = value_dataset.attrs.get("units")
+                        value_units = _read_text_value(units) if units is not None else ""
                     row_count = _require_parallel_lengths(
                         "/entry/sample_thicknesses/sample",
                         sample_name=sample_names,
@@ -860,7 +869,9 @@ class WorkflowContext:
                         value=values,
                     )
                     for row_index in range(row_count):
-                        ctx.sample_thicknesses[(sample_names[row_index], config_ids[row_index])] = float(values[row_index])
+                        ctx.sample_thicknesses[(sample_names[row_index], config_ids[row_index])] = (
+                            _normalize_sample_thickness_to_mm(float(values[row_index]), units=value_units)
+                        )
 
             masks_group = entry.get("masks")
             if isinstance(masks_group, h5py.Group):
@@ -1057,11 +1068,11 @@ class WorkflowContext:
         return self.empty_cell_transmissions.get(config_id)
 
     def set_sample_thickness(self, sample_name: str, config_id: str, value: float) -> None:
-        """Store one sample thickness in meters."""
+        """Store one sample thickness in millimeters."""
         self.sample_thicknesses[(sample_name, config_id)] = float(value)
 
     def get_sample_thickness(self, sample_name: str, config_id: str) -> Optional[float]:
-        """Return one stored sample thickness in meters, or ``None`` when missing."""
+        """Return one stored sample thickness in millimeters, or ``None`` when missing."""
         return self.sample_thicknesses.get((sample_name, config_id))
 
     def set_mask(self, config_id: str, detector_number: int, mask: np.ndarray) -> None:
@@ -1709,6 +1720,32 @@ def _read_float_array_dataset(group: h5py.Group, name: str) -> list[float]:
     return [float(item) for item in raw.tolist()]
 
 
+def _normalize_sample_thickness_to_mm(value: float, *, units: str = "") -> float:
+    """Normalize one sample-thickness value to millimeters."""
+    normalized_units = units.strip().lower()
+    if normalized_units in {"mm", "millimeter", "millimeters", "millimetre", "millimetres"}:
+        return value
+    if normalized_units in {"m", "meter", "meters", "metre", "metres"}:
+        return value * _THICKNESS_MM_PER_M
+    # Legacy workflow files and converted runs stored thickness in meters without units.
+    if 0.0 < abs(value) <= _LEGACY_THICKNESS_METERS_MAX:
+        return value * _THICKNESS_MM_PER_M
+    return value
+
+
+def _read_sample_thickness_dataset_mm(dataset: h5py.Dataset) -> Optional[float]:
+    """Read one sample-thickness dataset and normalize its value to millimeters."""
+    try:
+        value = float(np.asarray(dataset[()]).reshape(()))
+    except Exception:
+        return None
+    if not np.isfinite(value):
+        return None
+    units = dataset.attrs.get("units")
+    units_text = _read_text_value(units) if units is not None else ""
+    return _normalize_sample_thickness_to_mm(value, units=units_text)
+
+
 def _require_parallel_lengths(group_path: str, **columns: list[Any]) -> int:
     """Ensure parallel datasets have the same length and return that length."""
     lengths = {name: len(values) for name, values in columns.items()}
@@ -1942,13 +1979,10 @@ def _read_sample_thickness(path: Path) -> Optional[float]:
     with h5py.File(path, "r") as handle:
         for entry_path in ("/raw_data", "/entry", "/entry0", "/entry1"):
             dataset_path = f"{entry_path}/sample/thickness"
-            if dataset_path not in handle:
+            if dataset_path not in handle or not isinstance(handle[dataset_path], h5py.Dataset):
                 continue
-            try:
-                value = float(np.asarray(handle[dataset_path][()]).reshape(()))
-            except Exception:
-                continue
-            if np.isfinite(value):
+            value = _read_sample_thickness_dataset_mm(handle[dataset_path])
+            if value is not None:
                 return value
     return None
 

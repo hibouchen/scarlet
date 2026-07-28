@@ -27,6 +27,8 @@ class TestSansLlbConverterSchema(unittest.TestCase):
         sample_mask_shape: str = "square",
         sample_mask_size: float = 8.0,
         sample_mask_size_y: float | None = 8.0,
+        sample_thickness: float | None = None,
+        sample_thickness_units: str | None = None,
     ) -> None:
         raw0 = numpy.array([[10.0, 20.0], [30.0, 40.0]], dtype=numpy.float64)
         with h5py.File(input_path, "w") as fin:
@@ -36,6 +38,10 @@ class TestSansLlbConverterSchema(unittest.TestCase):
             sample = entry.create_group("sample")
             sample.attrs["NX_class"] = b"NXsample"
             sample.create_dataset("name", data=numpy.bytes_("sample"))
+            if sample_thickness is not None:
+                thickness = sample.create_dataset("thickness", data=float(sample_thickness))
+                if sample_thickness_units is not None:
+                    thickness.attrs["units"] = numpy.bytes_(sample_thickness_units)
 
             control = entry.create_group("control")
             control.attrs["NX_class"] = b"NXmonitor"
@@ -137,6 +143,23 @@ class TestSansLlbConverterSchema(unittest.TestCase):
             with h5py.File(output_path, "r") as fout:
                 self.assertAlmostEqual(float(fout["/raw_data/instrument/collimation/collimation_distance"][()]), 8.0)
                 self.assertEqual(fout["/raw_data/instrument/collimation/collimation_distance"].attrs["units"], b"m")
+
+    def test_sansllb_converter_writes_sample_thickness_in_mm(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            input_path = Path(td) / "sansllb_sample_thickness.hdf"
+            output_path = Path(td) / "sansllb_sample_thickness_out.h5"
+            self._write_minimal_sansllb_input(
+                input_path,
+                sample_thickness=0.002,
+                sample_thickness_units="m",
+            )
+
+            convert_sansllb_to_scarlet_nxsas_raw(input_path, output_path, overwrite=True)
+
+            with h5py.File(output_path, "r") as fout:
+                thickness = fout["/raw_data/sample/thickness"]
+                self.assertAlmostEqual(float(thickness[()]), 2.0)
+                self.assertEqual(thickness.attrs["units"], b"mm")
 
     def test_sansllb_converter_deadtime_corrects_all_detector_views(self) -> None:
         with tempfile.TemporaryDirectory() as td:

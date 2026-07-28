@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import h5py
 import numpy as np
 
 from scarlet.validation.schema_loader import load_schema
@@ -66,7 +67,7 @@ class TestWorkflowContextPersistence(unittest.TestCase):
             ctx.set_roi("config_1", (100, 140, 95, 135))
             ctx.set_transmission("sample_a", "config_1", 0.91)
             ctx.set_empty_cell_transmission("config_1", 0.95)
-            ctx.set_sample_thickness("sample_a", "config_1", 0.002)
+            ctx.set_sample_thickness("sample_a", "config_1", 2.0)
             ctx.set_mask("config_1", 0, np.zeros((4, 4), dtype=np.uint8))
             ctx.mask_files["config_1"] = mask_bundle_path.resolve()
             ctx.set_flatfield("config_1", flatfield_path)
@@ -87,6 +88,8 @@ class TestWorkflowContextPersistence(unittest.TestCase):
             schema = load_schema("scarlet_workflow_context_v1.0.yaml")
             report = validate_nexus_file(saved_path, schema)
             self.assertTrue(report.ok, "\n".join(report.format_lines()))
+            with h5py.File(saved_path, "r") as handle:
+                self.assertEqual(handle["/entry/sample_thicknesses/sample/value"].attrs["units"], b"mm")
 
             loaded = WorkflowContext.load(saved_path)
 
@@ -101,7 +104,7 @@ class TestWorkflowContextPersistence(unittest.TestCase):
             self.assertEqual(loaded.get_roi("config_1"), (100, 140, 95, 135))
             self.assertEqual(loaded.get_transmission("sample_a", "config_1"), 0.91)
             self.assertEqual(loaded.get_empty_cell_transmission("config_1"), 0.95)
-            self.assertEqual(loaded.get_sample_thickness("sample_a", "config_1"), 0.002)
+            self.assertEqual(loaded.get_sample_thickness("sample_a", "config_1"), 2.0)
             self.assertEqual(loaded.get_mask_file("config_1"), mask_bundle_path.resolve())
             self.assertEqual(loaded.get_flatfield("config_1"), flatfield_path.resolve())
             self.assertEqual(loaded.get_flatfield_source("config_2"), "config_1")
@@ -113,3 +116,37 @@ class TestWorkflowContextPersistence(unittest.TestCase):
             self.assertTrue(any(artifact.kind == "workflow_context" for artifact in loaded.artifacts))
             self.assertTrue(any(log.message == "workflow created" for log in loaded.logs))
             self.assertTrue(any(issue.message == "reference missing" for issue in loaded.issues))
+
+    def test_load_converts_legacy_meter_sample_thicknesses_to_mm(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            raw_dir = root / "raw"
+            out_dir = root / "out"
+            raw_dir.mkdir()
+            out_dir.mkdir()
+
+            sample_path = out_dir / "sample_a.nxs"
+
+            ctx = WorkflowContext(
+                experiment_id="exp-123",
+                instrument_name="sansllb",
+                root_dir=raw_dir,
+                output_dir=out_dir,
+            )
+            ctx.add_run(
+                RunKey(config_id="config_1", entity="sample", mode="scattering", sample_name="sample_a"),
+                sample_path,
+            )
+            ctx.set_sample_thickness("sample_a", "config_1", 2.0)
+
+            workflow_path = root / "workflow_context_legacy_thickness.nxs"
+            saved_path = ctx.save(workflow_path)
+
+            with h5py.File(saved_path, "a") as handle:
+                dataset = handle["/entry/sample_thicknesses/sample/value"]
+                dataset[...] = np.asarray([0.002], dtype=np.float64)
+                dataset.attrs["units"] = np.bytes_("m")
+
+            loaded = WorkflowContext.load(saved_path)
+
+            self.assertEqual(loaded.get_sample_thickness("sample_a", "config_1"), 2.0)

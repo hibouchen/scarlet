@@ -645,6 +645,31 @@ def normalization_step(state: ReductionState) -> ReductionState:
     return state
 
 
+@reduction_step("normalize by thickness")
+def normalize_by_thickness(state: ReductionState) -> ReductionState:
+    thickness = state.workflow.get_sample_thickness(state.sample_name, state.config_id)
+    if thickness is None:
+        state.workflow.warn(
+            "Missing sample thickness; assuming thickness=1.0 mm and skipping thickness normalization",
+            where="normalize_by_thickness",
+            key=f"{state.sample_name}:{state.config_id}",
+            sample_name=state.sample_name,
+            config_id=state.config_id,
+        )
+        return state
+
+    thickness = float(thickness)
+    if not np.isfinite(thickness) or thickness <= 0.0:
+        raise ValueError(
+            f"sample thickness must be > 0 mm for {state.sample_name!r} in {state.config_id!r}, got {thickness!r}"
+        )
+    for detector_number, detector in state.detectors.items():
+        state.detectors[detector_number] = detector / thickness
+    state.notes.append(f"Normalized detector data by sample thickness {thickness:g} mm")
+    return state
+    
+
+
 @reduction_step("azimuthal averaging")
 def azimuthal_averaging_step(state: ReductionState) -> ReductionState:
     configuration = _read_state_configuration(state)
@@ -743,6 +768,7 @@ class ReductionPipeline:
             steps=(
                 as_reduction_step(subtract_references_step),
                 as_reduction_step(normalization_step),
+                as_reduction_step(normalize_by_thickness),
                 as_reduction_step(azimuthal_averaging_step),
                 as_reduction_step(save_processed_detectors_step),
                 as_reduction_step(save_azimuthal_text_step),
@@ -755,6 +781,7 @@ class ReductionPipeline:
             steps=(
                 as_reduction_step(subtract_references_step),
                 as_reduction_step(normalization_step),
+                as_reduction_step(normalize_by_thickness),
                 as_reduction_step(azimuthal_averaging_step),
                 as_reduction_step(save_processed_detectors_step),
                 as_reduction_step(save_azimuthal_text_step),

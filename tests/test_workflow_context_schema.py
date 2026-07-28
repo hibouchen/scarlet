@@ -104,7 +104,11 @@ class TestWorkflowContextSchema(unittest.TestCase):
                 sample_thicknesses_sample = sample_thicknesses.create_group("sample")
                 sample_thicknesses_sample.create_dataset("sample_name", data=np.array([b"sample_a"], dtype="S32"))
                 sample_thicknesses_sample.create_dataset("config_id", data=np.array([b"config_1"], dtype="S32"))
-                sample_thicknesses_sample.create_dataset("value", data=np.array([0.002], dtype=np.float64))
+                sample_thickness_values = sample_thicknesses_sample.create_dataset(
+                    "value",
+                    data=np.array([2.0], dtype=np.float64),
+                )
+                sample_thickness_values.attrs["units"] = b"mm"
 
                 masks = entry.create_group("masks")
                 mask_cfg = masks.create_group("config_1")

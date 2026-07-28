@@ -87,7 +87,7 @@ Ce format **ne contient pas** :
 SCARLET impose l’existence de `NXsample`, mais **ne force pas** un ensemble minimal de champs (les instruments varient beaucoup).  
 Recommandé :
 - `name`
-- `thickness` (m)
+- `thickness` (mm)
 - `transmission` (sans unité, 0–1) si déjà mesurée/connue (sinon calculée dans le workflow)
 
 ---
@@ -278,4 +278,3 @@ Pour être validé au minimum :
 - Les étapes de workflow peuvent ensuite dériver automatiquement :
   - `aperture1`, `aperture2`
   - `collimation_distance` (et éventuellement l’écrire si on veut un “snapshot”).
-

@@ -55,7 +55,7 @@ All positions use `NXtransformations`.
 ```
 /entry/sample (NXsample)
     name
-    thickness [m]                (recommended)
+    thickness [mm]               (recommended)
     transmission [1]             (optional)
 ```
 

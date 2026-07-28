@@ -17,7 +17,7 @@ from ._hdf import (
     safe_get_dataset as _safe_get_dataset,
     write_dataset as _write_dataset,
 )
-from ._units import MM_TO_M, length_dataset_to_m as _length_dataset_to_m, mm_or_m_to_m as _mm_or_m_to_m
+from ._units import length_dataset_to_m as _length_dataset_to_m, length_dataset_to_mm as _length_dataset_to_mm
 
 
 NM_TO_ANGSTROM = 10.0
@@ -653,11 +653,17 @@ def convert_sansllb_to_scarlet_nxsas_raw(
             # /entry/sample
             sample_out = _ensure_group(entry_out, "sample", "NXsample")
             if sample_in in fin:
-                # copy a few common fields
-                for key in ("name", "thickness", "transmission"):
-                    p = f"{sample_in}/{key}"
-                    if p in fin:
-                        _write_dataset(sample_out, key, fin[p][()])
+                sample_name_path = f"{sample_in}/name"
+                if sample_name_path in fin:
+                    _write_dataset(sample_out, "name", fin[sample_name_path][()])
+
+                sample_thickness_mm = _length_dataset_to_mm(_safe_get_dataset(fin, f"{sample_in}/thickness"))
+                if sample_thickness_mm is not None:
+                    _write_dataset(sample_out, "thickness", sample_thickness_mm, units="mm")
+
+                sample_transmission_path = f"{sample_in}/transmission"
+                if sample_transmission_path in fin:
+                    _write_dataset(sample_out, "transmission", fin[sample_transmission_path][()])
             else:
                 warnings.append("Missing NXsample group in input; creating empty /entry/sample.")
                 _write_dataset(sample_out, "name", "unknown", as_string=True)

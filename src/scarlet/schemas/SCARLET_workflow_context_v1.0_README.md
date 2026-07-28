@@ -186,7 +186,7 @@ This group stores the two transmission caches of the current workflow object.
 `/entry/sample_thicknesses/sample` stores the sample-thickness table with required parallel datasets:
 - `sample_name`
 - `config_id`
-- `value`
+- `value` (`mm`)
 
 ---
 

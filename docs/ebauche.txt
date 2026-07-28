@@ -40,7 +40,7 @@
 
   /sample (NXsample)
     name
-    thickness [m]                             (recommandé)
+    thickness [mm]                            (recommandé)
     transmission [1]                          (optionnel brut)
     (environment logs optionnels)
 

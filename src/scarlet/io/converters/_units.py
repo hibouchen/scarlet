@@ -8,10 +8,15 @@ from ._hdf import as_float_scalar, as_str
 
 
 MM_TO_M = 1e-3
+M_TO_MM = 1e3
 
 
 def mm_to_m(value) -> float:
     return as_float_scalar(value) * MM_TO_M
+
+
+def m_to_mm(value) -> float:
+    return as_float_scalar(value) * M_TO_MM
 
 
 def mm_or_m_to_m(value) -> float:
@@ -34,3 +39,16 @@ def length_dataset_to_m(ds: Optional[h5py.Dataset]) -> Optional[float]:
     if units_s in {"m", "meter", "meters", "metre", "metres"}:
         return as_float_scalar(value)
     return mm_or_m_to_m(value)
+
+
+def length_dataset_to_mm(ds: Optional[h5py.Dataset]) -> Optional[float]:
+    if ds is None:
+        return None
+    units = ds.attrs.get("units")
+    units_s = as_str(units).strip().lower() if units is not None else ""
+    value = ds[()]
+    if units_s in {"mm", "millimeter", "millimeters", "millimetre", "millimetres"}:
+        return as_float_scalar(value)
+    if units_s in {"m", "meter", "meters", "metre", "metres"}:
+        return m_to_mm(value)
+    return as_float_scalar(value)

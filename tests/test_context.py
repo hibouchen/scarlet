@@ -37,7 +37,7 @@ def _write_transmission_file(
         detector.create_dataset("beam_center_y", data=1.5)
 
 
-def _write_sample_thickness(path: Path, thickness_m: float) -> None:
+def _write_sample_thickness(path: Path, thickness_mm: float, *, units: str | None = "mm") -> None:
     with h5py.File(path, "a") as f:
         for entry_name in ("entry", "raw_data", "entry0", "entry1"):
             if entry_name not in f:
@@ -47,7 +47,9 @@ def _write_sample_thickness(path: Path, thickness_m: float) -> None:
                 continue
             if "thickness" in sample:
                 del sample["thickness"]
-            sample.create_dataset("thickness", data=float(thickness_m))
+            dataset = sample.create_dataset("thickness", data=float(thickness_mm))
+            if units is not None:
+                dataset.attrs["units"] = np.bytes_(units)
             return
     raise ValueError(f"Missing sample group in {path}")
 
@@ -221,7 +223,7 @@ class TestWorkflowContext(unittest.TestCase):
                 rows = list(csv.DictReader(handle))
             rows[0]["sample_name"] = "sample_b"
             rows[0]["config_id"] = "config_2"
-            rows[0]["thickness"] = "0.0015"
+            rows[0]["thickness"] = "1.5"
             rows[0]["transmission"] = "0.5"
             with csv_path.open("w", encoding="utf-8", newline="") as handle:
                 writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
@@ -242,7 +244,7 @@ class TestWorkflowContext(unittest.TestCase):
                 sample_path.resolve(),
             )
             self.assertEqual(ctx.transmissions, {("sample_b", "config_2"): 0.5})
-            self.assertEqual(ctx.sample_thicknesses, {("sample_b", "config_2"): 0.0015})
+            self.assertEqual(ctx.sample_thicknesses, {("sample_b", "config_2"): 1.5})
             self.assertIn("config_2", ctx.configurations)
             self.assertEqual(ctx.get("runs_table_csv"), csv_path.resolve())
 
@@ -257,11 +259,11 @@ class TestWorkflowContext(unittest.TestCase):
                 RunKey(config_id="config_1", entity="sample", mode="scattering", sample_name="sample_a"),
                 sample_path,
             )
-            ctx.set_sample_thickness("sample_a", "config_1", 0.002)
+            ctx.set_sample_thickness("sample_a", "config_1", 2.0)
 
             table = ctx.runs_table()
 
-            self.assertEqual(table.rows[0]["thickness"], "0.002")
+            self.assertEqual(table.rows[0]["thickness"], "2")
 
     def test_compute_transmissions_includes_empty_cell_transmission_runs(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -329,7 +331,7 @@ class TestWorkflowContext(unittest.TestCase):
 
             raw_path = raw_dir / "water_raw.h5"
             _write_minimal_raw_nexus_file(raw_path, sample_name="water", count_time_s=10.0)
-            _write_sample_thickness(raw_path, 0.001)
+            _write_sample_thickness(raw_path, 1.0)
 
             configuration = Configuration(
                 wavelength=6.0,
@@ -373,4 +375,53 @@ class TestWorkflowContext(unittest.TestCase):
             )
             self.assertEqual(ctx.get_water("config_1", "scattering"), (output_dir / "water_raw.nxs").resolve())
             self.assertEqual(ctx.get_reference_file("water", "scattering", "config_1"), (output_dir / "water_raw.nxs").resolve())
-            self.assertAlmostEqual(ctx.get_sample_thickness("water", "config_1"), 0.001)
+            self.assertAlmostEqual(ctx.get_sample_thickness("water", "config_1"), 1.0)
+
+    def test_initialize_workflow_context_converts_meter_sample_thickness_to_mm(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            raw_dir = root / "raw"
+            output_dir = root / "out"
+            raw_dir.mkdir()
+
+            raw_path = raw_dir / "sample_raw.h5"
+            _write_minimal_raw_nexus_file(raw_path, sample_name="sample_a", count_time_s=10.0)
+            _write_sample_thickness(raw_path, 0.002, units="m")
+
+            configuration = Configuration(
+                wavelength=6.0,
+                sample_detector_distance=4.2,
+                config_id="cfg",
+                collimation=Collimation(
+                    aperture1=Aperture(type="slit", x_gap=0.002, y_gap=0.003),
+                    aperture2=Aperture(type="pinhole", diameter=0.004),
+                    collimation_distance=1.5,
+                    last_aperture_to_sample_distance=0.5,
+                ),
+            )
+
+            def fake_convert(_instrument_name, input_path, output_path, overwrite=False):
+                del overwrite
+                output_path = Path(output_path)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_bytes(Path(input_path).read_bytes())
+                return SimpleNamespace(output_file=output_path)
+
+            with (
+                mock.patch("scarlet.io.converters.convert_to_scarlet_nxsas_raw", side_effect=fake_convert),
+                mock.patch(
+                    "scarlet.io.mode_inference.guess_measurement_mode_from_nexus_image",
+                    return_value=SimpleNamespace(mode="scattering"),
+                ),
+                mock.patch(
+                    "scarlet.workflow.configuration.configuration_from_nexus",
+                    return_value=(configuration, []),
+                ),
+            ):
+                ctx = initialize_workflow_context_from_raw_directory(
+                    raw_dir,
+                    output_dir=output_dir,
+                    instrument_name="sansllb",
+                )
+
+            self.assertAlmostEqual(ctx.get_sample_thickness("sample_a", "config_1"), 2.0)
