@@ -74,11 +74,13 @@ def _compute_or_get_transmission(
         if cached is not None:
             return float(cached)
 
-    empty_beam_path = workflow.get_empty_beam(config_id, "transmission")
+    transmission_source_mode = workflow.get_transmission_source_mode()
+    empty_beam_path = workflow.get_empty_beam(config_id, transmission_source_mode)
     roi = workflow.get_roi(config_id)
     if empty_beam_path is None or roi is None:
         raise ValueError(
-            "Cannot compute transmission without empty-beam transmission and ROI "
+            "Cannot compute transmission without empty-beam "
+            f"{transmission_source_mode} and ROI "
             f"for configuration {config_id!r}"
         )
 
@@ -418,17 +420,21 @@ def build_water_flatfield_from_workflow_context(
         else None
     )
 
-    water_transmission_path = workflow.get_water(source_config_id, "transmission")
-    if water_transmission_path is None:
-        selected = _select_reference_run(
-            workflow,
-            config_id=source_config_id,
-            entity="water",
-            mode="transmission",
-        )
-        water_transmission_path = None if selected is None else selected[1]
-    if water_transmission_path is None:
-        raise ValueError(f"Missing water transmission reference for configuration {source_config_id!r}")
+    transmission_source_mode = workflow.get_transmission_source_mode()
+    if transmission_source_mode == "scattering":
+        water_transmission_path = water_scattering_path
+    else:
+        water_transmission_path = workflow.get_water(source_config_id, "transmission")
+        if water_transmission_path is None:
+            selected = _select_reference_run(
+                workflow,
+                config_id=source_config_id,
+                entity="water",
+                mode="transmission",
+            )
+            water_transmission_path = None if selected is None else selected[1]
+        if water_transmission_path is None:
+            raise ValueError(f"Missing water transmission reference for configuration {source_config_id!r}")
 
     water_transmission = _compute_or_get_transmission(
         workflow,
@@ -447,7 +453,7 @@ def build_water_flatfield_from_workflow_context(
                 workflow,
                 config_id=source_config_id,
                 entity="empty_cell",
-                mode="transmission",
+                mode=transmission_source_mode,
             )
             empty_cell_transmission = _compute_or_get_transmission(
                 workflow,

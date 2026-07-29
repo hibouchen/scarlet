@@ -23,6 +23,8 @@ from scarlet.reduction.transmission import (
 Level = Literal["INFO", "WARN", "ERROR"]
 # Run acquisition modes.
 Mode = Literal["scattering", "transmission"]
+# Workflow-level transmission computation strategy.
+TransmissionStrategy = Literal["opaque_beamstop", "semi_transparent_beamstop"]
 # Logical run categories handled by the workflow.
 Entity = Literal["sample", "empty_beam", "empty_cell", "dark", "water"]
 # One detector center is stored as (x, y).
@@ -44,6 +46,24 @@ DetectorMasks = Dict[int, np.ndarray]
 
 _THICKNESS_MM_PER_M = 1000.0
 _LEGACY_THICKNESS_METERS_MAX = 0.01
+_TRANSMISSION_STRATEGY_STORE_KEY = "transmission_strategy"
+_TRANSMISSION_STRATEGY_ALIASES: dict[str, TransmissionStrategy] = {
+    "opaque": "opaque_beamstop",
+    "opaque_beamstop": "opaque_beamstop",
+    "semi_transparent": "semi_transparent_beamstop",
+    "semi_transparent_beamstop": "semi_transparent_beamstop",
+}
+
+
+def _normalize_transmission_strategy(value: TransmissionStrategy | str) -> TransmissionStrategy:
+    normalized = str(value).strip().lower()
+    strategy = _TRANSMISSION_STRATEGY_ALIASES.get(normalized)
+    if strategy is None:
+        expected = ", ".join(sorted(_TRANSMISSION_STRATEGY_ALIASES))
+        raise ValueError(
+            f"Invalid transmission strategy {value!r}; expected one of {expected}"
+        )
+    return strategy
 
 
 @dataclass(frozen=True)
@@ -1014,6 +1034,22 @@ class WorkflowContext:
         """Return the transmission ROI for a configuration, or ``None`` when missing."""
         return self.rois.get(config_id)
 
+    def set_transmission_strategy(self, strategy: TransmissionStrategy | str) -> None:
+        """Select how transmissions are computed across the workflow."""
+        self.store[_TRANSMISSION_STRATEGY_STORE_KEY] = _normalize_transmission_strategy(strategy)
+
+    def get_transmission_strategy(self) -> TransmissionStrategy:
+        """Return the workflow-level transmission computation strategy."""
+        raw_strategy = self.store.get(_TRANSMISSION_STRATEGY_STORE_KEY, "opaque_beamstop")
+        return _normalize_transmission_strategy(raw_strategy)
+
+    def get_transmission_source_mode(self) -> Mode:
+        """Return which acquisition mode must be used to compute transmissions."""
+        strategy = self.get_transmission_strategy()
+        if strategy == "semi_transparent_beamstop":
+            return "scattering"
+        return "transmission"
+
     def set_dark(self, config_id: str, file_path: Path) -> None:
         """Store the scattering dark file for a configuration."""
         self.dark[config_id] = self._resolve_path(file_path)
@@ -1343,11 +1379,12 @@ class WorkflowContext:
 
     def compute_transmissions(self, *, detector_number: int = 0) -> TransmissionValues:
         """Compute transmissions for sample and empty-cell transmission runs."""
+        source_mode = self.get_transmission_source_mode()
         for entity in ("sample", "empty_cell"):
-            for key, path in self.iter_runs(entity=cast(Entity, entity), mode="transmission"):
+            for key, path in self.iter_runs(entity=cast(Entity, entity), mode=source_mode):
                 if key.sample_name is None:
                     continue
-                empty_beam_path = self.get_empty_beam(key.config_id, "transmission")
+                empty_beam_path = self.get_empty_beam(key.config_id, source_mode)
                 roi = self.get_roi(key.config_id)
                 if empty_beam_path is None or roi is None:
                     self.warn(
@@ -1356,6 +1393,7 @@ class WorkflowContext:
                         key=key.short(),
                         missing_empty_beam=empty_beam_path is None,
                         missing_roi=roi is None,
+                        transmission_source_mode=source_mode,
                     )
                     continue
                 value = compute_transmission(
@@ -2229,19 +2267,22 @@ def _ingest_raw_directory_into_workflow_context(
         sample_name = _read_sample_name(converted_path)
         entity = _classify_entity_from_sample_name(sample_name)
         sample_thickness = _read_sample_thickness(converted_path)
-        mode_guess = guess_measurement_mode_from_nexus_image(converted_path)
-        if mode_guess.mode == "transmission":
-            mode: Mode = "transmission"
-        elif mode_guess.mode == "scattering":
+        if ctx.get_transmission_strategy() == "semi_transparent_beamstop" and entity != "empty_beam":
             mode = "scattering"
         else:
-            mode = "transmission" if entity == "empty_beam" else "scattering"
-            ctx.warn(
-                "Could not confidently infer measurement mode; using heuristic fallback",
-                where=where,
-                key=str(converted_path),
-                guessed_mode=mode,
-            )
+            mode_guess = guess_measurement_mode_from_nexus_image(converted_path)
+            if mode_guess.mode == "transmission":
+                mode = "transmission"
+            elif mode_guess.mode == "scattering":
+                mode = "scattering"
+            else:
+                mode = "transmission" if entity == "empty_beam" else "scattering"
+                ctx.warn(
+                    "Could not confidently infer measurement mode; using heuristic fallback",
+                    where=where,
+                    key=str(converted_path),
+                    guessed_mode=mode,
+                )
 
         run_key = RunKey(
             config_id=config_id,
@@ -2268,28 +2309,51 @@ def _ingest_raw_directory_into_workflow_context(
 
 
 def _initialize_transmission_geometry(ctx: WorkflowContext, *, where: str) -> None:
-    """Initialize ROI and detector0 beam center from empty-beam transmission files."""
+    """Initialize ROI and detector beam centers from the workflow empty-beam files."""
+    transmission_source_mode = ctx.get_transmission_source_mode()
     for config_id, files_by_mode in sorted(ctx.empty_beam.items()):
-        empty_beam_transmission = files_by_mode.get("transmission")
-        if empty_beam_transmission is None:
+        roi_source = files_by_mode.get(transmission_source_mode)
+        if roi_source is None:
             ctx.warn(
-                "Missing empty_beam transmission file; cannot initialize ROI or beam center",
+                f"Missing empty_beam {transmission_source_mode} file; cannot initialize ROI",
                 where=where,
                 key=config_id,
+                transmission_source_mode=transmission_source_mode,
+            )
+        else:
+            try:
+                ctx.set_roi(config_id, compute_transmission_roi(roi_source, detector_number=0))
+            except Exception as exc:
+                ctx.warn(
+                    "Failed to initialize transmission ROI",
+                    where=where,
+                    key=config_id,
+                    error=str(exc),
+                    roi_source=str(roi_source),
+                    transmission_source_mode=transmission_source_mode,
+                )
+
+        center_source = files_by_mode.get("transmission")
+        if center_source is None:
+            ctx.warn(
+                "Missing empty_beam transmission file; cannot initialize beam center",
+                where=where,
+                key=config_id,
+                transmission_source_mode=transmission_source_mode,
             )
             continue
         try:
-            ctx.set_roi(config_id, compute_transmission_roi(empty_beam_transmission, detector_number=0))
-            for detector_number, center in _read_beam_centers_from_file(empty_beam_transmission).items():
+            for detector_number, center in _read_beam_centers_from_file(center_source).items():
                 ctx.set_beam_center(config_id, detector_number, center)
-            ctx.set_beam_center(config_id, 0, compute_beam_center(empty_beam_transmission, detector_number=0))
+            ctx.set_beam_center(config_id, 0, compute_beam_center(center_source, detector_number=0))
         except Exception as exc:
             ctx.warn(
-                "Failed to initialize transmission ROI or detector0 beam center",
+                "Failed to initialize detector0 beam center from empty_beam transmission",
                 where=where,
                 key=config_id,
                 error=str(exc),
-                empty_beam_transmission=str(empty_beam_transmission),
+                center_source=str(center_source),
+                transmission_source_mode=transmission_source_mode,
             )
 
 
@@ -2299,6 +2363,7 @@ def initialize_workflow_context_from_raw_directory(
     output_dir: str | Path | None = None,
     experiment_id: str = "experiment",
     instrument_name: str | None = None,
+    transmission_strategy: TransmissionStrategy | str = "opaque_beamstop",
     overwrite: bool = False,
 ) -> WorkflowContext:
     """Create a fresh workflow context by scanning and converting a raw-data directory."""
@@ -2314,6 +2379,7 @@ def initialize_workflow_context_from_raw_directory(
         root_dir=input_dir,
         output_dir=output_dir,
     )
+    ctx.set_transmission_strategy(transmission_strategy)
     ctx.set("converted_data_dir", output_dir)
     return _ingest_raw_directory_into_workflow_context(
         ctx,

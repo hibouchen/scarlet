@@ -11,7 +11,12 @@ import h5py
 import numpy as np
 
 from scarlet.workflow.configuration import Aperture, Collimation, Configuration
-from scarlet.workflow.context import RunKey, WorkflowContext, initialize_workflow_context_from_raw_directory
+from scarlet.workflow.context import (
+    RunKey,
+    WorkflowContext,
+    _initialize_transmission_geometry,
+    initialize_workflow_context_from_raw_directory,
+)
 
 from test_workflow_configuration import _write_minimal_raw_nexus_file
 
@@ -71,6 +76,16 @@ class TestWorkflowContext(unittest.TestCase):
         self.assertIsNone(ctx.get_empty_cell_transmission("config_1"))
         self.assertIsNone(ctx.get_sample_thickness("sample_a", "config_1"))
         self.assertIsNone(ctx.get_reference_file("water", "scattering", "config_1"))
+        self.assertEqual(ctx.get_transmission_strategy(), "opaque_beamstop")
+        self.assertEqual(ctx.get_transmission_source_mode(), "transmission")
+
+    def test_transmission_strategy_can_switch_to_semi_transparent_beamstop(self) -> None:
+        ctx = WorkflowContext()
+
+        ctx.set_transmission_strategy("semi_transparent")
+
+        self.assertEqual(ctx.get_transmission_strategy(), "semi_transparent_beamstop")
+        self.assertEqual(ctx.get_transmission_source_mode(), "scattering")
 
     def test_add_run_preserves_duplicate_logical_keys(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -322,6 +337,73 @@ class TestWorkflowContext(unittest.TestCase):
             self.assertIsNone(ctx.get_transmission("sample_a", "config_1"))
             self.assertTrue(any(issue.where == "compute_transmissions" for issue in ctx.issues))
 
+    def test_compute_transmissions_can_use_scattering_runs_with_semi_transparent_beamstop(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            empty_beam_path = root / "empty_beam_scattering.nxs"
+            sample_path = root / "sample_scattering.nxs"
+            empty_cell_path = root / "empty_cell_scattering.nxs"
+
+            empty_beam_data = np.zeros((4, 4), dtype=np.float64)
+            empty_beam_data[1:3, 1:3] = 100.0
+            sample_data = np.zeros((4, 4), dtype=np.float64)
+            sample_data[1:3, 1:3] = 40.0
+            empty_cell_data = np.zeros((4, 4), dtype=np.float64)
+            empty_cell_data[1:3, 1:3] = 50.0
+
+            _write_transmission_file(empty_beam_path, data=empty_beam_data, monitor_integral=10.0)
+            _write_transmission_file(sample_path, data=sample_data, monitor_integral=20.0)
+            _write_transmission_file(empty_cell_path, data=empty_cell_data, monitor_integral=10.0)
+
+            ctx = WorkflowContext(output_dir=root / "out")
+            ctx.set_transmission_strategy("semi_transparent_beamstop")
+            ctx.set_empty_beam("config_1", "scattering", empty_beam_path)
+            ctx.set_roi("config_1", (1, 3, 1, 3))
+            ctx.add_run(
+                RunKey(config_id="config_1", entity="sample", mode="scattering", sample_name="sample_a"),
+                sample_path,
+            )
+            ctx.add_run(
+                RunKey(config_id="config_1", entity="empty_cell", mode="scattering", sample_name="empty_cell"),
+                empty_cell_path,
+            )
+
+            transmissions = ctx.compute_transmissions()
+
+            self.assertEqual(transmissions, {("sample_a", "config_1"): 0.2, ("empty_cell", "config_1"): 0.5})
+            self.assertAlmostEqual(ctx.get_transmission("sample_a", "config_1"), 0.2)
+            self.assertAlmostEqual(ctx.get_empty_cell_transmission("config_1"), 0.5)
+
+    def test_initialize_transmission_geometry_uses_scattering_roi_and_transmission_center_for_semi_transparent_beamstop(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            empty_beam_scattering = root / "empty_beam_scattering.nxs"
+            empty_beam_transmission = root / "empty_beam_transmission.nxs"
+
+            scattering_data = np.zeros((4, 4), dtype=np.float64)
+            scattering_data[1:3, 1:3] = 100.0
+            transmission_data = np.zeros((4, 4), dtype=np.float64)
+            transmission_data[0, 3] = 200.0
+
+            _write_transmission_file(empty_beam_scattering, data=scattering_data, monitor_integral=1.0)
+            _write_transmission_file(empty_beam_transmission, data=transmission_data, monitor_integral=1.0)
+
+            ctx = WorkflowContext(output_dir=root / "out")
+            ctx.set_transmission_strategy("semi_transparent_beamstop")
+            ctx.add_run(
+                RunKey(config_id="config_1", entity="empty_beam", mode="scattering", sample_name="EB"),
+                empty_beam_scattering,
+            )
+            ctx.add_run(
+                RunKey(config_id="config_1", entity="empty_beam", mode="transmission", sample_name="EB"),
+                empty_beam_transmission,
+            )
+
+            _initialize_transmission_geometry(ctx, where="test")
+
+            self.assertEqual(ctx.get_roi("config_1"), (0, 4, 0, 4))
+            self.assertEqual(ctx.get_beam_center("config_1", 0), (3.0, 0.0))
+
     def test_initialize_workflow_context_detects_water_entity(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -425,3 +507,109 @@ class TestWorkflowContext(unittest.TestCase):
                 )
 
             self.assertAlmostEqual(ctx.get_sample_thickness("sample_a", "config_1"), 2.0)
+
+    def test_initialize_workflow_context_forces_scattering_mode_with_semi_transparent_beamstop(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            raw_dir = root / "raw"
+            output_dir = root / "out"
+            raw_dir.mkdir()
+
+            raw_path = raw_dir / "sample_raw.h5"
+            _write_minimal_raw_nexus_file(raw_path, sample_name="sample_a", count_time_s=10.0)
+
+            configuration = Configuration(
+                wavelength=6.0,
+                sample_detector_distance=4.2,
+                config_id="cfg",
+                collimation=Collimation(
+                    aperture1=Aperture(type="slit", x_gap=0.002, y_gap=0.003),
+                    aperture2=Aperture(type="pinhole", diameter=0.004),
+                    collimation_distance=1.5,
+                    last_aperture_to_sample_distance=0.5,
+                ),
+            )
+
+            def fake_convert(_instrument_name, input_path, output_path, overwrite=False):
+                del overwrite
+                output_path = Path(output_path)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_bytes(Path(input_path).read_bytes())
+                return SimpleNamespace(output_file=output_path)
+
+            with (
+                mock.patch("scarlet.io.converters.convert_to_scarlet_nxsas_raw", side_effect=fake_convert),
+                mock.patch(
+                    "scarlet.io.mode_inference.guess_measurement_mode_from_nexus_image",
+                    return_value=SimpleNamespace(mode="transmission"),
+                ) as mode_guess_mock,
+                mock.patch(
+                    "scarlet.workflow.configuration.configuration_from_nexus",
+                    return_value=(configuration, []),
+                ),
+            ):
+                ctx = initialize_workflow_context_from_raw_directory(
+                    raw_dir,
+                    output_dir=output_dir,
+                    instrument_name="sansllb",
+                    transmission_strategy="semi_transparent_beamstop",
+                )
+
+            self.assertIn(
+                RunKey(config_id="config_1", entity="sample", mode="scattering", sample_name="sample_a"),
+                ctx.runs,
+            )
+            mode_guess_mock.assert_not_called()
+
+    def test_initialize_workflow_context_keeps_empty_beam_transmission_in_semi_transparent_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            raw_dir = root / "raw"
+            output_dir = root / "out"
+            raw_dir.mkdir()
+
+            raw_path = raw_dir / "empty_beam_raw.h5"
+            _write_minimal_raw_nexus_file(raw_path, sample_name="EB", count_time_s=10.0)
+
+            configuration = Configuration(
+                wavelength=6.0,
+                sample_detector_distance=4.2,
+                config_id="cfg",
+                collimation=Collimation(
+                    aperture1=Aperture(type="slit", x_gap=0.002, y_gap=0.003),
+                    aperture2=Aperture(type="pinhole", diameter=0.004),
+                    collimation_distance=1.5,
+                    last_aperture_to_sample_distance=0.5,
+                ),
+            )
+
+            def fake_convert(_instrument_name, input_path, output_path, overwrite=False):
+                del overwrite
+                output_path = Path(output_path)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_bytes(Path(input_path).read_bytes())
+                return SimpleNamespace(output_file=output_path)
+
+            with (
+                mock.patch("scarlet.io.converters.convert_to_scarlet_nxsas_raw", side_effect=fake_convert),
+                mock.patch(
+                    "scarlet.io.mode_inference.guess_measurement_mode_from_nexus_image",
+                    return_value=SimpleNamespace(mode="transmission"),
+                ) as mode_guess_mock,
+                mock.patch(
+                    "scarlet.workflow.configuration.configuration_from_nexus",
+                    return_value=(configuration, []),
+                ),
+            ):
+                ctx = initialize_workflow_context_from_raw_directory(
+                    raw_dir,
+                    output_dir=output_dir,
+                    instrument_name="sansllb",
+                    transmission_strategy="semi_transparent_beamstop",
+                )
+
+            self.assertIn(
+                RunKey(config_id="config_1", entity="empty_beam", mode="transmission", sample_name="EB"),
+                ctx.runs,
+            )
+            mode_guess_mock.assert_called_once()

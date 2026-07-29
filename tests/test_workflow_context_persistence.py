@@ -63,6 +63,7 @@ class TestWorkflowContextPersistence(unittest.TestCase):
                 RunKey(config_id="config_1", entity="empty_beam", mode="transmission", sample_name="EmptyBeam"),
                 empty_beam_path,
             )
+            ctx.set_transmission_strategy("semi_transparent_beamstop")
             ctx.set_beam_center("config_1", 0, (63.5, 64.5))
             ctx.set_roi("config_1", (100, 140, 95, 135))
             ctx.set_transmission("sample_a", "config_1", 0.91)
@@ -99,6 +100,7 @@ class TestWorkflowContextPersistence(unittest.TestCase):
             self.assertEqual(loaded.output_dir, out_dir.resolve())
             self.assertEqual(len(loaded.runs), 4)
             self.assertEqual(sorted(key.duplicate_index for key in loaded.runs if key.entity == "dark"), [0, 1])
+            self.assertEqual(loaded.get_transmission_strategy(), "semi_transparent_beamstop")
             self.assertEqual(loaded.get_empty_beam("config_1", "transmission"), empty_beam_path.resolve())
             self.assertEqual(loaded.get_beam_center("config_1", 0), (63.5, 64.5))
             self.assertEqual(loaded.get_roi("config_1"), (100, 140, 95, 135))
