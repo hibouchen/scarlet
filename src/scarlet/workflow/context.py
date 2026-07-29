@@ -1380,7 +1380,7 @@ class WorkflowContext:
     def compute_transmissions(self, *, detector_number: int = 0) -> TransmissionValues:
         """Compute transmissions for sample and empty-cell transmission runs."""
         source_mode = self.get_transmission_source_mode()
-        for entity in ("sample", "empty_cell"):
+        for entity in ("sample", "empty_cell", "water"):
             for key, path in self.iter_runs(entity=cast(Entity, entity), mode=source_mode):
                 if key.sample_name is None:
                     continue
