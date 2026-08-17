@@ -47,6 +47,55 @@ The repository contains ad requirements.txt file allowing to install all the req
 pip install -r requirements.txt
 ```
 
+### Windows installation
+
+For a portable Windows setup, the repository ships three `.cmd` files at the project root:
+
+- `install_windows.cmd`: creates a local virtual environment and installs SCARLET;
+- `run_scarlet.cmd`: opens JupyterLab and the tutorial workflow;
+- `run_scarlet_viewer.cmd`: launches the SCARLET viewer.
+
+These scripts use the folder where they are located, so they do not depend on absolute paths and can be used on another PC after copying or cloning the project.
+
+Recommended usage on Windows:
+
+```bat
+git clone https://github.com/hibouchen/scarlet.git
+cd scarlet
+install_windows.cmd
+```
+
+Then:
+
+```bat
+run_scarlet.cmd
+run_scarlet_viewer.cmd
+```
+
+### Windows desktop shortcuts
+
+After running `install_windows.cmd`, shortcuts can be created for the two launchers.
+
+For the tutorial and JupyterLab:
+
+1. In Windows Explorer, go to the SCARLET project folder.
+2. Right-click `run_scarlet.cmd`.
+3. Select `Show more options` if needed, then `Send to` -> `Desktop (create shortcut)`.
+4. Rename the shortcut on the Desktop, for example to `SCARLET Notebook`.
+
+For the SCARLET viewer:
+
+1. In the same folder, right-click `run_scarlet_viewer.cmd`.
+2. Select `Show more options` if needed, then `Send to` -> `Desktop (create shortcut)`.
+3. Rename the shortcut on the Desktop, for example to `SCARLET Viewer`.
+
+If desired, the shortcut icon can also be customized from:
+
+- right-click the shortcut;
+- select `Properties`;
+- click `Change Icon...`;
+- choose an `.ico` file such as `logo_scarlet.ico` from the project folder.
+
 ## Installation for development
 
 From the project root:
@@ -70,14 +119,6 @@ PYTHONPATH=src pytest -q
 
 ### GUI note
 
-The mask editor currently uses `tkinter`.
-
-- `tkinter` is not a pip dependency managed through `pyproject.toml`
-- it is usually provided by the Python installation or by a system package
-- on some Linux distributions you may need to install `python3-tk`
-
-For the most portable setup, the core package, CLI, and notebooks should be considered the primary interfaces; the `tkinter` GUI remains optional.
-
 `jupyterlab`, `silx`, and `PySide6` are installed with the base package and are no longer optional extras.
 
 ---
@@ -93,6 +134,17 @@ SCARLET uses a sample-centred coordinate system:
 - distances in metres unless stated otherwise.
 
 Instrument components are described with NeXus groups and, where possible, `NXtransformations`.
+
+## Local data convention
+
+There is no mandatory data folder layout, but the examples use:
+
+```text
+data/<instrument>/raw/        # original instrument files
+data/<instrument>/processed/  # converted SCARLET files and generated outputs
+```
+
+The `data/` directory is ignored by git so that raw and processed experimental files are not committed accidentally.
 
 ---
 
@@ -338,18 +390,7 @@ Implemented operations currently cover conversion, validation, workflow bookkeep
 
 ---
 
-## Local data convention
 
-There is no mandatory data folder layout, but the examples use:
-
-```text
-data/<instrument>/raw/        # original instrument files
-data/<instrument>/processed/  # converted SCARLET files and generated outputs
-```
-
-The `data/` directory is ignored by git so that raw and processed experimental files are not committed accidentally.
-
----
 
 ## Roadmap
 
@@ -357,13 +398,9 @@ Near-term priorities:
 
 1. stabilize the higher-level workflow around references, flatfields, and reduced outputs;
 2. align the public CLI and Python API with the currently implemented reduction pieces;
-3. add formal uncertainty propagation to the correction chain;
-4. add multi-distance stitching and Q-resolution handling.
 
 Longer-term goals:
 
-- multi-distance stitching;
-- Q-resolution handling;
 - TOF-aware workflows;
 - AI-assisted masking and quality checks;
 - instrument-agnostic validated release.

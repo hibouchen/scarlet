@@ -642,7 +642,7 @@ def main(argv: list[str] | None = None) -> int:
     except ModuleNotFoundError as e:
         missing = getattr(e, "name", None) or str(e)
         print(
-            f"Missing dependency: {missing}. Install viewer dependencies: `pip install -e .[viewer]`.",
+            f"Missing dependency: {missing}. Install project dependencies: `pip install -e .`.",
             file=sys.stderr,
         )
         return 2

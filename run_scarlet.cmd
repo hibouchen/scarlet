@@ -1,27 +1,21 @@
 @echo off
 setlocal
 
-rem ==================================================
-rem Configuration
-rem ==================================================
-
-set "SCARLET_DIR=C:\Users\gac-sansllb\Document\SCARLET"
+for %%I in ("%~dp0.") do set "SCARLET_DIR=%%~fI"
 set "VENV_DIR=%SCARLET_DIR%\scarlet_venv"
+set "PYTHON_EXE=%VENV_DIR%\Scripts\python.exe"
 
-set "TEMPLATE_NOTEBOOK=%SCARLET_DIR%\scarlet\notebooks\tutorial.ipynb"
+set "TEMPLATE_NOTEBOOK=%SCARLET_DIR%\notebooks\tutorial.ipynb"
 set "SESSIONS_DIR=%SCARLET_DIR%\tutorial_sessions"
 
 title Tutoriel SCARLET
 
-rem ==================================================
-rem Verifications
-rem ==================================================
-
-if not exist "%VENV_DIR%\Scripts\python.exe" (
+if not exist "%PYTHON_EXE%" (
     echo.
     echo ERREUR : environnement Python introuvable.
+    echo Lancez d'abord install_windows.cmd.
     echo.
-    echo %VENV_DIR%
+    echo %PYTHON_EXE%
     echo.
     pause
     exit /b 1
@@ -40,10 +34,6 @@ if not exist "%TEMPLATE_NOTEBOOK%" (
 if not exist "%SESSIONS_DIR%" (
     mkdir "%SESSIONS_DIR%"
 )
-
-rem ==================================================
-rem Menu
-rem ==================================================
 
 :MENU
 cls
@@ -72,10 +62,6 @@ echo Choix invalide.
 pause
 goto MENU
 
-rem ==================================================
-rem Creer un nouveau notebook
-rem ==================================================
-
 :NOUVEAU
 cls
 echo.
@@ -89,10 +75,8 @@ if not defined USER_NAME (
     set "USER_NAME=utilisateur"
 )
 
-rem Remplacer les espaces par des tirets bas
 set "USER_NAME=%USER_NAME: =_%"
 
-rem Creer une date et une heure
 for /f %%I in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set "TIMESTAMP=%%I"
 
 set "USER_DIR=%SESSIONS_DIR%\%USER_NAME%"
@@ -121,13 +105,9 @@ echo.
 
 cd /d "%USER_DIR%"
 
-"%VENV_DIR%\Scripts\python.exe" -m jupyter lab "%USER_NOTEBOOK%"
+"%PYTHON_EXE%" -m jupyter lab "%USER_NOTEBOOK%"
 
 goto MENU
-
-rem ==================================================
-rem Ouvrir un notebook existant
-rem ==================================================
 
 :EXISTANT
 cls
@@ -142,13 +122,9 @@ echo.
 
 cd /d "%SESSIONS_DIR%"
 
-"%VENV_DIR%\Scripts\python.exe" -m jupyter lab .
+"%PYTHON_EXE%" -m jupyter lab .
 
 goto MENU
-
-rem ==================================================
-rem Quitter
-rem ==================================================
 
 :FIN
 endlocal
