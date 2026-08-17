@@ -19,6 +19,9 @@ from ._hdf import (
 from ._units import MM_TO_M, mm_to_m as _mm_to_m
 
 
+SAM_WAVELENGTH_RELATIVE_ERROR = 0.10
+
+
 def _sam_instrument_path(fin: h5py.File, entry: str) -> str:
     eg = fin[entry]
     for k, obj in eg.items():
@@ -46,8 +49,15 @@ def _sam_read_detector_counts(fin: h5py.File, entry: str, warnings: List[str]) -
             return a
         raise ValueError(f"Unsupported detector data shape at {scan_path}: {a.shape}")
 
-    # common NXdata layout: /entry0/data1/detector_data
-    for cand in (f"{entry}/data1/detector_data", f"{entry}/data0/detector_data"):
+    # common NXdata layouts:
+    # - /entry0/data1/detector_data
+    # - /entry0/data/detector_data1
+    for cand in (
+        f"{entry}/data1/detector_data",
+        f"{entry}/data0/detector_data",
+        f"{entry}/data/detector_data1",
+        f"{entry}/data/detector_data0",
+    ):
         if cand in fin:
             a = np.asarray(fin[cand][()])
             if a.ndim == 3 and a.shape[-1] == 1:
@@ -98,6 +108,41 @@ def _sam_monitor_integral(fin: h5py.File, entry: str) -> float:
         return _as_float_scalar(monsum)
 
     return float("nan")
+
+
+def _sam_wavelength_error(wavelength: float) -> float:
+    if not np.isfinite(wavelength):
+        return float("nan")
+    return float(wavelength) * SAM_WAVELENGTH_RELATIVE_ERROR
+
+
+def _sam_sample_name(fin: h5py.File, entry: str) -> str:
+    sample_name = _safe_get(fin, f"{entry}/experiment_identifier")
+    if sample_name is not None:
+        name = _as_str(sample_name).strip()
+        if name:
+            return name
+
+    title = _safe_get(fin, f"{entry}/title")
+    if title is not None:
+        name = _as_str(title).strip()
+        if name:
+            return name
+
+    return "unknown"
+
+
+def _sam_sample_aperture_mm(
+    fin: h5py.File,
+    inst_in: str,
+) -> tuple[Optional[float], Optional[float]]:
+    beam = f"{inst_in}/Beam"
+    ap_x = _safe_get(fin, f"{beam}/sample_ap_x_or_diam")
+    ap_y = _safe_get(fin, f"{beam}/sample_ap_y")
+
+    ap_x_mm = None if ap_x is None else float(_as_float_scalar(ap_x))
+    ap_y_mm = None if ap_y is None else float(_as_float_scalar(ap_y))
+    return ap_x_mm, ap_y_mm
 
 
 def _sam_detector_dead_time(fin: h5py.File, inst_in: str) -> float:
@@ -205,6 +250,7 @@ def convert_sam_to_scarlet_nxsas_raw(
         # monochromator / selector wavelength
         wl = _safe_get(fin, f"{inst_in}/Selector/wavelength")
         wavelength = _as_float_scalar(wl) if wl is not None else float("nan")
+        wavelength_error = _sam_wavelength_error(wavelength)
         if np.isnan(wavelength):
             warnings.append("Missing selector wavelength; monochromator/wavelength will be NaN.")
 
@@ -237,6 +283,10 @@ def convert_sam_to_scarlet_nxsas_raw(
             return None if v is None else float(_as_float_scalar(v))
 
         def slit_widths_mm(i: int) -> tuple[Optional[float], Optional[float]]:
+            if i == 4:
+                ap_x_mm, ap_y_mm = _sam_sample_aperture_mm(fin, inst_in)
+                if ap_x_mm is not None or ap_y_mm is not None:
+                    return ap_x_mm, ap_y_mm
             xw = vslit_mm(f"s{i}w_actual_width")
             if xw is None:
                 xw = vslit_mm(f"s{i}w_wanted_width")
@@ -255,11 +305,7 @@ def convert_sam_to_scarlet_nxsas_raw(
 
             # sample
             sample_out = _ensure_group(entry_out, "sample", "NXsample")
-            title = _safe_get(fin, f"{entry}/title")
-            if title is not None:
-                _write_dataset(sample_out, "name", _as_str(title), as_string=True)
-            else:
-                _write_dataset(sample_out, "name", "unknown", as_string=True)
+            _write_dataset(sample_out, "name", _sam_sample_name(fin, entry), as_string=True)
 
             # control monitor required by the v1.3 schema
             control_out = _ensure_group(entry_out, "control", "NXmonitor")
@@ -300,18 +346,20 @@ def convert_sam_to_scarlet_nxsas_raw(
 
             mono_out = _ensure_group(inst_out, "monochromator", "NXmonochromator")
             _write_dataset(mono_out, "wavelength", wavelength)
+            if not np.isnan(wavelength_error):
+                _write_dataset(mono_out, "wavelength_error", wavelength_error)
 
             # collimation
             coll_out = _ensure_group(inst_out, "collimation", None)
             elements_out = _ensure_group(coll_out, "elements", None)
 
             collimation_order: list[tuple[str, int]] = [
-                ("slit", 1),
                 ("guide", 1),
-                ("slit", 2),
+                ("slit", 1),
                 ("guide", 2),
-                ("slit", 3),
+                ("slit", 2),
                 ("guide", 3),
+                ("slit", 3),
                 ("slit", 4),
             ]
             end_d = 0.1
@@ -325,18 +373,23 @@ def convert_sam_to_scarlet_nxsas_raw(
                 dist_m = start_d - k * step
 
                 if kind == "slit":
-                    el = _ensure_group(elements_out, name, "NXslit")
                     xw_mm, yw_mm = slit_widths_mm(idx)
-                    if xw_mm is None:
-                        warnings.append(f"{vslit}: missing width for {name}/x_gap; writing NaN.")
-                        _write_dataset(el, "x_gap", float("nan"))
+                    is_pinhole = idx == 4 and xw_mm is not None and yw_mm is not None and float(yw_mm) == 0.0
+                    if is_pinhole:
+                        el = _ensure_group(elements_out, name, "NXpinhole")
+                        _write_dataset(el, "diameter", float(xw_mm) * MM_TO_M)
                     else:
-                        _write_dataset(el, "x_gap", float(xw_mm) * MM_TO_M)
-                    if yw_mm is None:
-                        warnings.append(f"{vslit}: missing width for {name}/y_gap; writing NaN.")
-                        _write_dataset(el, "y_gap", float("nan"))
-                    else:
-                        _write_dataset(el, "y_gap", float(yw_mm) * MM_TO_M)
+                        el = _ensure_group(elements_out, name, "NXslit")
+                        if xw_mm is None:
+                            warnings.append(f"{vslit}: missing width for {name}/x_gap; writing NaN.")
+                            _write_dataset(el, "x_gap", float("nan"))
+                        else:
+                            _write_dataset(el, "x_gap", float(xw_mm) * MM_TO_M)
+                        if yw_mm is None:
+                            warnings.append(f"{vslit}: missing width for {name}/y_gap; writing NaN.")
+                            _write_dataset(el, "y_gap", float("nan"))
+                        else:
+                            _write_dataset(el, "y_gap", float(yw_mm) * MM_TO_M)
                 else:
                     el = _ensure_group(elements_out, name, "NXguide")
                     state_value = _safe_get(fin, f"{collimation_in}/col{idx}_state")
