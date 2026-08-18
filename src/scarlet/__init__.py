@@ -8,7 +8,7 @@ try:
     __version__ = version("scarlet")
 except PackageNotFoundError:
     # Fallback for source checkouts used without installed package metadata.
-    __version__ = "0.2.1"
+    __version__ = "0.2.2"
 
 __all__ = ["__version__", "ValidationReport", "ValidationMessage", "validate_nexus_file"]
 

@@ -10,6 +10,13 @@ The project follows a simple Semantic Versioning policy:
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-08-18
+
+- SAM: improved raw-file conversion to populate sample name, thickness, detector distance, pixel sizes, and slit/aperture metadata from the source NeXus fields.
+- SAM: aligned converted detector orientation with the raw beam-center coordinates and updated mask compatibility for the transposed detector images.
+- Workflow: relaxed mode inference fallback for non-2D files and updated the reduction pipeline for SAM pinhole resolution handling.
+- Documentation: refreshed the SAM tutorial notebook and generated workflow artifacts for the current reduction flow.
+
 ## [0.2.0] - 2026-07-24
 
 - Feature: implemented curve stitching utilities for combining scattering curves across configurations.
