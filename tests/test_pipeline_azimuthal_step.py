@@ -10,7 +10,7 @@ import numpy as np
 
 from scarlet.reduction.geometry import compute_q_norm_map
 from scarlet.reduction.integration import azimuthal_average
-from scarlet.workflow.configuration import Configuration
+from scarlet.workflow.configuration import Aperture, Collimation, Configuration
 from scarlet.workflow.context import RunKey, WorkflowContext
 from scarlet.workflow.pipeline import ReductionPipeline, ReductionState, as_reduction_step, azimuthal_averaging_step
 
@@ -96,6 +96,56 @@ class TestPipelineAzimuthalStep(unittest.TestCase):
             np.testing.assert_array_equal(integrated.coords["counts"].values, expected.coords["counts"].values)
             self.assertEqual(updated.reductions_steps, ["azimuthal averaging"])
             self.assertIn("Computed azimuthal average", updated.notes[-1])
+
+    def test_azimuthal_averaging_step_supports_pinhole_aperture(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            sample_path = root / "sample_scattering.nxs"
+            sample_data = np.array(
+                [
+                    [0.0, 1.0, 2.0, 0.0],
+                    [1.0, 5.0, 7.0, 2.0],
+                    [2.0, 7.0, 5.0, 1.0],
+                    [0.0, 2.0, 1.0, 0.0],
+                ],
+                dtype=np.float64,
+            )
+            _write_raw_file(sample_path, data=sample_data, monitor_integral=2.0)
+
+            workflow = WorkflowContext(root_dir=root, output_dir=root / "out")
+            workflow.add_run(
+                RunKey(
+                    config_id="cfg",
+                    entity="sample",
+                    mode="scattering",
+                    sample_name="sample",
+                ),
+                sample_path,
+            )
+            workflow.configurations["cfg"] = Configuration(
+                wavelength=6.0,
+                sample_detector_distance=[4.2],
+                config_id="cfg",
+                collimation=Collimation(
+                    aperture1=Aperture(type="slit", x_gap=0.002, y_gap=0.002),
+                    aperture2=Aperture(type="pinhole", diameter=0.004),
+                    collimation_distance=1.5,
+                    last_aperture_to_sample_distance=0.5,
+                ),
+            )
+
+            state = ReductionState(
+                sample_name="sample",
+                config_id="cfg",
+                workflow=workflow,
+                azimuthal_n_bins=3,
+            )
+            updated = azimuthal_averaging_step(state)
+
+            integrated = updated.detectors[0]
+            self.assertEqual(tuple(integrated.dims), ("q",))
+            self.assertIn("q_error", integrated.coords)
+            self.assertTrue(np.isfinite(integrated.coords["q_error"].values).any())
 
 
 if __name__ == "__main__":

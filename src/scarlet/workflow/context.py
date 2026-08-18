@@ -2100,6 +2100,7 @@ _IGNORED_INPUT_DEFINITIONS = {
     "SCARLET_refs_sub",
     "SCARLET_refs_norm",
     "SCARLET_workflow_context",
+    "SCARLET_flatfield",
 }
 
 
@@ -2115,44 +2116,6 @@ def _pick_nexus_entry_path(handle: h5py.File) -> Optional[str]:
             continue
         if _read_text_value(obj.attrs.get("NX_class", "")) == "NXentry":
             return candidate
-    return None
-
-
-def _detector_data_dimensionality_issue(entry: h5py.Group, *, entry_path: str) -> Optional[str]:
-    """Return a warning message when detector data are not strictly 2D."""
-    instrument_group: Optional[h5py.Group] = None
-    if "instrument" in entry and isinstance(entry["instrument"], h5py.Group):
-        instrument_group = entry["instrument"]
-    else:
-        for obj in entry.values():
-            if not isinstance(obj, h5py.Group):
-                continue
-            if _read_text_value(obj.attrs.get("NX_class", "")) == "NXinstrument":
-                instrument_group = obj
-                break
-
-    if instrument_group is None:
-        return "Skipping HDF5 input file without NXinstrument under entry"
-
-    found_detector_data = False
-    for detector_name, detector_group in instrument_group.items():
-        if not isinstance(detector_group, h5py.Group):
-            continue
-        if _read_text_value(detector_group.attrs.get("NX_class", "")) != "NXdetector":
-            continue
-        if "data" not in detector_group or not isinstance(detector_group["data"], h5py.Dataset):
-            continue
-        found_detector_data = True
-        data = detector_group["data"]
-        if len(data.shape) != 2:
-            dataset_path = f"{entry_path}/{instrument_group.name.split('/')[-1]}/{detector_name}/data"
-            return (
-                "Skipping HDF5 input file with non-2D detector data "
-                f"at {dataset_path} (shape={tuple(data.shape)!r})"
-            )
-
-    if not found_detector_data:
-        return "Skipping HDF5 input file without detector data under NXinstrument"
     return None
 
 
@@ -2172,12 +2135,6 @@ def _classify_hdf5_input_candidate(path: Path) -> tuple[bool, Optional[str]]:
                     definition = ""
                 if definition in _IGNORED_INPUT_DEFINITIONS:
                     return False, f"Skipping non-raw HDF5 input file with definition {definition!r}"
-
-            entry = handle[entry_path]
-            assert isinstance(entry, h5py.Group)
-            dimensionality_issue = _detector_data_dimensionality_issue(entry, entry_path=entry_path)
-            if dimensionality_issue is not None:
-                return False, dimensionality_issue
             return True, None
     except OSError:
         return False, "Skipping unreadable HDF5 input file"

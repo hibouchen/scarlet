@@ -24,7 +24,7 @@ class TestSamConverterSchema(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             input_path = Path(td) / "sam_input.nxs"
             output_path = Path(td) / "sam_output.h5"
-            raw_counts = np.array([[10.0, 20.0], [30.0, 40.0]], dtype=np.float64)
+            raw_counts = np.array([[10.0, 20.0], [30.0, 40.0], [50.0, 60.0]], dtype=np.float64)
 
             with h5py.File(input_path, "w") as fin:
                 entry = fin.create_group("entry0")
@@ -39,6 +39,10 @@ class TestSamConverterSchema(unittest.TestCase):
                 monitor.create_dataset("preset", data=10.0)
                 monitor.create_dataset("integral", data=1234.0)
 
+                sample = entry.create_group("sample")
+                thickness = sample.create_dataset("thickness", data=0.2)
+                thickness.attrs["units"] = np.bytes_("cm")
+
                 data1 = entry.create_group("data1")
                 data1.attrs["NX_class"] = b"NXdata"
                 data1.create_dataset("detector_data", data=raw_counts)
@@ -47,6 +51,8 @@ class TestSamConverterSchema(unittest.TestCase):
                 instrument.attrs["NX_class"] = b"NXinstrument"
 
                 beam = instrument.create_group("Beam")
+                beam.create_dataset("center_x", data=1.5)
+                beam.create_dataset("center_y", data=0.5)
                 beam.create_dataset("sample_ap_x_or_diam", data=8.0)
                 beam["sample_ap_x_or_diam"].attrs["units"] = np.bytes_("mm")
                 beam.create_dataset("sample_ap_y", data=4.0)
@@ -55,12 +61,12 @@ class TestSamConverterSchema(unittest.TestCase):
                 selector = instrument.create_group("Selector")
                 selector.create_dataset("wavelength", data=6.0)
 
-                distance = instrument.create_group("Distance")
-                distance.create_dataset("S2_Sample", data=2.5)
+                det_y = instrument.create_group("det_y")
+                det_y.create_dataset("value", data=250.0)
 
                 detector = instrument.create_group("detector")
-                detector.create_dataset("pixel_size_x", data=5.0)
-                detector.create_dataset("pixel_size_y", data=5.0)
+                detector.create_dataset("dim1PixelSize", data=2.5)
+                detector.create_dataset("dim2PixelSize", data=5.0)
                 detector.create_dataset("dead_time", data=1.0e-3)
 
                 collimation = instrument.create_group("collimation")
@@ -73,7 +79,7 @@ class TestSamConverterSchema(unittest.TestCase):
 
             convert_sam_to_scarlet_nxsas_raw(input_path, output_path, overwrite=True)
 
-            expected = correct_detector_dead_time(raw_counts, acq_time=10.0, deadtime=1.0e-3)
+            expected = correct_detector_dead_time(raw_counts, acq_time=10.0, deadtime=1.0e-3).T
             expected_wavelength_error = 0.1 * 6.0
 
             with h5py.File(output_path, "r") as fout:
@@ -81,6 +87,16 @@ class TestSamConverterSchema(unittest.TestCase):
                 np.testing.assert_allclose(fout["/raw_data/data0/counts"][()], expected)
                 self.assertTrue(bool(fout["/raw_data/instrument/detector0/deadtime_corrected"][()]))
                 self.assertEqual(fout["/raw_data/sample/name"][()].decode(), "EB")
+                self.assertEqual(float(fout["/raw_data/sample/thickness"][()]), 2.0)
+                self.assertEqual(fout["/raw_data/sample/thickness"].attrs["units"], b"mm")
+                self.assertEqual(
+                    float(fout["/raw_data/instrument/detector0/transformations/translation"][2]),
+                    2.5,
+                )
+                self.assertEqual(float(fout["/raw_data/instrument/detector0/x_pixel_size"][()]), 0.0025)
+                self.assertEqual(float(fout["/raw_data/instrument/detector0/y_pixel_size"][()]), 0.005)
+                self.assertEqual(float(fout["/raw_data/instrument/detector0/beam_center_x"][()]), 1.5)
+                self.assertEqual(float(fout["/raw_data/instrument/detector0/beam_center_y"][()]), 0.5)
                 self.assertEqual(fout["/raw_data/instrument/collimation/elements/slit4"].attrs["NX_class"], b"NXslit")
                 self.assertEqual(float(fout["/raw_data/instrument/collimation/elements/slit4/x_gap"][()]), 0.008)
                 self.assertEqual(float(fout["/raw_data/instrument/collimation/elements/slit4/y_gap"][()]), 0.004)
@@ -107,6 +123,10 @@ class TestSamConverterSchema(unittest.TestCase):
                 monitor.create_dataset("preset", data=10.0)
                 monitor.create_dataset("integral", data=1234.0)
 
+                sample = entry.create_group("sample")
+                thickness = sample.create_dataset("thickness", data=1.5)
+                thickness.attrs["units"] = np.bytes_("mm")
+
                 data = entry.create_group("data")
                 data.attrs["NX_class"] = b"NXdata"
                 data.create_dataset("detector_data1", data=raw_counts[..., np.newaxis])
@@ -115,6 +135,8 @@ class TestSamConverterSchema(unittest.TestCase):
                 instrument.attrs["NX_class"] = b"NXinstrument"
 
                 beam = instrument.create_group("Beam")
+                beam.create_dataset("center_x", data=0.5)
+                beam.create_dataset("center_y", data=0.5)
                 beam.create_dataset("sample_ap_x_or_diam", data=7.0)
                 beam["sample_ap_x_or_diam"].attrs["units"] = np.bytes_("mm")
                 beam.create_dataset("sample_ap_y", data=0.0)
@@ -123,12 +145,12 @@ class TestSamConverterSchema(unittest.TestCase):
                 selector = instrument.create_group("Selector")
                 selector.create_dataset("wavelength", data=6.0)
 
-                distance = instrument.create_group("Distance")
-                distance.create_dataset("S2_Sample", data=2.5)
+                det_y = instrument.create_group("det_y")
+                det_y.create_dataset("value", data=250.0)
 
                 detector = instrument.create_group("detector")
-                detector.create_dataset("pixel_size_x", data=5.0)
-                detector.create_dataset("pixel_size_y", data=5.0)
+                detector.create_dataset("dim1PixelSize", data=2.5)
+                detector.create_dataset("dim2PixelSize", data=5.0)
                 detector.create_dataset("dead_time", data=0.0)
 
                 collimation = instrument.create_group("collimation")
@@ -145,8 +167,18 @@ class TestSamConverterSchema(unittest.TestCase):
             expected_wavelength_error = 0.1 * 6.0
 
             with h5py.File(output_path, "r") as fout:
-                np.testing.assert_allclose(fout["/raw_data/instrument/detector0/data"][()], expected)
+                np.testing.assert_allclose(fout["/raw_data/instrument/detector0/data"][()], expected.T)
                 self.assertEqual(fout["/raw_data/sample/name"][()].decode(), "sample")
+                self.assertEqual(float(fout["/raw_data/sample/thickness"][()]), 1.5)
+                self.assertEqual(fout["/raw_data/sample/thickness"].attrs["units"], b"mm")
+                self.assertEqual(
+                    float(fout["/raw_data/instrument/detector0/transformations/translation"][2]),
+                    2.5,
+                )
+                self.assertEqual(float(fout["/raw_data/instrument/detector0/x_pixel_size"][()]), 0.0025)
+                self.assertEqual(float(fout["/raw_data/instrument/detector0/y_pixel_size"][()]), 0.005)
+                self.assertEqual(float(fout["/raw_data/instrument/detector0/beam_center_x"][()]), 0.5)
+                self.assertEqual(float(fout["/raw_data/instrument/detector0/beam_center_y"][()]), 0.5)
                 self.assertEqual(fout["/raw_data/instrument/collimation/elements/slit4"].attrs["NX_class"], b"NXpinhole")
                 self.assertEqual(float(fout["/raw_data/instrument/collimation/elements/slit4/diameter"][()]), 0.007)
                 self.assertEqual(fout["/raw_data/instrument/collimation/aperture2"].attrs["NX_class"], b"NXpinhole")
@@ -177,6 +209,8 @@ class TestSamConverterSchema(unittest.TestCase):
             wavelength = float(fout["/raw_data/instrument/monochromator/wavelength"][()])
             self.assertEqual(float(fout["/raw_data/instrument/monochromator/wavelength_error"][()]), 0.1 * wavelength)
             self.assertEqual(fout["/raw_data/sample/name"][()].decode(), "EB")
+            self.assertEqual(float(fout["/raw_data/sample/thickness"][()]), 2.0)
+            self.assertEqual(fout["/raw_data/sample/thickness"].attrs["units"], b"mm")
             self.assertEqual(fout["/raw_data/control/mode"][()].decode(), "timer")
             self.assertEqual(float(fout["/raw_data/control/preset"][()]), 30.0)
             self.assertEqual(float(fout["/raw_data/control/integral"][()]), 296271.0)

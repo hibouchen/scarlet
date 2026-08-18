@@ -174,6 +174,14 @@ def guess_measurement_mode_from_nexus_image(
 
         data = np.asarray(h5[data_path][()], dtype=float)
 
+    if data.ndim != 2:
+        return ImageModeGuess(
+            mode="unknown",
+            confidence=0.0,
+            scores={"transmission": 0.0, "scattering": 0.0},
+            reasons=[f"detector image is not 2D at {data_path} (shape={tuple(data.shape)!r})"],
+        )
+
     return guess_measurement_mode_from_image(
         data,
         center=None,

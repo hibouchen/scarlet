@@ -691,7 +691,8 @@ def azimuthal_averaging_step(state: ReductionState) -> ReductionState:
             pixel_size=pixel_size,
             wavelength=wavelength,
         )
-        if aperture_type == "circular":
+        q_error = None
+        if aperture_type == "pinhole":
             q_error = compute_q_resolution_circular(
                 q_map,
                 r1=aperture1_opening[0]/2,
@@ -812,7 +813,8 @@ class ReductionPipeline:
 class StichingPipeline():
     workflow: WorkflowContext
 
-    def run_for_sample(self, sample_name: str, scale_on: str | None= None):
+    def run_for_sample(self, sample_name: str, scale_on: str | None= None, 
+                       normalization_factor: float =1.0):
         config = self.workflow.configurations
         segments = []
         for config_id in config:
@@ -849,8 +851,8 @@ class StichingPipeline():
         
         final_data = np.column_stack([
                 result.final_curve.q,
-                result.final_curve.i,
-                result.final_curve.di,
+                result.final_curve.i * normalization_factor,
+                result.final_curve.di * normalization_factor,
                 result.final_curve.dq,
                 result.origin_segment_id,
             ])
@@ -865,10 +867,10 @@ class StichingPipeline():
         return final_data
 
     
-    def run_all(self, scale_on: str | None= None):
+    def run_all(self, scale_on: str | None= None, normalization_factor: float =1.0):
         sample_names = []
         for run in self.workflow.runs:
             if run.entity=="sample" and run.mode=="scattering":
                 sample_names.append(run.sample_name)
         for sample in sample_names:
-            self.run_for_sample(sample, scale_on=scale_on)
+            self.run_for_sample(sample, scale_on=scale_on, normalization_factor=normalization_factor)

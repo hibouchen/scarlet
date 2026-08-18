@@ -14,12 +14,14 @@ from ._hdf import (
     ensure_group as _ensure_group,
     pick_entry as _pick_entry,
     safe_get as _safe_get,
+    safe_get_dataset as _safe_get_dataset,
     write_dataset as _write_dataset,
 )
 from ._units import MM_TO_M, mm_to_m as _mm_to_m
 
 
 SAM_WAVELENGTH_RELATIVE_ERROR = 0.10
+CM_TO_M = 1.0e-2
 
 
 def _sam_instrument_path(fin: h5py.File, entry: str) -> str:
@@ -145,12 +147,48 @@ def _sam_sample_aperture_mm(
     return ap_x_mm, ap_y_mm
 
 
+def _sam_sample_thickness_mm(fin: h5py.File, entry: str) -> Optional[float]:
+    ds = _safe_get_dataset(fin, f"{entry}/sample/thickness")
+    if ds is None:
+        return None
+
+    units = ds.attrs.get("units")
+    units_s = _as_str(units).strip().lower() if units is not None else ""
+    value = _as_float_scalar(ds[()])
+
+    if units_s in {"mm", "millimeter", "millimeters", "millimetre", "millimetres"}:
+        return value
+    if units_s in {"cm", "centimeter", "centimeters", "centimetre", "centimetres"}:
+        return value * 10.0
+    if units_s in {"m", "meter", "meters", "metre", "metres"}:
+        return value * 1000.0
+    return value
+
+
+def _sam_detector_distance_m(fin: h5py.File, inst_in: str) -> float:
+    # Current SAM exports used here expose the detector distance through det_y/value.
+    # The stored value is in cm in the raw files, even though the metadata may be unreliable.
+    # Distance/S2_Sample is not populated consistently, so keep a 0.0 fallback for now.
+    det_dist = _safe_get(fin, f"{inst_in}/det_y/value")
+    if det_dist is None:
+        return 0.0
+    return _as_float_scalar(det_dist) * CM_TO_M
+
+
 def _sam_detector_dead_time(fin: h5py.File, inst_in: str) -> float:
     for dataset_name in ("dead_time", "deadtime"):
         value = _safe_get(fin, f"{inst_in}/detector/{dataset_name}")
         if value is not None:
             return _as_float_scalar(value)
     return float("nan")
+
+
+def _sam_beam_center(fin: h5py.File, inst_in: str) -> tuple[Optional[float], Optional[float]]:
+    beam_center_x = _safe_get(fin, f"{inst_in}/Beam/center_x")
+    beam_center_y = _safe_get(fin, f"{inst_in}/Beam/center_y")
+    if beam_center_x is None or beam_center_y is None:
+        return None, None
+    return float(_as_float_scalar(beam_center_x)), float(_as_float_scalar(beam_center_y))
 
 
 def _sam_guide_state(value) -> str:
@@ -254,15 +292,15 @@ def convert_sam_to_scarlet_nxsas_raw(
         if np.isnan(wavelength):
             warnings.append("Missing selector wavelength; monochromator/wavelength will be NaN.")
 
-        # sample-detector distance (assumed meters in SAM files)
-        det_dist = _safe_get(fin, f"{inst_in}/Distance/S2_Sample")
-        det_z_m = _as_float_scalar(det_dist) if det_dist is not None else float("nan")
+        # sample-detector distance
+        det_z_m = _sam_detector_distance_m(fin, inst_in)
 
         # detector pixel sizes (SAM stores these in mm)
-        px_x = _safe_get(fin, f"{inst_in}/detector/pixel_size_x")
-        px_y = _safe_get(fin, f"{inst_in}/detector/pixel_size_y")
+        px_x = _safe_get(fin, f"{inst_in}/detector/dim1PixelSize")
+        px_y = _safe_get(fin, f"{inst_in}/detector/dim2PixelSize")
         x_pixel_size_m = _mm_to_m(px_x) if px_x is not None else float("nan")
         y_pixel_size_m = _mm_to_m(px_y) if px_y is not None else float("nan")
+        beam_center_x, beam_center_y = _sam_beam_center(fin, inst_in)
 
         # counts
         counts = _sam_read_detector_counts(fin, entry, warnings)
@@ -306,6 +344,9 @@ def convert_sam_to_scarlet_nxsas_raw(
             # sample
             sample_out = _ensure_group(entry_out, "sample", "NXsample")
             _write_dataset(sample_out, "name", _sam_sample_name(fin, entry), as_string=True)
+            sample_thickness_mm = _sam_sample_thickness_mm(fin, entry)
+            if sample_thickness_mm is not None:
+                _write_dataset(sample_out, "thickness", sample_thickness_mm, units="mm")
 
             # control monitor required by the v1.3 schema
             control_out = _ensure_group(entry_out, "control", "NXmonitor")
@@ -417,13 +458,17 @@ def convert_sam_to_scarlet_nxsas_raw(
                 detector_name="detector0",
                 warnings=warnings,
             )
+            corrected_counts = np.asarray(corrected_counts).T
             _write_dataset(det_out, "data", corrected_counts)
             _write_dataset(det_out, "x_pixel_size", x_pixel_size_m)
             _write_dataset(det_out, "y_pixel_size", y_pixel_size_m)
 
             ny, nx = corrected_counts.shape[-2], corrected_counts.shape[-1]
-            _write_dataset(det_out, "beam_center_x", (float(nx) - 1.0) / 2.0)
-            _write_dataset(det_out, "beam_center_y", (float(ny) - 1.0) / 2.0)
+            if beam_center_x is None or beam_center_y is None:
+                beam_center_x = (float(nx) - 1.0) / 2.0
+                beam_center_y = (float(ny) - 1.0) / 2.0
+            _write_dataset(det_out, "beam_center_x", beam_center_x)
+            _write_dataset(det_out, "beam_center_y", beam_center_y)
             _write_dataset(det_out, "dead_time", detector_dead_time)
             _write_dataset(det_out, "deadtime_corrected", deadtime_corrected)
 
