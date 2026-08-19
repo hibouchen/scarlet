@@ -789,6 +789,18 @@ class ReductionPipeline:
             )
         )
 
+    @classmethod
+    def without_water_normalization(cls) -> "ReductionPipeline":
+        return cls(
+            steps=(
+                as_reduction_step(subtract_references_step),
+                as_reduction_step(normalize_by_thickness),
+                as_reduction_step(azimuthal_averaging_step),
+                as_reduction_step(save_processed_detectors_step),
+                as_reduction_step(save_azimuthal_text_step),
+            )
+        )
+
     @property
     def step_names(self) -> tuple[str, ...]:
         return tuple(step.name for step in self.steps)
@@ -800,6 +812,29 @@ class ReductionPipeline:
         return state
     
     def run_for_sample(self, workflow: WorkflowContext, sample_name: str, config_id: str) -> ReductionState:
+        run_key = RunKey(
+            config_id=config_id,
+            entity="sample",
+            mode="scattering",
+            sample_name=sample_name,
+        )
+        if workflow.get_run_path(run_key) is None:
+            available_configs = sorted(
+                {
+                    key.config_id
+                    for key, _path in workflow.iter_runs(
+                        entity="sample",
+                        mode="scattering",
+                        sample_name=sample_name,
+                    )
+                }
+            )
+            available_text = ", ".join(available_configs) if available_configs else "none"
+            raise ValueError(
+                "Missing sample scattering run "
+                f"for sample_name={sample_name!r}, config_id={config_id!r}. "
+                f"Available scattering configs for this sample: {available_text}"
+            )
         state = ReductionState(sample_name=sample_name, config_id=config_id, workflow=workflow)
         return self.run(state)
     

@@ -112,6 +112,32 @@ class TestReductionPipelineFactories(unittest.TestCase):
             ),
         )
 
+    def test_run_for_sample_reports_missing_scattering_run_for_config(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            sample_path = root / "sample_scattering.nxs"
+            _write_detector_file(
+                sample_path,
+                sample_name="sample_a",
+                data=np.ones((2, 2), dtype=np.float64),
+            )
+
+            ctx = WorkflowContext(output_dir=root / "out")
+            ctx.add_run(
+                RunKey(config_id="cfg_2", entity="sample", mode="scattering", sample_name="sample_a"),
+                sample_path,
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "Missing sample scattering run .*config_id='cfg_4'.*cfg_2",
+            ):
+                ReductionPipeline.default().run_for_sample(
+                    workflow=ctx,
+                    sample_name="sample_a",
+                    config_id="cfg_4",
+                )
+
 
 class TestAzimuthalTextWriter(unittest.TestCase):
     def test_write_azimuthal_text_file_writes_four_columns_and_header(self) -> None:

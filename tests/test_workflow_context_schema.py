@@ -100,6 +100,9 @@ class TestWorkflowContextSchema(unittest.TestCase):
                 empty_cell_transmissions.create_dataset("config_id", data=np.array([b"config_1"], dtype="S32"))
                 empty_cell_transmissions.create_dataset("value", data=np.array([0.95], dtype=np.float64))
 
+                transmission_sources = entry.create_group("transmission_sources")
+                transmission_sources.create_dataset("config_2", data=b"config_1")
+
                 sample_thicknesses = entry.create_group("sample_thicknesses")
                 sample_thicknesses_sample = sample_thicknesses.create_group("sample")
                 sample_thicknesses_sample.create_dataset("sample_name", data=np.array([b"sample_a"], dtype="S32"))

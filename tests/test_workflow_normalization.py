@@ -599,6 +599,48 @@ class TestWorkflowNormalizationPipeline(unittest.TestCase):
                 expected_flatfield,
             )
 
+    def test_build_water_flatfield_can_use_transmission_source_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            water_scattering_path = root / "water_scattering_target.nxs"
+            water_transmission_path = root / "water_transmission_source.nxs"
+            _write_detector_file(
+                water_scattering_path,
+                sample_name="water",
+                data=np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=np.float64),
+            )
+            _write_detector_file(
+                water_transmission_path,
+                sample_name="water",
+                data=np.ones((2, 2), dtype=np.float64),
+            )
+
+            ctx = WorkflowContext(output_dir=root / "out")
+            ctx.add_run(
+                RunKey(config_id="cfg_target", entity="water", mode="scattering", sample_name="water"),
+                water_scattering_path,
+            )
+            ctx.add_run(
+                RunKey(config_id="cfg_source", entity="water", mode="transmission", sample_name="water"),
+                water_transmission_path,
+            )
+            ctx.set_transmission("water", "cfg_source", 1.0)
+            ctx.set_transmission_source("cfg_target", "cfg_source")
+
+            flatfield_path = ctx.build_water_flatfield("cfg_target")
+
+            self.assertEqual(ctx.get_transmission("water", "cfg_target"), 1.0)
+            expected_flatfield = normalize_by_solid_angle(
+                np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=np.float64),
+                detector_distance=4.2,
+                beam_center=(0.5, 0.5),
+                pixel_size=(0.001, 0.001),
+            )
+            np.testing.assert_allclose(
+                load_flatfield_file(flatfield_path)[0].data.values,
+                expected_flatfield,
+            )
+
     def test_build_water_flatfield_can_use_scattering_runs_with_semi_transparent_beamstop(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

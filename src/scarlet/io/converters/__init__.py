@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 
-ApparatusName = Literal["sam", "sansllb"]
+ApparatusName = Literal["d11", "sam", "sansllb"]
 
 
 def _normalize_apparatus_name(name: str) -> str:
@@ -13,7 +13,7 @@ def _normalize_apparatus_name(name: str) -> str:
 
 
 def list_apparatus() -> list[str]:
-    return ["sam", "sansllb"]
+    return ["d11", "sam", "sansllb"]
 
 
 def get_converter(apparatus: str) -> Callable[..., Any]:
@@ -21,10 +21,15 @@ def get_converter(apparatus: str) -> Callable[..., Any]:
     Return a converter function by apparatus name.
 
     Known apparatus names:
+    - "d11"
     - "sam"
     - "sansllb" (aliases: "sans-llb", "sans_llb")
     """
     key = _normalize_apparatus_name(apparatus)
+    if key == "d11":
+        from .d11 import convert_d11_to_scarlet_nxsas_raw
+
+        return convert_d11_to_scarlet_nxsas_raw
     if key == "sam":
         from .sam import convert_sam_to_scarlet_nxsas_raw
 
@@ -61,4 +66,3 @@ def convert_to_scarlet_nxsas_raw(
 
 
 __all__ = ["ApparatusName", "convert_to_scarlet_nxsas_raw", "get_converter", "list_apparatus"]
-

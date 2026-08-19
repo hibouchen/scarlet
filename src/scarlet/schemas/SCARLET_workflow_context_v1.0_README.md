@@ -10,7 +10,7 @@ This file contains:
 - saved instrumental configurations
 - per-configuration beam centers and transmission ROI
 - reference file paths grouped by entity and acquisition mode
-- sample transmissions, empty-cell transmissions, and sample thicknesses
+- sample transmissions, empty-cell transmissions, transmission-source mappings, and sample thicknesses
 - mask bundles, in-memory detector masks, flatfields, flatfield-source mappings, and stale-flatfield markers
 - logs, issues, artifacts, timings, and a safe serialized subset of `WorkflowContext.store`
 
@@ -32,6 +32,7 @@ Heavy transient caches such as open HDF5 handles, detector frames, or frame-erro
   /rois (NXcollection)
   /references (NXcollection)
   /transmissions (NXcollection)
+  /transmission_sources (NXcollection)
   /sample_thicknesses (NXcollection)
   /masks (NXcollection)
   /flatfield_sources (NXcollection)
@@ -178,6 +179,17 @@ This group stores the two transmission caches of the current workflow object.
 `/entry/transmissions/empty_cell` stores the empty-cell transmission table with required parallel datasets:
 - `config_id`
 - `value`
+
+---
+
+## `/entry/transmission_sources`
+
+This group stores the optional mapping from one target configuration to the configuration providing reusable transmissions.
+
+Suggested layout:
+- `/entry/transmission_sources/config_2 = "config_4"`
+
+When present, workflow getters resolve sample and empty-cell transmissions through this mapping.
 
 ---
 

@@ -221,6 +221,7 @@ scarlet convert sansllb data/SANSLLB/raw/run_001.nxs \
 
 The currently registered converters are:
 
+- `d11` with alias `D11`;
 - `sansllb` with aliases `SANSLLB`, `sans-llb`, `sans_llb`;
 - `sam`.
 

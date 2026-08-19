@@ -39,6 +39,8 @@ ReferenceFilesByMode = Dict[Mode, Path]
 TransmissionValues = Dict[tuple[str, str], float]
 # Empty-cell transmission values indexed by configuration id.
 EmptyCellTransmissionValues = Dict[str, float]
+# Optional mapping from target configuration id to source transmission configuration id.
+TransmissionSources = Dict[str, str]
 # Sample thickness values indexed by sample name and configuration id.
 SampleThicknessValues = Dict[tuple[str, str], float]
 # Per-detector masks indexed by detector number.
@@ -182,6 +184,8 @@ class WorkflowContext:
     transmissions: TransmissionValues = field(default_factory=dict)
     # Computed empty-cell transmissions indexed by configuration id.
     empty_cell_transmissions: EmptyCellTransmissionValues = field(default_factory=dict)
+    # Optional mapping from target configuration id to source transmission configuration id.
+    transmission_sources: TransmissionSources = field(default_factory=dict)
     # Sample thicknesses indexed by sample name and configuration id.
     sample_thicknesses: SampleThicknessValues = field(default_factory=dict)
     # Per-configuration detector masks cache with 1=masked, 0=valid.
@@ -444,6 +448,7 @@ class WorkflowContext:
         self.water.clear()
         self.transmissions.clear()
         self.empty_cell_transmissions.clear()
+        self.transmission_sources.clear()
         self.sample_thicknesses.clear()
         self.masks.clear()
         self.mask_files.clear()
@@ -598,6 +603,11 @@ class WorkflowContext:
                 "value",
                 data=np.asarray([float(value) for _, value in empty_cell_rows], dtype=np.float64),
             )
+
+            transmission_sources_group = entry.create_group("transmission_sources")
+            transmission_sources_group.attrs["NX_class"] = np.bytes_("NXcollection")
+            for config_id, source_config_id in sorted(self.transmission_sources.items()):
+                _write_hdf5_dataset(transmission_sources_group, str(config_id), str(source_config_id))
 
             sample_thicknesses_group = entry.create_group("sample_thicknesses")
             sample_thicknesses_group.attrs["NX_class"] = np.bytes_("NXcollection")
@@ -870,6 +880,13 @@ class WorkflowContext:
                     for row_index in range(row_count):
                         ctx.empty_cell_transmissions[config_ids[row_index]] = float(values[row_index])
 
+            transmission_sources_group = entry.get("transmission_sources")
+            if isinstance(transmission_sources_group, h5py.Group):
+                for config_id, dataset in transmission_sources_group.items():
+                    if not isinstance(dataset, h5py.Dataset):
+                        continue
+                    ctx.transmission_sources[config_id] = _read_text_dataset(dataset).strip()
+
             sample_thicknesses_group = entry.get("sample_thicknesses")
             if isinstance(sample_thicknesses_group, h5py.Group):
                 sample_group = sample_thicknesses_group.get("sample")
@@ -1092,7 +1109,53 @@ class WorkflowContext:
 
     def get_transmission(self, sample_name: str, config_id: str) -> Optional[float]:
         """Return one computed sample transmission, or ``None`` when missing."""
-        return self.transmissions.get((sample_name, config_id))
+        effective_config_id = self.resolve_transmission_config(config_id)
+        return self.transmissions.get((sample_name, effective_config_id))
+
+    def set_transmission_source(self, config_id: str, source_config_id: str) -> str:
+        """Declare that one configuration must reuse transmissions from another configuration."""
+        config_id = str(config_id).strip()
+        source_config_id = str(source_config_id).strip()
+        if not config_id or not source_config_id:
+            raise ValueError("config_id and source_config_id must not be empty")
+        if config_id == source_config_id:
+            self.transmission_sources.pop(config_id, None)
+            self.invalidate_flatfield(config_id)
+            return config_id
+
+        previous = self.transmission_sources.get(config_id)
+        self.transmission_sources[config_id] = source_config_id
+        try:
+            resolved = self.resolve_transmission_config(config_id)
+        except Exception:
+            if previous is None:
+                self.transmission_sources.pop(config_id, None)
+            else:
+                self.transmission_sources[config_id] = previous
+            raise
+
+        self.invalidate_flatfield(config_id)
+        return resolved
+
+    def get_transmission_source(self, config_id: str) -> Optional[str]:
+        """Return the direct source configuration used for transmission reuse, if any."""
+        return self.transmission_sources.get(config_id)
+
+    def resolve_transmission_config(self, config_id: str) -> str:
+        """Resolve the effective configuration that provides transmissions for one target configuration."""
+        current = str(config_id).strip()
+        if not current:
+            raise ValueError("config_id must not be empty")
+        seen: list[str] = []
+        while True:
+            if current in seen:
+                cycle = " -> ".join([*seen, current])
+                raise ValueError(f"Cycle detected in transmission source mapping: {cycle}")
+            seen.append(current)
+            source = self.transmission_sources.get(current)
+            if source is None or source == current:
+                return current
+            current = source
 
     def set_empty_cell_transmission(self, config_id: str, value: float) -> None:
         """Store one computed empty-cell transmission for a configuration."""
@@ -1101,7 +1164,8 @@ class WorkflowContext:
 
     def get_empty_cell_transmission(self, config_id: str) -> Optional[float]:
         """Return one computed empty-cell transmission, or ``None`` when missing."""
-        return self.empty_cell_transmissions.get(config_id)
+        effective_config_id = self.resolve_transmission_config(config_id)
+        return self.empty_cell_transmissions.get(effective_config_id)
 
     def set_sample_thickness(self, sample_name: str, config_id: str, value: float) -> None:
         """Store one sample thickness in millimeters."""

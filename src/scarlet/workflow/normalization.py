@@ -421,25 +421,33 @@ def build_water_flatfield_from_workflow_context(
     )
 
     transmission_source_mode = workflow.get_transmission_source_mode()
-    if transmission_source_mode == "scattering":
+    transmission_config_id = workflow.resolve_transmission_config(source_config_id)
+    if transmission_source_mode == "scattering" and transmission_config_id == source_config_id:
         water_transmission_path = water_scattering_path
+        water_transmission_sample_name = water_scattering_key.sample_name
     else:
-        water_transmission_path = workflow.get_water(source_config_id, "transmission")
+        selected = _select_reference_run(
+            workflow,
+            config_id=transmission_config_id,
+            entity="water",
+            mode=transmission_source_mode,
+        )
+        if selected is None:
+            water_transmission_path = workflow.get_water(transmission_config_id, transmission_source_mode)
+            water_transmission_sample_name = water_scattering_key.sample_name
+        else:
+            water_transmission_key, water_transmission_path = selected
+            water_transmission_sample_name = water_transmission_key.sample_name
         if water_transmission_path is None:
-            selected = _select_reference_run(
-                workflow,
-                config_id=source_config_id,
-                entity="water",
-                mode="transmission",
+            raise ValueError(
+                f"Missing water {transmission_source_mode} reference "
+                f"for configuration {transmission_config_id!r}"
             )
-            water_transmission_path = None if selected is None else selected[1]
-        if water_transmission_path is None:
-            raise ValueError(f"Missing water transmission reference for configuration {source_config_id!r}")
 
     water_transmission = _compute_or_get_transmission(
         workflow,
-        config_id=source_config_id,
-        sample_name=water_scattering_key.sample_name,
+        config_id=transmission_config_id,
+        sample_name=water_transmission_sample_name,
         transmission_file=water_transmission_path,
         detector_number=detector_number_for_transmission,
         entity="water",
@@ -451,13 +459,13 @@ def build_water_flatfield_from_workflow_context(
         if empty_cell_transmission is None:
             empty_cell_key, empty_cell_transmission_path = _require_reference_run(
                 workflow,
-                config_id=source_config_id,
+                config_id=transmission_config_id,
                 entity="empty_cell",
                 mode=transmission_source_mode,
             )
             empty_cell_transmission = _compute_or_get_transmission(
                 workflow,
-                config_id=source_config_id,
+                config_id=transmission_config_id,
                 sample_name=empty_cell_key.sample_name,
                 transmission_file=empty_cell_transmission_path,
                 detector_number=detector_number_for_transmission,

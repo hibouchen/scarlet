@@ -208,6 +208,14 @@ nodes:
         - config_id
         - value
 
+  - path: /entry/transmission_sources
+    kind: group
+    required: false
+
+  - path_pattern: ^/entry/transmission_sources/[^/]+$
+    kind: dataset
+    required: false
+
   - path: /entry/sample_thicknesses
     kind: group
     required: false

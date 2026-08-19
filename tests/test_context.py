@@ -87,6 +87,28 @@ class TestWorkflowContext(unittest.TestCase):
         self.assertEqual(ctx.get_transmission_strategy(), "semi_transparent_beamstop")
         self.assertEqual(ctx.get_transmission_source_mode(), "scattering")
 
+    def test_transmission_source_resolves_sample_and_empty_cell_values(self) -> None:
+        ctx = WorkflowContext()
+        ctx.set_transmission("sample_a", "config_source", 0.42)
+        ctx.set_empty_cell_transmission("config_source", 0.84)
+
+        resolved = ctx.set_transmission_source("config_target", "config_source")
+
+        self.assertEqual(resolved, "config_source")
+        self.assertEqual(ctx.get_transmission_source("config_target"), "config_source")
+        self.assertEqual(ctx.resolve_transmission_config("config_target"), "config_source")
+        self.assertEqual(ctx.get_transmission("sample_a", "config_target"), 0.42)
+        self.assertEqual(ctx.get_empty_cell_transmission("config_target"), 0.84)
+
+    def test_transmission_source_rejects_cycles(self) -> None:
+        ctx = WorkflowContext()
+        ctx.set_transmission_source("config_b", "config_c")
+
+        with self.assertRaisesRegex(ValueError, "Cycle detected"):
+            ctx.set_transmission_source("config_c", "config_b")
+
+        self.assertIsNone(ctx.get_transmission_source("config_c"))
+
     def test_add_run_preserves_duplicate_logical_keys(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
