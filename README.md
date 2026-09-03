@@ -391,8 +391,6 @@ Implemented operations currently cover conversion, validation, workflow bookkeep
 
 ---
 
-
-
 ## Roadmap
 
 Near-term priorities:

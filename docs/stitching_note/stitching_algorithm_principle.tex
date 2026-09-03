@@ -1,0 +1,611 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[french]{babel}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb}
+\usepackage{siunitx}
+\usepackage{geometry}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+\geometry{margin=2.4cm}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!50!black,
+    urlcolor=blue!50!black,
+    citecolor=blue!50!black
+}
+
+\title{Principe de l'algorithme de stitching de courbes SAS}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\section{Objectif général}
+
+Dans une expérience de diffusion aux petits angles, une même mesure peut être
+obtenue à partir de plusieurs configurations instrumentales et parfois de
+plusieurs détecteurs pour une même configuration. Chaque courbe fournit une
+mesure de l'intensité diffusée sur une gamme de vecteur de diffusion $Q$ :
+
+\[
+    I(Q) \pm \Delta I(Q),
+\]
+
+avec éventuellement une estimation de la résolution expérimentale :
+
+\[
+    \Delta Q(Q).
+\]
+
+L'objectif du stitching est de construire une seule courbe finale continue,
+cohérente et exploitable à partir de plusieurs courbes partielles. L'algorithme
+ne doit cependant pas utiliser aveuglément toutes les courbes disponibles. Une
+courbe de grand angle, par exemple, peut être redondante si elle couvre une
+gamme de $Q$ déjà mieux mesurée par une autre configuration.
+
+Le principe général est donc le suivant :
+
+\[
+\boxed{
+    \text{sélectionner les segments utiles, les raccorder, puis concaténer}
+}
+\]
+
+\section{Notion de segment}
+
+L'algorithme ne raisonne pas seulement en termes de configuration instrumentale.
+Il considère chaque courbe détecteur comme un \emph{segment candidat}. Un
+segment correspond donc typiquement à une combinaison :
+
+\[
+    \text{configuration} + \text{détecteur}.
+\]
+
+Par exemple :
+
+\[
+\begin{array}{lll}
+    \texttt{c9d0}   & \leftrightarrow & \texttt{config\_9},\ \texttt{detector0}, \\
+    \texttt{c10d0}  & \leftrightarrow & \texttt{config\_10},\ \texttt{detector0}, \\
+    \texttt{c10d2}  & \leftrightarrow & \texttt{config\_10},\ \texttt{detector2}.
+\end{array}
+\]
+
+Chaque segment contient quatre colonnes :
+
+\[
+    Q,\quad I(Q),\quad \Delta I(Q),\quad \Delta Q(Q).
+\]
+
+Pour chaque segment, on calcule aussi des informations globales :
+
+\[
+    Q_{\min},\quad Q_{\max},\quad N_{\mathrm{points}},
+\]
+
+ainsi que des indicateurs de qualité, par exemple :
+
+\[
+    \mathrm{median}\left(\frac{\Delta I}{I}\right),
+    \qquad
+    \mathrm{median}\left(\frac{\Delta Q}{Q}\right).
+\]
+
+\section{Pourquoi ne pas concaténer toutes les courbes ?}
+
+Lorsque plusieurs détecteurs sont disponibles, il arrive que certains segments :
+
+\begin{itemize}[leftmargin=1.5em]
+    \item recouvrent presque entièrement une zone déjà couverte par un autre
+    segment ;
+    \item aient une incertitude relative plus grande ;
+    \item présentent une résolution moins favorable ;
+    \item introduisent une discontinuité dans la courbe finale ;
+    \item n'apportent pas de nouvelle gamme utile en $Q$.
+\end{itemize}
+
+Dans ce cas, inclure systématiquement tous les segments peut dégrader la courbe
+finale. L'algorithme doit donc être capable de rejeter un segment même si celui-ci
+est techniquement présent dans les fichiers d'entrée.
+
+Le critère fondamental est :
+
+\[
+\boxed{
+    \text{un segment est utile seulement s'il apporte une information nouvelle
+    et fiable}
+}
+\]
+
+\section{Raccord entre deux segments}
+
+Considérons deux segments $A$ et $B$ qui se recouvrent sur une gamme de $Q$.
+La question est de savoir si le segment $B$ peut être raccordé au segment $A$
+par un simple facteur multiplicatif.
+
+On cherche donc un facteur $s$ tel que :
+
+\[
+    I_A(Q) \simeq s\,I_B(Q).
+\]
+
+Cette convention est importante : le facteur $s$ est le facteur qui transforme
+le segment $B$ vers l'échelle du segment $A$.
+
+\subsection{Travail dans l'espace logarithmique}
+
+Plutôt que d'ajuster directement le rapport $I_A/I_B$, on travaille sur le
+log-ratio :
+
+\[
+    r(Q) = \ln I_A(Q) - \ln I_B(Q).
+\]
+
+Si le raccord est purement multiplicatif, alors :
+
+\[
+    r(Q) \simeq \ln s.
+\]
+
+Autrement dit, dans la zone de recouvrement, le log-ratio doit former un
+plateau. Le problème du raccord devient donc un problème de détection de plateau.
+
+\subsection{Incertitude sur le log-ratio}
+
+Si les incertitudes sur les deux intensités sont indépendantes, l'incertitude
+sur le log-ratio est approximativement :
+
+\[
+    \sigma_r^2(Q)
+    =
+    \left(\frac{\Delta I_A(Q)}{I_A(Q)}\right)^2
+    +
+    \left(\frac{\Delta I_B(Q)}{I_B(Q)}\right)^2.
+\]
+
+Cette quantité sert à pondérer les points dans la zone de recouvrement.
+
+\subsection{Estimation du facteur de raccord}
+
+Dans une fenêtre de recouvrement donnée $\Omega$, on ajuste une constante :
+
+\[
+    r(Q) \simeq \ln s.
+\]
+
+Le meilleur estimateur pondéré est :
+
+\[
+    \ln s =
+    \frac{\sum_{i\in\Omega} w_i r_i}
+         {\sum_{i\in\Omega} w_i},
+    \qquad
+    w_i = \frac{1}{\sigma_{r,i}^2}.
+\]
+
+L'incertitude associée est :
+
+\[
+    \sigma_{\ln s}
+    =
+    \left(
+        \sum_{i\in\Omega} w_i
+    \right)^{-1/2}.
+\]
+
+Le facteur multiplicatif est ensuite :
+
+\[
+    s = \exp(\ln s),
+\]
+
+et son incertitude est approximativement :
+
+\[
+    \sigma_s \simeq s\,\sigma_{\ln s}.
+\]
+
+\section{Recherche automatique d'une bonne fenêtre de recouvrement}
+
+Le recouvrement géométrique complet entre deux segments n'est pas toujours la
+meilleure zone pour calculer le facteur. Les bords de détecteur, la résolution,
+le bruit ou des défauts de normalisation peuvent rendre une partie de l'overlap
+moins fiable.
+
+L'algorithme teste donc plusieurs fenêtres candidates dans la zone de
+recouvrement. Pour chaque fenêtre, il calcule :
+
+\begin{itemize}[leftmargin=1.5em]
+    \item le facteur de raccord $s$ ;
+    \item le $\chi^2$ réduit du fit par une constante ;
+    \item la pente résiduelle du log-ratio ;
+    \item la largeur logarithmique de la fenêtre ;
+    \item un indicateur de résolution relative.
+\end{itemize}
+
+\subsection{Test de platitude}
+
+Un raccord acceptable doit présenter un log-ratio à peu près constant.
+Pour vérifier cela, on ajuste aussi :
+
+\[
+    r(Q) = a + b\ln Q.
+\]
+
+La pente $b$ doit être compatible avec zéro. On utilise donc le score :
+
+\[
+    z_b = \left|\frac{b}{\sigma_b}\right|.
+\]
+
+Une valeur petite de $z_b$ indique que la pente n'est pas significative. Une
+valeur grande indique que le ratio dérive avec $Q$, donc que la fenêtre ne
+correspond pas à un vrai plateau.
+
+\subsection{Rôle du $\chi^2$}
+
+Le $\chi^2$ réduit mesure la compatibilité du log-ratio avec une constante :
+
+\[
+    \chi^2_\nu
+    =
+    \frac{1}{N-1}
+    \sum_{i\in\Omega}
+    \frac{(r_i-\ln s)^2}{\sigma_{r,i}^2}.
+\]
+
+Un $\chi^2_\nu$ trop élevé indique que les fluctuations autour du plateau sont
+plus grandes que ce qui est attendu à partir des incertitudes.
+
+Cependant, le $\chi^2$ seul n'est pas suffisant : une dérive lente et régulière
+du ratio peut parfois donner un $\chi^2$ acceptable si les incertitudes sont
+grandes. C'est pourquoi l'algorithme utilise aussi le critère de pente.
+
+\subsection{Indicateur de résolution}
+
+La résolution n'est pas utilisée pour corriger explicitement les courbes.
+L'algorithme ne déconvolue pas les données et ne dégrade pas une courbe pour
+imiter la résolution d'une autre.
+
+En revanche, la résolution peut être utilisée comme critère de qualité
+secondaire. Pour une paire de segments $A$ et $B$, on définit :
+
+\[
+    \rho_\Omega
+    =
+    \mathrm{median}_{Q\in\Omega}
+    \left[
+        \sqrt{
+            \left(\frac{\Delta Q_A}{Q}\right)^2
+            +
+            \left(\frac{\Delta Q_B}{Q}\right)^2
+        }
+    \right].
+\]
+
+Une fenêtre où $\rho_\Omega$ est plus faible est préférée, toutes choses égales
+par ailleurs.
+
+\subsection{Score d'une fenêtre}
+
+Chaque fenêtre candidate reçoit un score de la forme :
+
+\[
+    S_\Omega =
+    \chi^2_{\nu,\Omega}
+    +
+    \lambda_b
+    \left(\frac{b_\Omega}{\sigma_{b,\Omega}}\right)^2
+    +
+    \lambda_w
+    \frac{\Delta\ln Q_{\mathrm{total}}}
+         {\Delta\ln Q_\Omega}
+    +
+    \lambda_Q
+    \left(\frac{\rho_\Omega}{\rho_{\mathrm{ref}}}\right)^2.
+\]
+
+Les différents termes ont les rôles suivants :
+
+\begin{description}[leftmargin=2em]
+    \item[$\chi^2_\nu$] pénalise les fenêtres qui ne sont pas compatibles avec
+    un plateau.
+    \item[Terme de pente] pénalise les ratios qui dérivent avec $Q$.
+    \item[Terme de largeur] évite de choisir une fenêtre trop petite simplement
+    parce qu'elle donne localement un bon score.
+    \item[Terme de résolution] favorise les fenêtres où la résolution relative
+    combinée est meilleure.
+\end{description}
+
+La meilleure fenêtre est celle qui minimise ce score.
+
+\section{Grille de calcul du ratio}
+
+Deux segments n'ont pas nécessairement les mêmes valeurs de $Q$. Pour calculer
+le log-ratio, les intensités doivent donc être évaluées sur une même grille.
+
+L'algorithme peut utiliser une grille commune logarithmique dans la zone de
+recouvrement :
+
+\[
+    Q_k =
+    \exp\left[
+        \ln Q_{\min}
+        +
+        k
+        \frac{\ln Q_{\max}-\ln Q_{\min}}{N-1}
+    \right].
+\]
+
+Les deux courbes sont interpolées sur cette grille commune. Le nombre de points
+est choisi de manière conservatrice, typiquement :
+
+\[
+    N = \min(N_A, N_B),
+\]
+
+où $N_A$ et $N_B$ sont les nombres de points réellement présents dans l'overlap
+pour les deux segments. Cela évite de sur-échantillonner artificiellement les
+données interpolées.
+
+\section{Sélection des segments utiles}
+
+Une fois que l'on sait tester le raccord entre deux segments, l'étape suivante
+consiste à construire une chaîne de segments.
+
+L'algorithme part d'un segment initial, par exemple le segment de plus bas $Q$,
+puis cherche quel segment peut prolonger la courbe de la manière la plus
+pertinente.
+
+Pour chaque candidat $B$ à ajouter après un segment courant $A$, on calcule :
+
+\begin{itemize}[leftmargin=1.5em]
+    \item la qualité du raccord $A\rightarrow B$ ;
+    \item la qualité intrinsèque du segment $B$ ;
+    \item la nouvelle gamme de $Q$ apportée par $B$.
+\end{itemize}
+
+La nouvelle couverture logarithmique est définie par :
+
+\[
+    \Delta\ln Q_{\mathrm{new}}
+    =
+    \max
+    \left[
+        0,\,
+        \ln\left(\frac{Q_{\max,B}}{Q_{\max,A}}\right)
+    \right].
+\]
+
+Un segment qui ne dépasse pas réellement la gamme déjà couverte n'apporte pas
+d'information nouvelle significative.
+
+\subsection{Qualité intrinsèque d'un segment}
+
+Pour un segment seul, on définit un score de qualité simple :
+
+\[
+    Q_{\mathrm{seg}}
+    =
+    \mathrm{median}
+    \left[
+        \left(\frac{\Delta I}{I}\right)^2
+        +
+        \lambda_{\mathrm{res}}
+        \left(\frac{\Delta Q}{Q}\right)^2
+    \right].
+\]
+
+Plus ce score est petit, meilleure est la qualité du segment.
+
+\subsection{Coût de transition}
+
+Pour choisir le prochain segment, l'algorithme minimise un coût de transition
+du type :
+
+\[
+    C(A\rightarrow B)
+    =
+    S_{A\rightarrow B}
+    +
+    \lambda_{\mathrm{seg}} Q_{\mathrm{seg},B}
+    -
+    \lambda_{\mathrm{new}} \Delta\ln Q_{\mathrm{new}}.
+\]
+
+Le premier terme mesure la qualité du raccord. Le deuxième pénalise les segments
+bruités ou de mauvaise résolution. Le troisième favorise les segments qui
+étendent réellement la gamme de $Q$.
+
+Ainsi, un segment est favorisé s'il :
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item se raccorde proprement au segment courant ;
+    \item possède une bonne qualité intrinsèque ;
+    \item apporte une nouvelle gamme de $Q$.
+\end{enumerate}
+
+\section{Critères d'acceptation et de rejet}
+
+Une transition entre deux segments est acceptée seulement si elle satisfait des
+critères minimaux :
+
+\[
+    \chi^2_\nu < \chi^2_{\nu,\max},
+\]
+
+\[
+    \left|\frac{b}{\sigma_b}\right| < z_{b,\max},
+\]
+
+\[
+    \Delta\ln Q_{\mathrm{new}} > \Delta\ln Q_{\min}.
+\]
+
+Si l'une de ces conditions échoue, la transition est rejetée.
+
+Les principaux statuts de rejet sont :
+
+\begin{description}[leftmargin=2em]
+    \item[\texttt{rejected\_bad\_overlap}] le ratio n'est pas suffisamment plat
+    ou le $\chi^2$ est trop élevé ;
+    \item[\texttt{rejected\_no\_new\_q\_coverage}] le segment n'apporte pas
+    assez de nouvelle gamme en $Q$ ;
+    \item[\texttt{rejected\_redundant\_or\_no\_new\_q\_coverage}] le segment
+    est redondant par rapport à la chaîne déjà retenue ;
+    \item[\texttt{rejected\_no\_valid\_transition}] aucun raccord acceptable
+    n'a été trouvé pour intégrer ce segment.
+\end{description}
+
+Ce mécanisme est essentiel pour éviter d'ajouter automatiquement des détecteurs
+grand angle qui n'améliorent pas la courbe finale.
+
+\section{Construction de la courbe finale}
+
+Une fois la chaîne de segments retenue, chaque segment reçoit un facteur global.
+Si le premier segment a un facteur global $G_0 = 1$, et si la transition
+$A\rightarrow B$ donne un facteur $s_{B\rightarrow A}$, alors :
+
+\[
+    G_B = G_A\,s_{B\rightarrow A}.
+\]
+
+La courbe corrigée du segment $B$ est donc :
+
+\[
+    I_{B,\mathrm{corr}}(Q) = G_B I_B(Q),
+\]
+
+et son incertitude :
+
+\[
+    \Delta I_{B,\mathrm{corr}}(Q) = G_B \Delta I_B(Q).
+\]
+
+La résolution $\Delta Q$ n'est pas multipliée par ce facteur, car il s'agit
+d'une incertitude sur l'axe $Q$, pas sur l'intensité :
+
+\[
+    \Delta Q_{B,\mathrm{corr}}(Q) = \Delta Q_B(Q).
+\]
+
+\subsection{Gestion des zones de recouvrement}
+
+Dans les zones de raccord, l'algorithme ne garde pas nécessairement tout
+l'overlap. Il conserve généralement une petite région autour de la fenêtre de
+fit pour éviter une coupure trop brutale, mais sans dupliquer excessivement les
+points.
+
+Si la fenêtre de fit est :
+
+\[
+    [Q_{\mathrm{fit,min}}, Q_{\mathrm{fit,max}}],
+\]
+
+on peut conserver une fraction centrale de cette fenêtre en échelle
+logarithmique. Cela permet de garder une transition visuellement et
+numériquement contrôlée.
+
+\section{Choix de l'échelle de référence}
+
+Par défaut, la courbe finale est exprimée dans l'échelle du premier segment
+retenu. Cependant, il est souvent préférable d'exprimer la courbe finale dans
+l'échelle d'une configuration de référence choisie par l'utilisateur.
+
+Supposons que les facteurs globaux obtenus soient :
+
+\[
+    G_0,\quad G_1,\quad G_2,\ldots
+\]
+
+et que le segment de référence ait le facteur :
+
+\[
+    G_{\mathrm{ref}}.
+\]
+
+On renormalise alors tous les facteurs :
+
+\[
+    G_i^{\mathrm{new}}
+    =
+    \frac{G_i}{G_{\mathrm{ref}}}.
+\]
+
+Ainsi, le segment de référence a bien :
+
+\[
+    G_{\mathrm{ref}}^{\mathrm{new}} = 1.
+\]
+
+Cette opération ne change pas la sélection des segments ni la qualité des
+raccords. Elle change seulement l'échelle absolue de la courbe finale.
+
+\section{Résumé de l'algorithme}
+
+L'algorithme complet peut être résumé ainsi :
+
+\begin{enumerate}[leftmargin=1.5em]
+    \item Charger toutes les courbes disponibles.
+    \item Transformer chaque courbe détecteur en segment candidat.
+    \item Calculer les indicateurs de qualité de chaque segment.
+    \item Tester les raccords possibles entre paires de segments.
+    \item Pour chaque raccord, chercher la meilleure fenêtre de plateau du
+    log-ratio.
+    \item Rejeter les transitions qui ne sont pas assez plates, trop bruitées
+    ou sans nouvelle couverture en $Q$.
+    \item Construire progressivement une chaîne de segments utiles.
+    \item Rejeter les segments redondants ou non raccordables.
+    \item Calculer les facteurs globaux de chaque segment retenu.
+    \item Renormaliser éventuellement la courbe sur une configuration de
+    référence.
+    \item Concaténer les segments retenus pour produire la courbe finale.
+\end{enumerate}
+
+\section{Points importants à retenir}
+
+\begin{itemize}[leftmargin=1.5em]
+    \item Le raccord est basé sur un facteur multiplicatif entre segments.
+    \item Ce facteur est estimé à partir d'un plateau du log-ratio.
+    \item Le $\chi^2$ seul ne suffit pas ; il faut aussi contrôler la pente du
+    log-ratio.
+    \item La résolution $\Delta Q$ n'est pas utilisée pour corriger explicitement
+    les courbes, mais elle peut aider à choisir les meilleures fenêtres.
+    \item Tous les détecteurs ne sont pas nécessairement utilisés.
+    \item Un segment peut être rejeté simplement parce qu'il est redondant.
+    \item La configuration de référence fixe l'échelle finale, mais ne change pas
+    la sélection des segments.
+\end{itemize}
+
+\section{Interprétation pratique}
+
+Une bonne courbe finale n'est pas celle qui contient le plus grand nombre de
+points, mais celle qui utilise les points les plus fiables et les plus utiles.
+L'algorithme cherche donc un compromis entre continuité, qualité statistique,
+résolution et couverture en $Q$.
+
+Dans ce cadre, le stitching n'est pas seulement une opération de collage. C'est
+une étape de sélection raisonnée de l'information expérimentale.
+
+\[
+\boxed{
+    \text{stitching} =
+    \text{raccord multiplicatif}
+    +
+    \text{contrôle de qualité}
+    +
+    \text{sélection des segments utiles}
+}
+\]
+
+\end{document}
