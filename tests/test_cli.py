@@ -62,6 +62,16 @@ class TestCli(unittest.TestCase):
         self.assertEqual(status, 0)
         run_viewer.assert_called_once_with(Path("tests/data/sam/raw_data"), instrument="sam")
 
+    def test_notebook_command_dispatches_tutorial_runner(self) -> None:
+        with mock.patch("scarlet.tutorial.run", return_value=0) as run:
+            status = main(["notebook", "notebooks", "--copy-only"])
+
+        self.assertEqual(status, 0)
+        run.assert_called_once()
+        args = run.call_args.args[0]
+        self.assertEqual(args.destination, "notebooks")
+        self.assertTrue(args.copy_only)
+
 
 if __name__ == "__main__":
     unittest.main()

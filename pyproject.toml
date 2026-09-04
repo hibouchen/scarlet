@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scarlet"
-version = "0.2.2"
+version = "0.2.3"
 description = "NeXus-native, instrument-agnostic framework for SANS data reduction."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -26,6 +26,7 @@ dev = ["pytest>=8"]
 
 [project.scripts]
 scarlet = "scarlet.cli:main"
+scarlet-notebook = "scarlet.tutorial:main"
 viewer = "scarlet.gui.scarlet_viewer:main"
 
 [tool.setuptools]
@@ -37,3 +38,4 @@ include = ["scarlet*"]
 
 [tool.setuptools.package-data]
 "scarlet.schemas" = ["*.yaml", "*.yml", "README.md"]
+"scarlet.notebooks" = ["*.ipynb"]

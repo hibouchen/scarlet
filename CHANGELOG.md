@@ -10,6 +10,12 @@ The project follows a simple Semantic Versioning policy:
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-09-04
+
+- Feature: added a graphical `scarlet notebook` launcher to create a notebook from the packaged tutorial or open an existing `.ipynb` file before starting JupyterLab.
+- Packaging: added the `scarlet-notebook` console script and packaged the tutorial notebook with the Python distribution.
+- Windows: updated `run_scarlet.cmd` to launch the graphical notebook selector.
+
 ## [0.2.2] - 2026-08-18
 
 - SAM: improved raw-file conversion to populate sample name, thickness, detector distance, pixel sizes, and slit/aperture metadata from the source NeXus fields.

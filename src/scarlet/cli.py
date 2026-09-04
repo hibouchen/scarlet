@@ -328,6 +328,12 @@ def _cmd_viewer(args: argparse.Namespace) -> int:
         return 2
 
 
+def _cmd_tutorial(args: argparse.Namespace) -> int:
+    from scarlet.tutorial import run
+
+    return run(args)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="scarlet", description="SCARLET utilities")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -483,6 +489,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="Instrument used to convert raw files before display (default: sansllb)",
     )
     viewer.set_defaults(func=_cmd_viewer)
+
+    tutorial = sub.add_parser("notebook", help="Open the packaged SCARLET tutorial notebook")
+    tutorial.add_argument(
+        "destination",
+        nargs="?",
+        default=None,
+        help=(
+            "Notebook file or directory to open. Directory paths and paths without "
+            "an extension receive tutorial.ipynb. If omitted, ./tutorial.ipynb is "
+            "selected from a graphical launcher."
+        ),
+    )
+    tutorial.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace the destination notebook with the packaged tutorial.",
+    )
+    tutorial.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="Start Jupyter without opening a browser window.",
+    )
+    tutorial.add_argument(
+        "--copy-only",
+        action="store_true",
+        help="Copy or locate the tutorial notebook without starting Jupyter.",
+    )
+    tutorial.set_defaults(func=_cmd_tutorial)
 
     return p
 

@@ -210,6 +210,25 @@ List known converters:
 scarlet convert list
 ```
 
+Open the packaged tutorial notebook in JupyterLab:
+
+```bash
+scarlet notebook
+```
+
+This opens a graphical launcher where you can create a notebook from the packaged
+tutorial or open an existing `.ipynb` file. The same launcher is also available as:
+
+```bash
+scarlet-notebook
+```
+
+For scripted use, pass a destination path directly:
+
+```bash
+scarlet notebook tutorial_sessions
+```
+
 Convert an instrument file to SCARLET `NXsas_raw`:
 
 ```bash
