@@ -1,0 +1,52 @@
+site_name: SCARLET
+site_description: Framework NeXus pour les workflows de reduction de donnees SANS.
+site_url: https://hibouchen.github.io/scarlet/
+repo_url: https://github.com/hibouchen/scarlet
+repo_name: hibouchen/scarlet
+
+theme:
+  name: material
+  language: fr
+  features:
+    - navigation.tabs
+    - navigation.top
+    - navigation.tracking
+    - search.highlight
+    - search.share
+    - content.code.copy
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - attr_list
+  - md_in_html
+  - tables
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          options:
+            docstring_style: google
+            show_source: false
+            show_root_heading: true
+            show_signature_annotations: true
+            separate_signature: true
+
+nav:
+  - Accueil: index.md
+  - Demarrer:
+      - Installation: installation.md
+      - Tutoriel: tutorial.md
+  - Utiliser SCARLET:
+      - Ligne de commande: cli.md
+      - Format de donnees: format.md
+      - Schemas NeXus: schemas.md
+  - Reference API: api.md

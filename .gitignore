@@ -23,6 +23,7 @@ dist/
 .coverage
 coverage.xml
 htmlcov/
+site/
 
 # IDE
 .vscode/
