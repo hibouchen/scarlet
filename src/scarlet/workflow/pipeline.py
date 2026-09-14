@@ -675,9 +675,15 @@ def azimuthal_averaging_step(state: ReductionState) -> ReductionState:
     configuration = _read_state_configuration(state)
     wavelength = _get_wavelength(configuration)
     wavelength_uncertainty = 0.0 if not state.file_path else _read_wavelength_uncertainty(state.file_path, wavelength=wavelength)
-    aperture_type = _aperture_type(configuration.collimation.aperture2)
-    aperture2_opening = _aperture_opening(configuration.collimation.aperture2)
-    aperture1_opening = _aperture_opening(configuration.collimation.aperture1)
+    aperture_type = None
+    aperture1_opening = None
+    aperture2_opening = None
+    collimation_distance = None
+    if configuration.collimation is not None:
+        aperture_type = _aperture_type(configuration.collimation.aperture2)
+        aperture2_opening = _aperture_opening(configuration.collimation.aperture2)
+        aperture1_opening = _aperture_opening(configuration.collimation.aperture1)
+        collimation_distance = configuration.collimation.collimation_distance
     integrated: dict[int, Any] = {}
     for detector_number, detector in state.detectors.items():
         detector_array = _require_dataarray(detector, name=f"detector{detector_number}", ndim=2)
@@ -692,25 +698,35 @@ def azimuthal_averaging_step(state: ReductionState) -> ReductionState:
             wavelength=wavelength,
         )
         q_error = None
-        if aperture_type == "pinhole":
+        if (
+            aperture_type == "pinhole"
+            and aperture1_opening is not None
+            and aperture2_opening is not None
+            and collimation_distance is not None
+        ):
             q_error = compute_q_resolution_circular(
                 q_map,
                 r1=aperture1_opening[0]/2,
                 r2=aperture2_opening[0]/2,
-                collimation_distance=configuration.collimation.collimation_distance,
+                collimation_distance=collimation_distance,
                 distance=detector_distance,
                 wavelength_spread=wavelength_uncertainty,
                 wavelength=wavelength,
                 pixel_size=pixel_size,
             )
-        elif aperture_type == "slit":
+        elif (
+            aperture_type == "slit"
+            and aperture1_opening is not None
+            and aperture2_opening is not None
+            and collimation_distance is not None
+        ):
             q_error = compute_q_resolution_rectangular(
                 q_map,
                 x1=aperture1_opening[0],
                 y1=aperture1_opening[1],
                 x2=aperture2_opening[0],
                 y2=aperture2_opening[1],
-                collimation_distance=configuration.collimation.collimation_distance,
+                collimation_distance=collimation_distance,
                 distance=detector_distance,     
                 wavelength_spread=wavelength_uncertainty,
                 wavelength=wavelength,
@@ -762,6 +778,16 @@ def save_azimuthal_text_step(state: ReductionState) -> ReductionState:
 @dataclass(frozen=True)
 class ReductionPipeline:
     steps: tuple[ReductionStep, ...] = field(default_factory=tuple)
+
+    @classmethod
+    def with_processed_output(cls) -> "ReductionPipeline":
+        return cls(
+            steps=(
+                as_reduction_step(subtract_references_step),
+                as_reduction_step(normalization_step),
+                as_reduction_step(save_processed_detectors_step),
+            )
+        )
 
     @classmethod
     def with_azimuthal_text_output(cls) -> "ReductionPipeline":

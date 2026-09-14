@@ -334,7 +334,7 @@ def azimuthal_average(
             minlength=int(n_bins) + 1,
         )[1:]
         binned_q_error = np.full(int(n_bins), np.nan, dtype=np.float64)
-        binned_q_error[non_empty] = np.sqrt(q_variance_sum[non_empty]/ counts[non_empty]) 
+        binned_q_error[non_empty] = np.sqrt(q_variance_sum[non_empty]) / counts[non_empty]
     else:
         binned_q_error = None
 

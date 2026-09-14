@@ -194,72 +194,6 @@ def _cmd_convert(args: argparse.Namespace) -> int:
     return 0
 
 
-def _print_generated_files(outputs: dict[str, Path]) -> None:
-    if not outputs:
-        print("No files generated.")
-        return
-    for config_id, path in sorted(outputs.items()):
-        print(f"{config_id}: {path}")
-
-
-def _validate_generated_files(
-    outputs: dict[str, Path],
-    *,
-    schema_name: str,
-    strict: bool,
-) -> int:
-    status = 0
-    for config_id, path in sorted(outputs.items()):
-        print(f"\nValidating {config_id}: {path}")
-        status = max(
-            status,
-            _validate_file_for_cli(
-                path,
-                schema_name=schema_name,
-                strict=strict,
-            ),
-        )
-    return status
-
-
-def _cmd_reduce_2d(args: argparse.Namespace) -> int:
-    from scarlet.reduction import reduce_2d
-
-    try:
-        result = reduce_2d(
-            Path(args.sample_scattering),
-            Path(args.refs_sub),
-            sample_transmission=None if args.sample_transmission is None else Path(args.sample_transmission),
-            refs_norm=None if args.refs_norm is None else Path(args.refs_norm),
-            output_path=Path(args.output),
-            detector_index=args.detector,
-            normalize_by=args.normalize_by,
-            apply_mask=not args.no_mask,
-            overwrite=args.overwrite,
-            raw_entry=args.raw_entry,
-            processed_entry=args.processed_entry,
-            refs_entry=args.refs_entry,
-            azimuthal_bins=args.azimuthal_bins,
-            azimuthal_q_min=args.azimuthal_q_min,
-            azimuthal_q_max=args.azimuthal_q_max,
-        )
-    except (FileExistsError, FileNotFoundError, ValueError, OSError) as e:
-        print(str(e), file=sys.stderr)
-        return 2
-
-    print(f"Reduced file: {args.output}")
-    print(f"Sample transmission: {result.sample_transmission.value:.6g}")
-    if result.water_transmission is not None:
-        print(f"Water transmission: {result.water_transmission.value:.6g}")
-    if len(result.detector_indices) == 1:
-        print(f"Detector: detector{result.detector_index}")
-    else:
-        print("Detectors: " + ", ".join(f"detector{i}" for i in result.detector_indices))
-    print(f"Normalization: {result.normalize_by}")
-    print(f"Azimuthal bins: {result.azimuthal_results[result.primary_detector_index].q.size}")
-    return 0
-
-
 def _cmd_azimuthal_average(args: argparse.Namespace) -> int:
     detector_indices = None if args.detector is None else list(args.detector)
     try:
@@ -283,33 +217,6 @@ def _cmd_azimuthal_average(args: argparse.Namespace) -> int:
     print(f"Detectors: " + ", ".join(f"detector{i}" for i in result.detector_indices))
     print(f"Bins: {len(result.q)}")
     print(f"Q range: {result.q_edges[0]:.6g} .. {result.q_edges[-1]:.6g} A^-1")
-    return 0
-
-
-def _cmd_mask_gui(args: argparse.Namespace) -> int:
-    from scarlet.gui import run_mask_editor
-
-    try:
-        run_mask_editor(
-            None if args.file is None else Path(args.file),
-            output_file=None if args.output is None else Path(args.output),
-        )
-    except (FileNotFoundError, ValueError, OSError) as e:
-        print(str(e), file=sys.stderr)
-        return 2
-    return 0
-
-
-def _cmd_nxsas_gui(args: argparse.Namespace) -> int:
-    from scarlet.gui import run_nxsas_viewer
-
-    try:
-        run_nxsas_viewer(
-            None if args.directory is None else Path(args.directory),
-        )
-    except (FileNotFoundError, NotADirectoryError, ValueError, OSError) as e:
-        print(str(e), file=sys.stderr)
-        return 2
     return 0
 
 
@@ -380,67 +287,6 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--strict", action="store_true", help="Treat validation warnings as errors")
     c.set_defaults(func=_cmd_convert)
 
-    r2d = sub.add_parser(
-        "reduce-2d",
-        help="Run the first deterministic 2D reduction pass",
-    )
-    r2d.add_argument("sample_scattering", help="Converted SCARLET NXsas_raw sample scattering file")
-    r2d.add_argument("refs_sub", help="SCARLET refs_sub bundle for the sample configuration")
-    r2d.add_argument("output", help="Output NeXus/HDF5 file. The raw file is copied and /processed_data is added.")
-    r2d.add_argument(
-        "--sample-transmission",
-        default=None,
-        help="Converted SCARLET NXsas_raw sample transmission file. If omitted, T_sample=1 is assumed.",
-    )
-    r2d.add_argument(
-        "--refs-norm",
-        default=None,
-        help="Optional SCARLET refs_norm bundle used for water normalization",
-    )
-    r2d.add_argument("--detector", type=int, default=None, help="Detector index to reduce (default: all detectors)")
-    r2d.add_argument(
-        "--normalize-by",
-        choices=("monitor", "count_time", "none"),
-        default="monitor",
-        help="How detector images are normalized before subtraction (default: monitor)",
-    )
-    r2d.add_argument(
-        "--raw-entry",
-        default="/raw_data",
-        help="Raw-data NXentry in sample files (default: /raw_data; falls back to /entry if absent)",
-    )
-    r2d.add_argument(
-        "--processed-entry",
-        default="/processed_data",
-        help="NXentry used to store reduced data in the output file (default: /processed_data)",
-    )
-    r2d.add_argument(
-        "--refs-entry",
-        default="/entry",
-        help="NXentry used by refs_sub/refs_norm bundles (default: /entry)",
-    )
-    r2d.add_argument(
-        "--azimuthal-bins",
-        type=int,
-        default=200,
-        help="Number of azimuthal Q bins written per detector in /processed_data (default: 200)",
-    )
-    r2d.add_argument(
-        "--azimuthal-q-min",
-        type=float,
-        default=None,
-        help="Minimum Q in A^-1 used for stored azimuthal curves (default: auto from reduced detectors)",
-    )
-    r2d.add_argument(
-        "--azimuthal-q-max",
-        type=float,
-        default=None,
-        help="Maximum Q in A^-1 used for stored azimuthal curves (default: auto from reduced detectors)",
-    )
-    r2d.add_argument("--no-mask", action="store_true", help="Do not apply masks stored in the reference bundles")
-    r2d.add_argument("--overwrite", action="store_true", help="Overwrite existing output file or processed entry")
-    r2d.set_defaults(func=_cmd_reduce_2d)
-
     avg = sub.add_parser(
         "azimuthal-average",
         help="Export or merge azimuthal I(Q) curves from a reduced SCARLET file",
@@ -470,15 +316,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     avg.add_argument("--overwrite", action="store_true", help="Overwrite existing output CSV")
     avg.set_defaults(func=_cmd_azimuthal_average)
-
-    gui = sub.add_parser("mask-gui", help="Open the graphical mask editor for detector masks")
-    gui.add_argument("file", nargs="?", help="Optional input NeXus/HDF5 file to load at startup")
-    gui.add_argument("--output", default=None, help="Optional output NeXus/HDF5 mask bundle path")
-    gui.set_defaults(func=_cmd_mask_gui)
-
-    nxsas_gui = sub.add_parser("nxsas-gui", help="Open the graphical NXsas file viewer")
-    nxsas_gui.add_argument("directory", nargs="?", help="Optional data folder loaded at startup")
-    nxsas_gui.set_defaults(func=_cmd_nxsas_gui)
 
     viewer = sub.add_parser("viewer", help="Open the silx-based SCARLET viewer")
     viewer.add_argument("directory", nargs="?", help="Optional data folder loaded at startup")

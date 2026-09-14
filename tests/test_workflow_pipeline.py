@@ -10,7 +10,6 @@ import numpy as np
 
 from scarlet.reduction.geometry import compute_q_norm_map
 from scarlet.reduction.integration import azimuthal_average
-from scarlet.reduction.resolution import compute_q_uncertainty_map
 from scarlet.workflow.configuration import Configuration
 from scarlet.workflow.context import RunKey, WorkflowContext
 from scarlet.workflow.pipeline import (
@@ -107,7 +106,9 @@ class TestReductionPipelineFactories(unittest.TestCase):
             (
                 "subtract references",
                 "water normalization",
+                "normalize by thickness",
                 "azimuthal averaging",
+                "save processed detectors",
                 "save azimuthal text",
             ),
         )
@@ -268,13 +269,6 @@ class TestWorkflowPipeline(unittest.TestCase):
                 original_detector,
                 q_map,
                 mask=np.asarray([[0, 1], [0, 0]], dtype=np.uint8),
-                q_error=compute_q_uncertainty_map(
-                    original_detector.data.values,
-                    beam_center=(0.5, 0.5),
-                    detector_distance=4.2,
-                    pixel_size=(0.001, 0.001),
-                    wavelength=6.0,
-                ),
                 n_bins=state.azimuthal_n_bins,
                 q_scale=state.azimuthal_q_scale,
             ).to_data_array()
@@ -284,7 +278,8 @@ class TestWorkflowPipeline(unittest.TestCase):
             np.testing.assert_allclose(updated.detectors[0].coords["q"].values, expected.coords["q"].values)
             self.assertIsNone(updated.detectors[0].coords["q"].variances)
             self.assertIsNone(expected.coords["q"].variances)
-            np.testing.assert_allclose(updated.detectors[0].coords["q_error"].values, expected.coords["q_error"].values)
+            self.assertNotIn("q_error", updated.detectors[0].coords)
+            self.assertNotIn("q_error", expected.coords)
             np.testing.assert_array_equal(updated.detectors[0].coords["counts"].values, expected.coords["counts"].values)
             self.assertIn("Computed azimuthal average", " ".join(updated.notes))
 

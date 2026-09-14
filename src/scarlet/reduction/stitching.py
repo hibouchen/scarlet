@@ -1,61 +1,48 @@
-"""Public curve stitching API.
+"""Public curve stitching API."""
 
-This module re-exports the maintained stitching implementation so callers can
-use the correctly spelled ``scarlet.reduction.stitching`` path.
-"""
-
-from .stitchingbis import (
-    CommonResolutionOverlap,
-    DegradedCurve,
+from .stiching import (
+    CurveSegment,
     MultiStitchResult,
+    PairFit,
     SASCurve,
-    ScaleFit,
-    StitchedCurve,
-    StitchResult,
-    choose_retained_overlap,
-    common_resolution_overlap,
-    degrade_to_resolution,
-    fit_scale_factor,
-    overlap_bounds,
-    stitch_many,
-    stitch_pair,
+    SelectedSegment,
+    infer_ids_from_filename,
+    load_segment_from_nexus,
+    load_segments,
+    rebase_result_to_reference,
+    save_outputs,
+    stitch_segments_greedy,
 )
 
 for _export in (
-    CommonResolutionOverlap,
-    DegradedCurve,
+    CurveSegment,
     MultiStitchResult,
+    PairFit,
     SASCurve,
-    ScaleFit,
-    StitchedCurve,
-    StitchResult,
+    SelectedSegment,
 ):
     _export.__module__ = __name__
 
 for _export in (
-    choose_retained_overlap,
-    common_resolution_overlap,
-    degrade_to_resolution,
-    fit_scale_factor,
-    overlap_bounds,
-    stitch_many,
-    stitch_pair,
+    infer_ids_from_filename,
+    load_segment_from_nexus,
+    load_segments,
+    rebase_result_to_reference,
+    save_outputs,
+    stitch_segments_greedy,
 ):
     _export.__module__ = __name__
 
 __all__ = [
-    "CommonResolutionOverlap",
-    "DegradedCurve",
+    "CurveSegment",
     "MultiStitchResult",
+    "PairFit",
     "SASCurve",
-    "ScaleFit",
-    "StitchedCurve",
-    "StitchResult",
-    "choose_retained_overlap",
-    "common_resolution_overlap",
-    "degrade_to_resolution",
-    "fit_scale_factor",
-    "overlap_bounds",
-    "stitch_many",
-    "stitch_pair",
+    "SelectedSegment",
+    "infer_ids_from_filename",
+    "load_segment_from_nexus",
+    "load_segments",
+    "rebase_result_to_reference",
+    "save_outputs",
+    "stitch_segments_greedy",
 ]

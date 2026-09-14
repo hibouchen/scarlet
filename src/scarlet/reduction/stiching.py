@@ -317,7 +317,12 @@ def load_segment_from_nexus(
     entry_name: str = "processed",
 ) -> list[CurveSegment]:
     path = Path(path)
-    processed_data = read_processed_data(path, entry_name=entry_name)
+    try:
+        processed_data = read_processed_data(path, entry_name=entry_name)
+    except ValueError as exc:
+        if "Missing processed entry" not in str(exc):
+            raise
+        return []
     if processed_data is None:
         return []
 
@@ -1448,6 +1453,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-from .stitching import stitch_many, stitch_pair

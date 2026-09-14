@@ -10,6 +10,11 @@ The project follows a simple Semantic Versioning policy:
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-09-14
+
+- CLI: removed the `reduce-2d` command, which depended on the deprecated `refs_sub` / `refs_norm` bundle workflow.
+- CLI: removed the standalone `mask-gui` and `nxsas-gui` commands; use `scarlet viewer` for NeXus inspection and mask export.
+
 ## [0.2.3] - 2026-09-04
 
 - Feature: added a graphical `scarlet notebook` launcher to create a notebook from the packaged tutorial or open an existing `.ipynb` file before starting JupyterLab.

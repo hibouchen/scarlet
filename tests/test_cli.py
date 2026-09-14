@@ -22,6 +22,13 @@ class TestCli(unittest.TestCase):
         status = main(["convert", "unknown", "input.nxs", "output.nxs"])
         self.assertEqual(status, 2)
 
+    def test_removed_commands_are_not_registered(self) -> None:
+        for command in ("mask-gui", "nxsas-gui", "reduce-2d"):
+            with self.subTest(command=command):
+                with self.assertRaises(SystemExit) as raised:
+                    main([command])
+                self.assertEqual(raised.exception.code, 2)
+
     def test_azimuthal_average_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             reduced = Path(tmp) / "reduced.nxs"
@@ -47,13 +54,6 @@ class TestCli(unittest.TestCase):
             ])
             self.assertEqual(status, 0)
             self.assertTrue(output.exists())
-
-    def test_nxsas_gui_command_dispatches_viewer(self) -> None:
-        with mock.patch("scarlet.gui.run_nxsas_viewer") as run_nxsas_viewer:
-            status = main(["nxsas-gui", "tests/data/sam/raw_data"])
-
-        self.assertEqual(status, 0)
-        run_nxsas_viewer.assert_called_once_with(Path("tests/data/sam/raw_data"))
 
     def test_viewer_command_dispatches_silx_viewer(self) -> None:
         with mock.patch("scarlet.gui.run_viewer", return_value=0) as run_viewer:

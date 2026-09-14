@@ -2,7 +2,7 @@
 
 This file describes a **SCARLET mask bundle**, stored as one NeXus/HDF5 file.
 
-It is intended to save the detector masks drawn by a user in the graphical mask editor,
+It is intended to save the detector masks drawn by a user in the SCARLET viewer,
 together with a snapshot of the instrumental configuration inferred from the source NeXus file.
 
 This file contains:

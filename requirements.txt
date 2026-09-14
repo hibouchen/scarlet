@@ -5,6 +5,7 @@ numpy
 pandas
 PySide6
 PyYAML
+qtawesome
 pytest
 scipp
 scipy
