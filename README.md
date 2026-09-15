@@ -6,6 +6,8 @@
 
 SCARLET is a NeXus-native framework for SANS data workflows. It provides command-line tools and Python APIs for converting raw instrument files, validating SCARLET NeXus/HDF5 files, inspecting data, preparing masks, and running reduction helpers.
 
+Documentation: https://hibouchen.github.io/scarlet/
+
 The high-level workflow around reduced outputs is still evolving.
 
 ## Installation
