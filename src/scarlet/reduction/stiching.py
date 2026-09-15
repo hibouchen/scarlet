@@ -188,9 +188,9 @@ class CurveSegment:
         return self.curve.dq / self.curve.q
 
     def quality_score(self, *, resolution_weight: float = 1.0) -> float:
-        """Score de qualité intrinsèque.
+        """Intrinsic quality score.
 
-        Plus petit = meilleur.
+        Lower is better.
         """
         return float(np.nanmedian(
             self.rel_error**2
@@ -260,9 +260,9 @@ class MultiStitchResult:
 # =============================================================================
 
 def infer_ids_from_filename(path: str | Path) -> tuple[str, str, str]:
-    """Infère name, config_id et detector_id depuis un nom de fichier.
+    """Infer name, config_id, and detector_id from a file name.
 
-    Fonction volontairement tolérante. Exemple :
+    This function deliberately accepts a broad range of file names. For example:
         ludox_SM30_config_config_9_detector2.txt
         -> name='config9_detector2', config_id='config_9', detector_id='detector2'
     """
@@ -697,15 +697,15 @@ def stitch_segments_greedy(
     new_coverage_weight: float = 1.5,
     keep_fraction: float = 0.25,
 ) -> MultiStitchResult:
-    """Sélectionne une chaîne de segments utiles par algorithme glouton.
+    """Select a useful chain of segments with a greedy algorithm.
 
-    À chaque étape, on cherche le segment qui :
-        - se raccorde correctement au segment courant ;
-        - apporte une nouvelle gamme de Q ;
-        - a une bonne qualité intrinsèque.
+    At each step, the algorithm seeks a segment that:
+        - connects correctly to the current segment;
+        - adds a new Q range;
+        - has good intrinsic quality.
 
-    Ce n'est pas encore une optimisation globale de type graphe/Dijkstra,
-    mais c'est robuste et simple pour une première intégration SCARLET.
+    This is not yet a global graph or Dijkstra-style optimization, but it is
+    robust and straightforward for an initial SCARLET integration.
     """
 
     segments = sorted(segments, key=lambda s: (s.q_min, s.q_center))
@@ -1012,18 +1012,18 @@ def rebase_result_to_reference(
     reference_config: str | None = None,
     reference_detector: str | None = None,
 ) -> MultiStitchResult:
-    """Renormalise tous les facteurs globaux vers une référence choisie.
+    """Renormalize all global factors against a selected reference.
 
-    Si le segment de référence a initialement un facteur global G_ref, tous les
-    facteurs sont divisés par G_ref :
+    If the reference segment initially has global factor G_ref, every factor is
+    divided by G_ref:
 
         G_i,new = G_i / G_ref
 
-    Ainsi, le segment de référence a :
+    The reference segment then has:
 
         G_ref,new = 1
 
-    La courbe finale est elle aussi divisée par G_ref.
+    The final curve is divided by G_ref as well.
     """
 
     ref_item = choose_reference_selected_segment(

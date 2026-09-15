@@ -1,64 +1,64 @@
-# Format de données générique (base SCARLET)
+# Generic data format (SCARLET baseline)
 
-Objectif : définir un conteneur NeXus/HDF5 **proche de NXsas**, mais avec une description de **collimation** plus exploitable pour la réduction (multi-éléments, positions, ouvertures).
+The goal is to define a NeXus/HDF5 container that is **close to NXsas**, while providing a more usable **collimation** description for reduction: multiple elements, positions, and apertures.
 
-Ce document décrit une *convention SCARLET* (profil) : on conserve l’esprit de NXsas (`NXentry`, `instrument/`, `sample/`, `data/`) tout en ajoutant une modélisation de collimation plus riche.
+This document describes a SCARLET convention, or profile. It retains the NXsas structure (`NXentry`, `instrument/`, `sample/`, and `data/`) while adding a richer collimation model.
 
-## Conventions générales
+## General conventions
 
-- Origine : centre de l’échantillon
-- Axes : `+z` aval (downstream), `+x` horizontal (beam-right), `+y` vertical (up)
-- Les éléments en amont de l’échantillon ont une position `z < 0`
+- Origin: sample center.
+- Axes: `+z` downstream, `+x` horizontal (beam-right), `+y` vertical (up).
+- Elements upstream of the sample have `z < 0`.
 
-## Organisation minimale (profil “raw”)
+## Minimal organization (raw profile)
 
-Chemins (vue simplifiée) :
+Simplified paths:
 
 ```
 /raw_data (NXentry)
-  definition = "NXsas_raw"            # convention SCARLET pour les données brutes
+  definition = "NXsas_raw"            # SCARLET convention for raw data
   /sample (NXsample)
   /instrument (NXinstrument)
-    /geometry                         # groupe existant SCARLET (réservé)
-    /collimation (NXcollection)       # extension SCARLET (détaillée ci-dessous)
+    /geometry                          # Existing reserved SCARLET group
+    /collimation (NXcollection)        # SCARLET extension, detailed below
     /detector
-  /control (NXmonitor)   
+  /control (NXmonitor)
   /data
-    /data0/data              # image 2D brute (SCARLET v0.1)
+    /data0/data                        # Raw 2D image (SCARLET v0.1)
 ```
 
-Remarque : l’implémentation actuelle converge vers le profil `scarlet_nxsas_raw_v1.3_mono.yaml` : les données brutes sont stockées dans les groupes `NXdetector` (`/raw_data/instrument/detector0`, `/raw_data/instrument/detector1`, ...) et exposées via des groupes `NXdata` (`/raw_data/data0`, `/raw_data/data1`, ...) contenant des liens vers les détecteurs.
+The current implementation converges on the `scarlet_nxsas_raw_v1.3_mono.yaml` profile: raw data are stored in `NXdetector` groups (`/raw_data/instrument/detector0`, `/raw_data/instrument/detector1`, and so on) and exposed through `NXdata` groups (`/raw_data/data0`, `/raw_data/data1`, and so on) containing links to those detectors.
 
-## Collimation (extension SCARLET)
+## Collimation (SCARLET extension)
 
-Dans NXsas, la collimation est souvent résumée par un seul objet “collimator” (et/ou une longueur de collimation). Pour SANS, cela ne suffit pas : la réduction a besoin de connaître les **éléments successifs** (guides, diaphragmes/pinhole, slits, sollers, etc.), leurs **positions** et leurs **ouvertures**.
+In NXsas, collimation is often summarized as a single collimator object and/or a collimation length. For SANS, this is insufficient: reduction needs to know the successive elements, such as guides, diaphragms, pinholes, slits, and sollers, together with their positions and apertures.
 
-### Principe
+### Principle
 
-Créer un groupe :
+Create the following group:
 
 ```
 /raw_data/instrument/collimation (NXcollection)
 ```
 
-Il contient une suite d’éléments de collimation, chacun étant un groupe NeXus avec un `NX_class` parlant (par ex. `NXslit`, `NXpinhole`, `NXguide`, `NXcollimator`).
+It contains a sequence of collimation elements. Each element is a NeXus group with a meaningful `NX_class`, for example `NXslit`, `NXpinhole`, `NXguide`, or `NXcollimator`.
 
-### Exemple (arborescence)
+### Example tree
 
-Exemple typique SANS “2 slits + pinhole + guide” (noms libres) :
+A typical SANS setup with two slits, a pinhole, and a guide can be represented as follows. Group names are arbitrary.
 
 ```
 /raw_data/instrument/collimation (NXcollection)
   order = ["slit_1", "guide_1", "slit_2", "pinhole_1"]
 
   /slit_1 (NXslit)
-    distance = -8.0            # m (z par rapport au centre échantillon)
+    distance = -8.0            # m, relative to the sample center
     x_gap = 0.010              # m
     y_gap = 0.010              # m
 
   /guide_1 (NXguide)
     distance = -6.0            # m
-    # paramètres selon instrument (ex: section, revêtement, etc.)
+    # Instrument-specific parameters, such as cross section or coating
 
   /slit_2 (NXslit)
     distance = -2.5            # m
@@ -70,51 +70,51 @@ Exemple typique SANS “2 slits + pinhole + guide” (noms libres) :
     diameter = 0.008           # m
 ```
 
-Dans cet exemple :
+In this example:
 
-- tous les éléments sont **en amont** de l’échantillon (distances négatives),
-- l’ordre est explicité via `order` (optionnel) ; sinon, on peut reconstituer une séquence via le tri sur `distance`,
-- les champs d’ouverture (`x_gap`, `y_gap`, `diameter`) sont en mètres.
+- all elements are upstream of the sample, so their distances are negative;
+- the order is made explicit with the optional `order` dataset; otherwise it can be reconstructed by sorting on `distance`;
+- the aperture fields (`x_gap`, `y_gap`, and `diameter`) are expressed in meters.
 
-### Position des éléments
+### Element positions
 
-Pour rendre le format utilisable rapidement (sans exiger immédiatement une chaîne complète `NXtransformations`), SCARLET introduit la convention suivante :
+To make the format immediately usable without requiring a complete `NXtransformations` chain, SCARLET introduces the following convention:
 
-- Chaque élément de collimation **doit** contenir un champ scalaire `distance` (float) en mètres, représentant la position **le long de z** par rapport au centre échantillon.
-  - `distance < 0` : en amont (avant l’échantillon)
-  - `distance > 0` : en aval
+- Every collimation element **must** include a scalar floating-point `distance` field in meters. It represents the position along `z` relative to the sample center.
+  - `distance < 0`: upstream of the sample.
+  - `distance > 0`: downstream of the sample.
 
-Le champ `distance` est compatible avec une transition future vers `depends_on` / `NXtransformations` (qui sera la représentation la plus “NeXus-pure”).
+The `distance` field is compatible with a future move to `depends_on` and `NXtransformations`, the more NeXus-native representation.
 
-### Champs recommandés par type
+### Recommended fields by type
 
-Les champs exacts dépendent des instruments, mais on recommande :
+Exact fields depend on the instrument, but the following are recommended:
 
-- `NXslit` : `x_gap`, `y_gap` (en mètres) + `distance`
-- `NXpinhole` : `diameter` (mètres) + `distance`
-- `NXguide` : `state` ("in" | "out") + géométrie/section (selon vos besoins) + `distance`
-- `NXcollimator` : paramètres de soller/divergence (si disponible) + `distance`
+- `NXslit`: `x_gap`, `y_gap` in meters, plus `distance`.
+- `NXpinhole`: `diameter` in meters, plus `distance`.
+- `NXguide`: `state` (`"in"` or `"out"`), geometry or section as needed, plus `distance`.
+- `NXcollimator`: soller or divergence parameters when available, plus `distance`.
 
-### Ordre
+### Ordering
 
-L’ordre peut être :
+Ordering can be:
 
-- implicite via `distance` (tri croissant),
-- ou explicite via un dataset optionnel `order` dans `instrument/collimation` (liste de noms de groupes).
+- implicit through `distance`, sorted in ascending order; or
+- explicit through an optional `order` dataset in `instrument/collimation`, containing group names.
 
-### Exemple (création en h5py)
+### h5py creation example
 
-Extrait Python (création uniquement de la collimation) :
+The following Python excerpt creates the collimation structure only:
 
 ```python
 import h5py
 
-with h5py.File("mon_fichier.nxs", "a") as f:
+with h5py.File("my_file.nxs", "a") as f:
     inst = f["raw_data/instrument"]
     coll = inst.require_group("collimation")
     coll.attrs["NX_class"] = "NXcollection"
 
-    # Optionnel mais pratique pour figer la séquence
+    # Optional, but useful to preserve the sequence explicitly.
     coll.create_dataset("order", data=[b"slit_1", b"guide_1", b"slit_2", b"pinhole_1"])
 
     s1 = coll.require_group("slit_1")
@@ -140,16 +140,16 @@ with h5py.File("mon_fichier.nxs", "a") as f:
     p1.create_dataset("diameter", data=0.008).attrs["units"] = "m"
 ```
 
-## Produits de réduction dans le même fichier
+## Reduction products in the same file
 
-Objectif : écrire les résultats réduits sous forme d’une **nouvelle `NXentry`** dans le même fichier NeXus logique, afin de conserver ensemble les données brutes et les données traitées.
+The goal is to write reduced results as a **new `NXentry`** in the same logical NeXus file, keeping raw and processed data together.
 
-La commande de réduction haut niveau, par exemple `scarlet reduce`, n’est pas encore implémentée dans l’état actuel du dépôt. Les commandes disponibles couvrent aujourd’hui la conversion, la validation, la génération des lots de références `refs_sub` / `refs_norm`, et une première correction déterministe 2D via `scarlet reduce-2d`.
+The high-level reduction command, for example `scarlet reduce`, is not yet implemented in the current repository. Available commands currently cover conversion, validation, generation of `refs_sub` and `refs_norm` reference bundles, and an initial deterministic 2D correction through `scarlet reduce-2d`.
 
-La sortie de `scarlet reduce-2d` copie le fichier brut si nécessaire puis ajoute :
+When needed, `scarlet reduce-2d` copies the raw file and then adds:
 
 ```
-/raw_data (NXentry)   # présent pour les fichiers convertis récents
+/raw_data (NXentry)   # Present in recent converted files
   definition = "NXsas_raw"
   ...
 
@@ -157,36 +157,36 @@ La sortie de `scarlet reduce-2d` copie le fichier brut si nécessaire puis ajout
   definition = "SCARLET_azimuthal_iq"
   schema_version = "0.2"
   /data (NXdata)
-    # alias vers le premier détecteur réduit
+    # Alias to the first reduced detector
   /data0 (NXdata)
-    I                 # courbe azimutale 1D pour detector0
-    Q                 # centres des bins en 1/angstrom
-    Q_edges           # bords des bins
-    n_pixels          # nombre de pixels accumulés par bin
-  /data1 (NXdata)     # optionnel si detector1 existe
+    I                 # 1D azimuthal curve for detector0
+    Q                 # Bin centers in 1/angstrom
+    Q_edges           # Bin edges
+    n_pixels          # Number of accumulated pixels per bin
+  /data1 (NXdata)     # Optional when detector1 exists
     I
     Q
     Q_edges
     n_pixels
   /detector0 (NXcollection)
-    I_2d              # image 2D corrigée pour detector0
+    I_2d              # Corrected 2D image for detector0
     Qx
     Qy
     sample_corrected
-    water_corrected   # optionnel
-    mask              # optionnel, 1 = masqué
-  /detector1 (NXcollection)   # optionnel si detector1 existe
+    water_corrected   # Optional
+    mask              # Optional, 1 means masked
+  /detector1 (NXcollection)   # Optional when detector1 exists
     I_2d
     Qx
     Qy
     sample_corrected
-    water_corrected   # optionnel, si refs_norm est fourni
-    mask              # optionnel, 1 = masqué
+    water_corrected   # Optional when refs_norm is supplied
+    mask              # Optional, 1 means masked
   /reduction (NXprocess)
     /detector_indices
     /sample_transmission/value
-    /water_transmission/value   # optionnel
+    /water_transmission/value   # Optional
     /inputs/...
 ```
 
-Ce produit `SCARLET_azimuthal_iq` reste volontairement préliminaire : il ne contient pas encore de propagation d’incertitudes ni de fusion multi-détecteurs.
+The `SCARLET_azimuthal_iq` product remains deliberately preliminary: it does not yet include uncertainty propagation or multi-detector merging.

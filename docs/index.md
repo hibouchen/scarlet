@@ -1,17 +1,17 @@
 # SCARLET
 
-**SCA**ttering **R**eduction and ana**L**ysis **E**nvironmen**T** est un framework Python pour les workflows de reduction de donnees SANS. Il utilise le format NeXus/HDF5 comme format d'echange principal et fournit des outils en ligne de commande, une API Python et des interfaces graphiques d'inspection.
+**SCA**ttering **R**eduction and ana**L**ysis **E**nvironmen**T** is a Python framework for SANS data-reduction workflows. It uses NeXus/HDF5 as its primary exchange format and provides command-line tools, a Python API, and graphical inspection interfaces.
 
-## Ce que SCARLET permet de faire
+## What SCARLET does
 
-- convertir des fichiers instrumentaux vers le profil `NXsas_raw` de SCARLET ;
-- valider des fichiers NeXus/HDF5 avec les schemas fournis ;
-- preparer et inspecter des masques de detecteur ;
-- appliquer des briques de reduction, dont l'integration azimutale ;
-- exporter une courbe `I(Q)` depuis une sortie reduite ;
-- travailler dans un notebook Jupyter avec le tutoriel fourni.
+- Convert instrument files to the SCARLET `NXsas_raw` profile.
+- Validate NeXus/HDF5 files against the supplied schemas.
+- Prepare and inspect detector masks.
+- Apply reduction building blocks, including azimuthal integration.
+- Export an `I(Q)` curve from a reduced output.
+- Work in a Jupyter notebook using the supplied tutorial.
 
-## Demarrage rapide
+## Quick start
 
 ```bash
 git clone https://github.com/hibouchen/scarlet.git
@@ -22,8 +22,8 @@ pip install -e .
 scarlet --help
 ```
 
-Poursuivez avec la page [Installation](installation.md), puis le [tutoriel](tutorial.md).
+Continue with [Installation](installation.md), then the [tutorial](tutorial.md).
 
-## Statut
+## Status
 
-SCARLET est en cours de developpement. Certaines fonctions de reduction haut niveau evoluent encore ; consultez le [changelog du projet](https://github.com/hibouchen/scarlet/blob/main/CHANGELOG.md) avant de mettre a jour un workflow de production.
+SCARLET is under active development. Some high-level reduction functionality is still evolving; review the [project changelog](https://github.com/hibouchen/scarlet/blob/main/CHANGELOG.md) before updating a production workflow.

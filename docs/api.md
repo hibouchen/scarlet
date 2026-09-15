@@ -1,8 +1,8 @@
-# Reference API
+# API reference
 
-Cette page est generee depuis les modules Python publics de SCARLET. Les signatures affichent l'API de la version installee au moment de la construction du site.
+This page is generated from SCARLET's public Python modules. The signatures reflect the API version installed when the site is built.
 
-## Package principal
+## Main package
 
 ::: scarlet
 

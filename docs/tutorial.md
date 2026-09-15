@@ -1,34 +1,34 @@
-# Tutoriel Jupyter
+# Jupyter tutorial
 
-Le tutoriel embarque un exemple de prise en main des donnees et des outils SCARLET.
+The bundled tutorial provides a hands-on introduction to SCARLET data and tools.
 
-## Ouvrir le tutoriel
+## Open the tutorial
 
-Depuis une installation de SCARLET :
+From a SCARLET installation:
 
 ```bash
 scarlet notebook
 ```
 
-Cette commande ouvre le lanceur graphique et permet de creer une copie modifiable du notebook de tutoriel. Une destination peut aussi etre fournie pour une utilisation scriptable :
+This command opens the graphical launcher and lets you create an editable copy of the tutorial notebook. A destination can also be provided for scripted use:
 
 ```bash
 scarlet notebook tutorial_sessions
 ```
 
-L'entree directe suivante est equivalente :
+The following direct entry point is equivalent:
 
 ```bash
 scarlet-notebook
 ```
 
-## Principes de travail
+## Working principles
 
-Conservez les donnees experimentales hors du depot et travaillez sur des copies de notebook. Par convention, les exemples du projet utilisent cette organisation :
+Keep experimental data outside the repository and work on notebook copies. By convention, the project examples use this layout:
 
 ```text
 data/<instrument>/raw/
 data/<instrument>/processed/
 ```
 
-Le repertoire `data/` est ignore par Git pour eviter de versionner les fichiers bruts et les produits de reduction locaux.
+The `data/` directory is ignored by Git to avoid versioning raw files and local reduction outputs.

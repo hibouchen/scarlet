@@ -1,8 +1,8 @@
 # Installation
 
-SCARLET demande Python 3.11 ou une version plus recente.
+SCARLET requires Python 3.11 or later.
 
-## Installation depuis le depot
+## Install from the repository
 
 ```bash
 git clone https://github.com/hibouchen/scarlet.git
@@ -12,48 +12,48 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-Sous Windows, activez l'environnement avec :
+On Windows, activate the environment with:
 
 ```bat
 .venv\Scripts\activate.bat
 ```
 
-Verifiez ensuite l'installation :
+Then verify the installation:
 
 ```bash
 scarlet --help
 ```
 
-## Installation pour le developpement
+## Development installation
 
-Installez les dependances de test, puis executez la suite :
+Install the test dependencies and run the test suite:
 
 ```bash
 pip install -e .[dev]
 pytest -q
 ```
 
-## Construire cette documentation
+## Build this documentation
 
-Les outils de documentation sont optionnels et n'alourdissent pas l'installation utilisateur :
+The documentation tools are optional and do not affect a regular user installation:
 
 ```bash
 pip install -e .[docs]
 mkdocs serve
 ```
 
-Le serveur de previsualisation affiche l'adresse locale dans le terminal. Pour verifier un build sans servir le site :
+The preview server prints its local address in the terminal. To validate a build without serving the site:
 
 ```bash
 mkdocs build --strict
 ```
 
-## Installation isolee avec pipx
+## Isolated installation with pipx
 
-Pour installer uniquement les commandes dans un environnement dedie :
+To install the commands in a dedicated environment:
 
 ```bash
 pipx install git+https://github.com/hibouchen/scarlet.git
 ```
 
-Les executables `scarlet`, `scarlet-notebook` et `viewer` deviennent alors accessibles depuis le terminal.
+The `scarlet`, `scarlet-notebook`, and `viewer` executables are then available from the terminal.

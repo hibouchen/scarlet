@@ -1,6 +1,6 @@
-# Ligne de commande
+# Command line
 
-La commande principale est `scarlet`.
+The main command is `scarlet`.
 
 ```bash
 scarlet --help
@@ -8,30 +8,30 @@ scarlet --help
 
 ## Schemas
 
-Listez les schemas embarques :
+List the bundled schemas:
 
 ```bash
 scarlet schema list
 ```
 
-Validez un fichier NeXus/HDF5 :
+Validate a NeXus/HDF5 file:
 
 ```bash
 scarlet validate data/SANSLLB/processed/run_001_scarlet.nxs \
   --schema scarlet_nxsas_raw_v1.3_mono.yaml
 ```
 
-L'option `--strict` traite aussi les avertissements comme des erreurs. `--entry` permet de designer explicitement l'entree NeXus a valider.
+The `--strict` option treats warnings as errors. `--entry` explicitly selects the NeXus entry to validate.
 
 ## Conversion
 
-Affichez les convertisseurs disponibles :
+List available converters:
 
 ```bash
 scarlet convert list
 ```
 
-Convertissez un fichier brut et validez le resultat :
+Convert a raw file and validate the result:
 
 ```bash
 scarlet convert sansllb data/SANSLLB/raw/run_001.nxs \
@@ -40,24 +40,24 @@ scarlet convert sansllb data/SANSLLB/raw/run_001.nxs \
   --validate
 ```
 
-Les convertisseurs enregistres comprennent `d11`, `sansllb` et `sam`.
+Registered converters include `d11`, `sansllb`, and `sam`.
 
-## Integration azimutale
+## Azimuthal integration
 
-Exportez une courbe `I(Q)` depuis une sortie traitee :
+Export an `I(Q)` curve from a processed output:
 
 ```bash
 scarlet azimuthal-average reduced_2d.nxs iq.csv --overwrite
 ```
 
-Les options `--processed-entry`, `--detector`, `--q-min` et `--q-max` permettent de selectionner les donnees a exporter.
+Use `--processed-entry`, `--detector`, `--q-min`, and `--q-max` to select the data to export.
 
-## Visualiseur
+## Viewer
 
-Ouvrez le visualiseur NeXus et de masques :
+Open the NeXus and mask viewer:
 
 ```bash
 scarlet viewer data/SANSLLB/processed --instrument sansllb
 ```
 
-Pour les conversions temporaires effectuees par le visualiseur, les instruments pris en charge sont `sansllb` et `sam`.
+For temporary conversions performed by the viewer, the supported instruments are `sansllb` and `sam`.
