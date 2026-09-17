@@ -30,6 +30,9 @@ site/
 .codex
 .codex/
 
+# JupyterHub deployment secrets
+deployment/jupyterhub/.env
+
 # Local data (keep placeholders/docs if needed)
 data/**
 !data/**/README.md

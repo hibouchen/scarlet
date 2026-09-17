@@ -1,0 +1,40 @@
+name: scarlet-jupyterhub
+
+services:
+  hub:
+    build:
+      context: .
+    image: scarlet-jupyterhub:0.2.4
+    restart: unless-stopped
+    ports:
+      - "${JUPYTERHUB_BIND_IP:-127.0.0.1}:${JUPYTERHUB_PORT:-8000}:8000"
+    environment:
+      DOCKER_NETWORK_NAME: ${DOCKER_NETWORK_NAME:-scarlet-jupyterhub}
+      JUPYTERHUB_ADMIN_USERS: ${JUPYTERHUB_ADMIN_USERS:?Set at least one administrator}
+      JUPYTERHUB_ALLOWED_USERS: ${JUPYTERHUB_ALLOWED_USERS:?Set the allowed users}
+      JUPYTERHUB_AUTH_MODE: ${JUPYTERHUB_AUTH_MODE:-github}
+      JUPYTERHUB_COOKIE_SECRET: ${JUPYTERHUB_COOKIE_SECRET:?Generate a random secret}
+      JUPYTERHUB_DUMMY_PASSWORD: ${JUPYTERHUB_DUMMY_PASSWORD:-}
+      JUPYTERHUB_GITHUB_CLIENT_ID: ${JUPYTERHUB_GITHUB_CLIENT_ID:-}
+      JUPYTERHUB_GITHUB_CLIENT_SECRET: ${JUPYTERHUB_GITHUB_CLIENT_SECRET:-}
+      JUPYTERHUB_OAUTH_CALLBACK_URL: ${JUPYTERHUB_OAUTH_CALLBACK_URL:-}
+      SCARLET_NOTEBOOK_IMAGE: ${SCARLET_NOTEBOOK_IMAGE:-scarlet-notebook:0.2.4}
+      SCARLET_SHARED_DATA_DIR: ${SCARLET_SHARED_DATA_DIR:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - hub-data:/srv/jupyterhub
+
+  notebook-image:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: ${SCARLET_NOTEBOOK_IMAGE:-scarlet-notebook:0.2.4}
+    profiles: [build]
+    command: ["true"]
+
+volumes:
+  hub-data:
+
+networks:
+  default:
+    name: ${DOCKER_NETWORK_NAME:-scarlet-jupyterhub}

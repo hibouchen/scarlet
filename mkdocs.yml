@@ -52,4 +52,5 @@ nav:
       - Command line: cli.md
       - Data format: format.md
       - NeXus schemas: schemas.md
+      - Web platform: web-platform.md
   - API reference: api.md
