@@ -44,7 +44,11 @@ def _select_reference_run(
             key=f"{config_id}:{entity}:{mode}",
             count=len(matches),
         )
-    return matches[0]
+    key, _raw_path = matches[0]
+    prepared_path = workflow.prepare_run(key)
+    if prepared_path is None:
+        return None
+    return key, prepared_path
 
 
 def _require_reference_run(
@@ -75,8 +79,13 @@ def _compute_or_get_transmission(
             return float(cached)
 
     transmission_source_mode = workflow.get_transmission_source_mode()
-    empty_beam_path = workflow.get_empty_beam(config_id, transmission_source_mode)
+    empty_beam_path = workflow.prepare_reference("empty_beam", transmission_source_mode, config_id)
     roi = workflow.get_roi(config_id)
+    if empty_beam_path is not None and roi is None:
+        from scarlet.reduction.transmission import compute_transmission_roi
+
+        roi = compute_transmission_roi(empty_beam_path, detector_number=detector_number)
+        workflow.set_roi(config_id, roi)
     if empty_beam_path is None or roi is None:
         raise ValueError(
             "Cannot compute transmission without empty-beam "
@@ -407,13 +416,13 @@ def build_water_flatfield_from_workflow_context(
         normalize_by_monitor=True,
         correct_deadtime=True,
     )
-    dark_path = workflow.get_dark(source_config_id)
+    dark_path = workflow.prepare_reference("dark", "scattering", source_config_id)
     dark = (
         nexus_reader.read_all_detectors(dark_path, normalize_by_monitor=True, correct_deadtime=True)
         if dark_path is not None
         else None
     )
-    empty_cell_path = workflow.get_empty_cell(source_config_id, "scattering")
+    empty_cell_path = workflow.prepare_reference("empty_cell", "scattering", source_config_id)
     empty_cell = (
         nexus_reader.read_all_detectors(empty_cell_path, normalize_by_monitor=True, correct_deadtime=True)
         if empty_cell_path is not None
@@ -433,7 +442,9 @@ def build_water_flatfield_from_workflow_context(
             mode=transmission_source_mode,
         )
         if selected is None:
-            water_transmission_path = workflow.get_water(transmission_config_id, transmission_source_mode)
+            water_transmission_path = workflow.prepare_reference(
+                "water", transmission_source_mode, transmission_config_id
+            )
             water_transmission_sample_name = water_scattering_key.sample_name
         else:
             water_transmission_key, water_transmission_path = selected

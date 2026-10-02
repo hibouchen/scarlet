@@ -11,6 +11,7 @@ from .configuration import (
 )
 from .context import (
     Artifact,
+    ExcludedFile,
     Issue,
     LogMessage,
     RunKey,
@@ -28,6 +29,7 @@ __all__ = [
     "ConfigTolerance",
     "Configuration",
     "Artifact",
+    "ExcludedFile",
     "Issue",
     "LogMessage",
     "RunKey",

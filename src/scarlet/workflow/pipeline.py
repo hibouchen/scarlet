@@ -39,14 +39,13 @@ class ReductionState:
     file_path: str = field(default_factory=str)
 
     def __post_init__(self):
-        file_path = self.workflow.get_run_path(
-            RunKey(
-                config_id=self.config_id,
-                entity="sample",
-                mode="scattering",
-                sample_name=self.sample_name,
-            )
+        run_key = RunKey(
+            config_id=self.config_id,
+            entity="sample",
+            mode="scattering",
+            sample_name=self.sample_name,
         )
+        file_path = self.workflow.prepare_run(run_key)
         if file_path:
             self.detectors = nexus_reader.read_all_detectors(
                 file_path,
@@ -56,7 +55,15 @@ class ReductionState:
             self.file_path = str(file_path)
             self.notes.append("Loaded data corrected by the deadtime and the monitor")
         if not self.transmission:
-            self.transmission = self.workflow.get_transmission(sample_name=self.sample_name, config_id=self.config_id)
+            cached_transmission = self.workflow.get_transmission(
+                sample_name=self.sample_name,
+                config_id=self.config_id,
+            )
+            if cached_transmission is None and file_path is not None:
+                cached_transmission = self.workflow.compute_transmission_for_run(run_key)
+            if cached_transmission is not None:
+                self.transmission = cached_transmission
+
 
 def _require_scipp():
     try:
@@ -552,7 +559,7 @@ def as_reduction_step(fn: StepFunction) -> ReductionStep:
 @reduction_step("subtract references")
 def subtract_references_step(state: ReductionState) -> ReductionState:
     dark_data_dict: dict[int, Any] = {}
-    dark_file = state.workflow.get_dark(state.config_id)
+    dark_file = state.workflow.prepare_reference("dark", "scattering", state.config_id)
     if dark_file:
         dark_data_dict = nexus_reader.read_all_detectors(dark_file, normalize_by_monitor=True, correct_deadtime=True)
     else:
@@ -560,9 +567,17 @@ def subtract_references_step(state: ReductionState) -> ReductionState:
             dark_data_dict[key] = None
 
     ec_data_dict: dict[int, Any] = {}
-    ec_file = state.workflow.get_empty_cell(state.config_id, "scattering")
+    ec_file = state.workflow.prepare_reference("empty_cell", "scattering", state.config_id)
     if ec_file:
         tr_ec = state.workflow.get_empty_cell_transmission(state.config_id)
+        if tr_ec is None:
+            for empty_cell_key, _path in state.workflow.iter_runs(
+                config_id=state.config_id,
+                entity="empty_cell",
+                mode="scattering",
+            ):
+                tr_ec = state.workflow.compute_transmission_for_run(empty_cell_key)
+                break
         ec_data_dict = nexus_reader.read_all_detectors(ec_file, normalize_by_monitor=True, correct_deadtime=True)
     else:
         tr_ec = None
@@ -879,7 +894,7 @@ class StichingPipeline():
         config = self.workflow.configurations
         segments = []
         for config_id in config:
-            file_path = self.workflow.get_run_path(RunKey(
+            file_path = self.workflow.prepare_run(RunKey(
                 config_id=config_id,
                 entity="sample",
                 mode="scattering",

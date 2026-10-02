@@ -263,6 +263,18 @@ nodes:
         - kind
         - created_utc
 
+  - path: /entry/excluded_files
+    kind: group
+    required: false
+    rules:
+      required_datasets:
+        - path
+        - reason
+        - source
+        - run_key
+        - action
+        - when_utc
+
   - path: /entry/logs
     kind: group
     required: true

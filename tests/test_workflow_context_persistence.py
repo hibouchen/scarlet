@@ -77,6 +77,25 @@ class TestWorkflowContextPersistence(unittest.TestCase):
             ctx.stale_flatfields.add("config_3")
             ctx.info("workflow created", where="test_save", step="setup")
             ctx.warn("reference missing", where="test_save", key="config_2", entity="water")
+            ignored_path = raw_dir / "notes.txt"
+            restored_path = raw_dir / "restored.hdf"
+            ctx.exclude_file(
+                ignored_path,
+                reason="Non-HDF5 input file",
+                source="directory_scan",
+            )
+            ctx.exclude_file(
+                restored_path,
+                reason="Removed from runs table CSV",
+                source="runs_table",
+                run_key="config_1:sample:scattering:restored",
+            )
+            ctx.reinstate_file(
+                restored_path,
+                reason="Added back by the user",
+                source="manual",
+                run_key="config_1:sample:scattering:restored",
+            )
             ctx.timings["initialize"] = 0.42
             ctx.add_artifact("sample_a.nxs", sample_path, kind="nexus")
             ctx.set("converted_data_dir", out_dir)
@@ -122,6 +141,10 @@ class TestWorkflowContextPersistence(unittest.TestCase):
             self.assertTrue(any(artifact.kind == "workflow_context" for artifact in loaded.artifacts))
             self.assertTrue(any(log.message == "workflow created" for log in loaded.logs))
             self.assertTrue(any(issue.message == "reference missing" for issue in loaded.issues))
+            self.assertEqual([event.action for event in loaded.excluded_files], ["excluded", "excluded", "reinstated"])
+            self.assertEqual([event.path for event in loaded.active_excluded_files()], [ignored_path.resolve()])
+            self.assertFalse(loaded.is_file_excluded(restored_path))
+            self.assertEqual(len(loaded.excluded_files_table(include_history=True).rows), 3)
 
     def test_load_converts_legacy_meter_sample_thicknesses_to_mm(self) -> None:
         with tempfile.TemporaryDirectory() as td:

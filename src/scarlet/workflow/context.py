@@ -21,6 +21,8 @@ from scarlet.reduction.transmission import (
 
 # Log levels used by the workflow during execution.
 Level = Literal["INFO", "WARN", "ERROR"]
+# Actions stored in the append-only file exclusion history.
+ExclusionAction = Literal["excluded", "reinstated"]
 # Run acquisition modes.
 Mode = Literal["scattering", "transmission"]
 # Workflow-level transmission computation strategy.
@@ -68,6 +70,16 @@ def _normalize_transmission_strategy(value: TransmissionStrategy | str) -> Trans
     return strategy
 
 
+def _normalize_top_level_entry_name(value: str) -> str:
+    """Normalize and validate the name of one top-level HDF5 entry."""
+    normalized = str(value).strip().strip("/")
+    if not normalized:
+        raise ValueError("entry_name must not be empty")
+    if "/" in normalized:
+        raise ValueError(f"entry_name must be a top-level entry name, got {value!r}")
+    return normalized
+
+
 @dataclass(frozen=True)
 class RunKey:
     """Logical identifier for one workflow run."""
@@ -95,6 +107,18 @@ class Artifact:
     path: Path
     kind: str = "file"
     created_utc: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+@dataclass(frozen=True)
+class ExcludedFile:
+    """One event in the append-only history of files excluded from the context."""
+
+    path: Path
+    reason: str
+    source: str
+    run_key: Optional[str] = None
+    action: ExclusionAction = "excluded"
+    when_utc: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 @dataclass
@@ -205,6 +229,7 @@ class WorkflowContext:
     logs: list[LogMessage] = field(default_factory=list)
     issues: list[Issue] = field(default_factory=list)
     artifacts: list[Artifact] = field(default_factory=list)
+    excluded_files: list[ExcludedFile] = field(default_factory=list)
     timings: Dict[str, float] = field(default_factory=dict)
 
     def _resolve_path(self, file_path: Path) -> Path:
@@ -244,11 +269,127 @@ class WorkflowContext:
         stored_key = self._allocate_run_key(key)
         self.runs[stored_key] = resolved_path
         self._sync_reference_store(stored_key, resolved_path)
+        self.reinstate_file(
+            resolved_path,
+            reason="Registered in workflow context",
+            source="add_run",
+            run_key=stored_key.short(),
+        )
         return stored_key
 
     def get_run_path(self, key: RunKey) -> Optional[Path]:
-        """Return the registered path for a run key, or ``None`` when missing."""
+        """Return the registered raw path for a run key, or ``None`` when missing."""
         return self.runs.get(key)
+
+    def refresh_runs(self, *, include_excluded: bool = False) -> WorkflowContext:
+        """Rescan ``root_dir`` and register new raw runs without converting them.
+
+        Files excluded manually or through the runs table remain excluded by
+        default. Pass ``include_excluded=True`` to reconsider them. Files that
+        were rejected by an earlier directory scan are always reconsidered so
+        that a repaired or completed acquisition can become a run.
+
+        Existing runs are preserved, including entries whose files have since
+        disappeared from disk.
+        """
+        input_dir = self.root_dir.resolve()
+        if not input_dir.is_dir():
+            raise NotADirectoryError(f"Workflow raw directory not found: {input_dir}")
+
+        previous_paths = {path.resolve() for path in self.runs.values()}
+        _ingest_raw_directory_into_workflow_context(
+            self,
+            input_dir=input_dir,
+            output_dir=self.output_dir.resolve(),
+            instrument_name=self.instrument_name,
+            overwrite=bool(self.store.get("conversion_overwrite", False)),
+            where="refresh_runs",
+            allow_empty=True,
+            respect_exclusions=not include_excluded,
+        )
+        current_paths = {path.resolve() for path in self.runs.values()}
+        self.info(
+            "Workflow run list refreshed",
+            where="refresh_runs",
+            input_dir=str(input_dir),
+            added_count=len(current_paths.difference(previous_paths)),
+            run_count=len(self.runs),
+        )
+        return self
+
+    def _converted_path_for_run(self, raw_path: Path) -> Path:
+        """Return the deterministic pipeline cache path for one raw run."""
+        raw_path = raw_path.resolve()
+        try:
+            filename = _flattened_nxsas_name(self.root_dir.resolve(), raw_path)
+        except ValueError:
+            filename = f"{raw_path.stem}.nxs"
+        return (self.output_dir / filename).resolve()
+
+    def prepare_run(self, key: RunKey) -> Optional[Path]:
+        """Return a pipeline-ready path, converting the registered raw run on demand."""
+        raw_path = self.get_run_path(key)
+        if raw_path is None:
+            return None
+
+        from scarlet.io.raw_inspection import is_pipeline_ready_nexus
+
+        if is_pipeline_ready_nexus(raw_path):
+            return raw_path
+
+        instrument_name = self.instrument_name.strip()
+        if not instrument_name or instrument_name.lower() == "unknown":
+            raise ValueError(
+                f"Cannot convert raw run {raw_path}: workflow instrument_name is not configured"
+            )
+
+        converted_paths = self.store.setdefault("converted_run_paths", {})
+        if not isinstance(converted_paths, dict):
+            converted_paths = {}
+            self.store["converted_run_paths"] = converted_paths
+        cached_value = converted_paths.get(str(raw_path))
+        if cached_value is not None:
+            cached_path = Path(cached_value).resolve()
+            if cached_path.exists():
+                return cached_path
+
+        from scarlet.io.converters import convert_to_scarlet_nxsas_raw
+        from scarlet.workflow.configuration import configuration_from_nexus
+
+        converted_path = self._converted_path_for_run(raw_path)
+        converted_path.parent.mkdir(parents=True, exist_ok=True)
+        overwrite = bool(self.store.get("conversion_overwrite", False))
+        if not converted_path.exists() or overwrite:
+            convert_to_scarlet_nxsas_raw(
+                instrument_name,
+                raw_path,
+                converted_path,
+                overwrite=converted_path.exists(),
+            )
+
+        converted_paths[str(raw_path)] = str(converted_path)
+        if not any(artifact.path.resolve() == converted_path for artifact in self.artifacts):
+            self.add_artifact(converted_path.name, converted_path, kind="nexus")
+
+        configuration, issues = configuration_from_nexus(converted_path)
+        for issue in issues:
+            self.warn(issue, where="configuration_from_nexus", key=str(converted_path))
+        self.configurations[key.config_id] = replace(configuration, config_id=key.config_id)
+        self.log(
+            "INFO",
+            "Converted raw run for pipeline",
+            where="prepare_run",
+            key=key.short(),
+            raw_path=str(raw_path),
+            converted_path=str(converted_path),
+        )
+        return converted_path
+
+    def prepare_reference(self, entity: Entity, mode: Mode, config_id: str) -> Optional[Path]:
+        """Prepare the first matching reference run for pipeline consumption."""
+        for key, _path in self.iter_runs(config_id=config_id, entity=entity, mode=mode):
+            return self.prepare_run(key)
+        return None
 
     def iter_runs(
         self,
@@ -278,6 +419,92 @@ class WorkflowContext:
             rows=_runs_rows(self),
         )
 
+    def get_run_nexus_path(self, key: RunKey) -> Optional[Path]:
+        """Return the NeXus file associated with a run without converting it."""
+        raw_path = self.get_run_path(key)
+        if raw_path is None:
+            return None
+
+        converted_paths = self.store.get("converted_run_paths", {})
+        if isinstance(converted_paths, dict):
+            cached_path = converted_paths.get(str(raw_path.resolve()))
+            if cached_path is not None:
+                return Path(cached_path).resolve()
+
+        from scarlet.io.raw_inspection import is_pipeline_ready_nexus
+
+        if is_pipeline_ready_nexus(raw_path):
+            return raw_path.resolve()
+        return self._converted_path_for_run(raw_path)
+
+    def _run_processing_status(
+        self,
+        key: RunKey,
+        *,
+        entry_name: str,
+    ) -> tuple[str, Optional[Path]]:
+        """Return the on-disk processing status and associated NeXus path."""
+        nexus_path = self.get_run_nexus_path(key)
+        if nexus_path is None or not nexus_path.exists():
+            return "missing", nexus_path
+        try:
+            with h5py.File(nexus_path, "r") as handle:
+                entry = handle.get(entry_name)
+                if isinstance(entry, h5py.Group):
+                    return "processed", nexus_path
+                return "unprocessed", nexus_path
+        except OSError:
+            return "unreadable", nexus_path
+
+    def is_run_processed(self, key: RunKey, *, entry_name: str = "processed") -> bool:
+        """Return whether the run's NeXus file contains the requested processed entry."""
+        normalized_entry = _normalize_top_level_entry_name(entry_name)
+        status, _ = self._run_processing_status(key, entry_name=normalized_entry)
+        return status == "processed"
+
+    def runs_status_table(self, *, entry_name: str = "processed") -> TableView:
+        """Inspect the NeXus files and return the current processing status of every run."""
+        normalized_entry = _normalize_top_level_entry_name(entry_name)
+        rows: list[dict[str, str]] = []
+        for key, raw_path in self.runs.items():
+            status, nexus_path = self._run_processing_status(
+                key,
+                entry_name=normalized_entry,
+            )
+            rows.append(
+                {
+                    "run_key": key.short(),
+                    "sample_name": key.sample_name or "",
+                    "config_id": key.config_id,
+                    "mode": key.mode,
+                    "entity": key.entity,
+                    "status": status,
+                    "nexus_path": "" if nexus_path is None else str(nexus_path),
+                    "raw_path": str(raw_path),
+                }
+            )
+        return TableView(
+            columns=(
+                "run_key",
+                "sample_name",
+                "config_id",
+                "mode",
+                "entity",
+                "status",
+                "nexus_path",
+                "raw_path",
+            ),
+            rows=rows,
+        )
+
+    def processed_runs_table(self, *, entry_name: str = "processed") -> TableView:
+        """Return a live table containing only runs whose NeXus file is processed."""
+        status_table = self.runs_status_table(entry_name=entry_name)
+        return TableView(
+            columns=status_table.columns,
+            rows=[row for row in status_table.rows if row["status"] == "processed"],
+        )
+
     def configurations_table(self) -> TableView:
         """Return a notebook-friendly table view of configuration parameters."""
         return TableView(
@@ -292,6 +519,118 @@ class WorkflowContext:
                 "notes",
             ),
             rows=_configuration_rows(self),
+        )
+
+    def _latest_file_exclusion_events(self) -> dict[Path, tuple[int, ExcludedFile]]:
+        """Return the latest exclusion-history event for each normalized path."""
+        latest: dict[Path, tuple[int, ExcludedFile]] = {}
+        for index, event in enumerate(self.excluded_files):
+            latest[event.path.resolve()] = (index, event)
+        return latest
+
+    def is_file_excluded(self, file_path: str | Path) -> bool:
+        """Return whether a file is currently excluded from the workflow context."""
+        return self.get_active_file_exclusion(file_path) is not None
+
+    def get_active_file_exclusion(self, file_path: str | Path) -> Optional[ExcludedFile]:
+        """Return the current exclusion event for a file, if it is excluded."""
+        latest = self._latest_file_exclusion_events().get(self._resolve_path(Path(file_path)))
+        if latest is None or latest[1].action != "excluded":
+            return None
+        return latest[1]
+
+    def exclude_file(
+        self,
+        file_path: str | Path,
+        *,
+        reason: str,
+        source: str,
+        run_key: str | RunKey | None = None,
+    ) -> ExcludedFile:
+        """Append an exclusion event and return it, avoiding exact duplicates."""
+        resolved_path = self._resolve_path(Path(file_path))
+        run_key_text = run_key.short() if isinstance(run_key, RunKey) else run_key
+        latest = self._latest_file_exclusion_events().get(resolved_path)
+        if latest is not None:
+            previous = latest[1]
+            if (
+                previous.action == "excluded"
+                and previous.reason == reason
+                and previous.source == source
+                and previous.run_key == run_key_text
+            ):
+                return previous
+
+        event = ExcludedFile(
+            path=resolved_path,
+            reason=reason,
+            source=source,
+            run_key=run_key_text,
+            action="excluded",
+        )
+        self.excluded_files.append(event)
+        self.info(
+            "File excluded from workflow context",
+            where="exclude_file",
+            file_path=str(resolved_path),
+            reason=reason,
+            source=source,
+            run_key=run_key_text,
+        )
+        return event
+
+    def reinstate_file(
+        self,
+        file_path: str | Path,
+        *,
+        reason: str = "File restored to workflow context",
+        source: str = "manual",
+        run_key: str | RunKey | None = None,
+    ) -> Optional[ExcludedFile]:
+        """Append a reinstatement event when a file is currently excluded."""
+        resolved_path = self._resolve_path(Path(file_path))
+        if not self.is_file_excluded(resolved_path):
+            return None
+        run_key_text = run_key.short() if isinstance(run_key, RunKey) else run_key
+        event = ExcludedFile(
+            path=resolved_path,
+            reason=reason,
+            source=source,
+            run_key=run_key_text,
+            action="reinstated",
+        )
+        self.excluded_files.append(event)
+        self.info(
+            "File restored to workflow context",
+            where="reinstate_file",
+            file_path=str(resolved_path),
+            reason=reason,
+            source=source,
+            run_key=run_key_text,
+        )
+        return event
+
+    def active_excluded_files(self) -> list[ExcludedFile]:
+        """Return the latest event for every file that is currently excluded."""
+        latest = self._latest_file_exclusion_events().values()
+        return [event for _, event in sorted(latest) if event.action == "excluded"]
+
+    def excluded_files_table(self, *, include_history: bool = False) -> TableView:
+        """Return a notebook-friendly view of active exclusions or their full history."""
+        events = self.excluded_files if include_history else self.active_excluded_files()
+        return TableView(
+            columns=("action", "file_path", "reason", "source", "run_key", "when_utc"),
+            rows=[
+                {
+                    "action": event.action,
+                    "file_path": str(event.path),
+                    "reason": event.reason,
+                    "source": event.source,
+                    "run_key": event.run_key or "",
+                    "when_utc": event.when_utc,
+                }
+                for event in events
+            ],
         )
 
     def write_runs_table_csv(self, file_path: str | Path, *, overwrite: bool = False) -> Path:
@@ -313,7 +652,7 @@ class WorkflowContext:
 
     def update_from_runs_table_csv(self, file_path: str | Path | None = None) -> WorkflowContext:
         """Update the workflow context from a CSV previously exported from runs_table()."""
-        from scarlet.workflow.configuration import configuration_from_nexus
+        from scarlet.io.raw_inspection import inspect_raw_run
 
         if file_path is None:
             file_path = self.get("runs_table_csv")
@@ -324,6 +663,7 @@ class WorkflowContext:
         if not csv_path.exists():
             raise FileNotFoundError(f"Runs table CSV not found: {csv_path}")
 
+        previous_runs = dict(self.runs)
         existing_by_name: dict[str, Path] = {}
         ambiguous_names: set[str] = set()
         for existing_path in self.runs.values():
@@ -431,14 +771,25 @@ class WorkflowContext:
                     rebuilt_empty_cell_transmissions[config_id] = transmission
 
             if config_id not in rebuilt_configurations:
-                configuration, issues = configuration_from_nexus(file_path)
-                for issue in issues:
-                    self.warn(issue, where="configuration_from_nexus", key=str(file_path))
+                configuration = inspect_raw_run(self.instrument_name, file_path).configuration
                 try:
                     configuration = replace(configuration, config_id=config_id)
                 except TypeError:
                     pass
                 rebuilt_configurations[config_id] = configuration
+
+        rebuilt_paths = {path.resolve() for path in rebuilt_runs.values()}
+        previous_paths: dict[Path, RunKey] = {}
+        for run_key, path in previous_runs.items():
+            previous_paths.setdefault(path.resolve(), run_key)
+        for removed_path, run_key in previous_paths.items():
+            if removed_path not in rebuilt_paths:
+                self.exclude_file(
+                    removed_path,
+                    reason="Removed from runs table CSV",
+                    source="runs_table",
+                    run_key=run_key,
+                )
 
         self.runs.clear()
         self.configurations.clear()
@@ -657,6 +1008,39 @@ class WorkflowContext:
                 artifacts_group,
                 "created_utc",
                 [artifact.created_utc for artifact in self.artifacts],
+            )
+
+            excluded_files_group = entry.create_group("excluded_files")
+            excluded_files_group.attrs["NX_class"] = np.bytes_("NXcollection")
+            _write_string_array_dataset(
+                excluded_files_group,
+                "path",
+                [str(event.path) for event in self.excluded_files],
+            )
+            _write_string_array_dataset(
+                excluded_files_group,
+                "reason",
+                [event.reason for event in self.excluded_files],
+            )
+            _write_string_array_dataset(
+                excluded_files_group,
+                "source",
+                [event.source for event in self.excluded_files],
+            )
+            _write_string_array_dataset(
+                excluded_files_group,
+                "run_key",
+                [event.run_key or "" for event in self.excluded_files],
+            )
+            _write_string_array_dataset(
+                excluded_files_group,
+                "action",
+                [event.action for event in self.excluded_files],
+            )
+            _write_string_array_dataset(
+                excluded_files_group,
+                "when_utc",
+                [event.when_utc for event in self.excluded_files],
             )
 
             logs_group = entry.create_group("logs")
@@ -959,6 +1343,40 @@ class WorkflowContext:
                             path=_resolve_loaded_path(paths[row_index], base_dir=base_dir),
                             kind=kinds[row_index],
                             created_utc=created_values[row_index],
+                        )
+                    )
+
+            excluded_files_group = entry.get("excluded_files")
+            if isinstance(excluded_files_group, h5py.Group):
+                paths = _read_text_array_dataset(excluded_files_group, "path")
+                reasons = _read_text_array_dataset(excluded_files_group, "reason")
+                sources = _read_text_array_dataset(excluded_files_group, "source")
+                run_keys = _read_text_array_dataset(excluded_files_group, "run_key")
+                actions = _read_text_array_dataset(excluded_files_group, "action")
+                when_values = _read_text_array_dataset(excluded_files_group, "when_utc")
+                row_count = _require_parallel_lengths(
+                    "/entry/excluded_files",
+                    path=paths,
+                    reason=reasons,
+                    source=sources,
+                    run_key=run_keys,
+                    action=actions,
+                    when_utc=when_values,
+                )
+                for row_index in range(row_count):
+                    action = actions[row_index].strip()
+                    if action not in {"excluded", "reinstated"}:
+                        raise ValueError(
+                            f"Invalid exclusion action at /entry/excluded_files/action[{row_index}]: {action!r}"
+                        )
+                    ctx.excluded_files.append(
+                        ExcludedFile(
+                            path=_resolve_loaded_path(paths[row_index], base_dir=base_dir),
+                            reason=reasons[row_index],
+                            source=sources[row_index],
+                            run_key=run_keys[row_index] or None,
+                            action=cast(ExclusionAction, action),
+                            when_utc=when_values[row_index],
                         )
                     )
 
@@ -1442,34 +1860,93 @@ class WorkflowContext:
         )
 
     def compute_transmissions(self, *, detector_number: int = 0) -> TransmissionValues:
-        """Compute transmissions for sample and empty-cell transmission runs."""
+        """Compute transmissions already ready as NeXus and defer raw runs to the pipeline."""
+        from scarlet.io.raw_inspection import is_pipeline_ready_nexus
+
         source_mode = self.get_transmission_source_mode()
+        deferred_count = 0
         for entity in ("sample", "empty_cell", "water"):
-            for key, path in self.iter_runs(entity=cast(Entity, entity), mode=source_mode):
+            for key, raw_path in list(self.iter_runs(entity=cast(Entity, entity), mode=source_mode)):
                 if key.sample_name is None:
                     continue
-                empty_beam_path = self.get_empty_beam(key.config_id, source_mode)
-                roi = self.get_roi(key.config_id)
-                if empty_beam_path is None or roi is None:
-                    self.warn(
-                        "Skipping transmission computation because prerequisites are missing",
-                        where="compute_transmissions",
-                        key=key.short(),
-                        missing_empty_beam=empty_beam_path is None,
-                        missing_roi=roi is None,
-                        transmission_source_mode=source_mode,
-                    )
+                source_config_id = self.resolve_transmission_config(key.config_id)
+                empty_beam_path = self.get_empty_beam(source_config_id, source_mode)
+                if (
+                    not is_pipeline_ready_nexus(raw_path)
+                    or empty_beam_path is None
+                    or not is_pipeline_ready_nexus(empty_beam_path)
+                ):
+                    deferred_count += 1
                     continue
-                value = compute_transmission(
-                    path,
-                    empty_beam_path,
-                    roi,
-                    detector_number=detector_number,
-                )
-                self.set_transmission(key.sample_name, key.config_id, value)
-                if key.entity == "empty_cell":
-                    self.set_empty_cell_transmission(key.config_id, value)
+                self.compute_transmission_for_run(key, detector_number=detector_number)
+        if deferred_count:
+            self.log(
+                "INFO",
+                "Deferred raw-run transmission calculations until pipeline execution",
+                where="compute_transmissions",
+                count=deferred_count,
+            )
         return dict(self.transmissions)
+
+    def compute_transmission_for_run(
+        self,
+        key: RunKey,
+        *,
+        detector_number: int = 0,
+    ) -> Optional[float]:
+        """Compute one transmission, converting only that run and its empty beam."""
+        if key.sample_name is None:
+            return None
+
+        source_mode = self.get_transmission_source_mode()
+        source_config_id = self.resolve_transmission_config(key.config_id)
+        source_key: Optional[RunKey] = None
+        for candidate, _path in self.iter_runs(
+            config_id=source_config_id,
+            entity=key.entity,
+            mode=source_mode,
+            sample_name=key.sample_name,
+        ):
+            source_key = candidate
+            break
+        if source_key is None:
+            self.warn(
+                "Skipping transmission computation because the source run is missing",
+                where="compute_transmission_for_run",
+                key=key.short(),
+                transmission_source_mode=source_mode,
+                source_config_id=source_config_id,
+            )
+            return None
+
+        path = self.prepare_run(source_key)
+        empty_beam_path = self.prepare_reference("empty_beam", source_mode, source_config_id)
+        roi = self.get_roi(source_config_id)
+        if empty_beam_path is not None and roi is None:
+            roi = compute_transmission_roi(empty_beam_path, detector_number=detector_number)
+            self.set_roi(source_config_id, roi)
+        if path is None or empty_beam_path is None or roi is None:
+            self.warn(
+                "Skipping transmission computation because prerequisites are missing",
+                where="compute_transmission_for_run",
+                key=key.short(),
+                missing_run=path is None,
+                missing_empty_beam=empty_beam_path is None,
+                missing_roi=roi is None,
+                transmission_source_mode=source_mode,
+            )
+            return None
+
+        value = compute_transmission(
+            path,
+            empty_beam_path,
+            roi,
+            detector_number=detector_number,
+        )
+        self.set_transmission(key.sample_name, source_config_id, value)
+        if key.entity == "empty_cell":
+            self.set_empty_cell_transmission(source_config_id, value)
+        return value
 
     def get_reference_file(self, ref_name: Entity, mode: Mode, config_id: str) -> Optional[Path]:
         """Return the path of a reference file for a configuration, or ``None`` when missing."""
@@ -2223,11 +2700,12 @@ def _ingest_raw_directory_into_workflow_context(
     instrument_name: str | None,
     overwrite: bool,
     where: str,
+    allow_empty: bool = False,
+    respect_exclusions: bool = False,
 ) -> WorkflowContext:
-    """Convert raw files from a directory and merge them into a workflow context."""
-    from scarlet.io.converters import convert_to_scarlet_nxsas_raw
-    from scarlet.io.mode_inference import guess_measurement_mode_from_nexus_image
-    from scarlet.workflow.configuration import compare_configurations, configuration_from_nexus
+    """Inspect raw files and merge them into a workflow context without converting them."""
+    from scarlet.io.raw_inspection import inspect_raw_run
+    from scarlet.workflow.configuration import compare_configurations
 
     candidate_files = sorted(
         path
@@ -2235,45 +2713,49 @@ def _ingest_raw_directory_into_workflow_context(
         if path.is_file() and not _is_relative_to(path.resolve(), output_dir)
     )
     if not candidate_files:
+        if allow_empty:
+            return ctx
         raise FileNotFoundError(f"No input files found in {input_dir}")
 
     raw_files: list[Path] = []
     for path in candidate_files:
+        active_exclusion = ctx.get_active_file_exclusion(path)
+        if (
+            respect_exclusions
+            and active_exclusion is not None
+            and active_exclusion.source != "directory_scan"
+        ):
+            continue
         if not _is_hdf5_file(path):
             ctx.warn("Skipping non-HDF5 input file", where=where, key=str(path))
+            ctx.exclude_file(
+                path,
+                reason="Non-HDF5 input file",
+                source="directory_scan",
+            )
             continue
         is_raw_candidate, skip_reason = _classify_hdf5_input_candidate(path)
         if is_raw_candidate:
             raw_files.append(path)
             continue
-        ctx.warn(skip_reason or "Skipping unsupported HDF5 input file", where=where, key=str(path))
+        reason = skip_reason or "Skipping unsupported HDF5 input file"
+        ctx.warn(reason, where=where, key=str(path))
+        ctx.exclude_file(path, reason=reason, source="directory_scan")
 
     if not raw_files:
+        if allow_empty:
+            return ctx
         raise FileNotFoundError(f"No HDF5 input files found in {input_dir}")
 
     existing_run_paths = {path.resolve() for path in ctx.runs.values()}
-    existing_artifact_paths = {artifact.path.resolve() for artifact in ctx.artifacts}
 
     for raw_path in raw_files:
-        converted_path = (output_dir / _flattened_nxsas_name(input_dir, raw_path)).resolve()
-        if converted_path in existing_run_paths and not overwrite:
+        raw_path = raw_path.resolve()
+        if raw_path in existing_run_paths:
             continue
 
-        if not converted_path.exists() or overwrite:
-            convert_to_scarlet_nxsas_raw(
-                instrument_name,
-                raw_path,
-                converted_path,
-                overwrite=overwrite,
-            )
-
-        if converted_path not in existing_artifact_paths:
-            ctx.add_artifact(converted_path.name, converted_path, kind="nexus")
-            existing_artifact_paths.add(converted_path)
-
-        configuration, issues = configuration_from_nexus(converted_path)
-        for issue in issues:
-            ctx.warn(issue, where="configuration_from_nexus", key=str(converted_path))
+        metadata = inspect_raw_run(instrument_name or ctx.instrument_name, raw_path)
+        configuration = metadata.configuration
 
         config_id: Optional[str] = None
         for existing_config_id, existing_configuration in ctx.configurations.items():
@@ -2285,23 +2767,22 @@ def _ingest_raw_directory_into_workflow_context(
             config_id = _next_generated_config_id(ctx.configurations.keys())
             ctx.configurations[config_id] = replace(configuration, config_id=config_id)
 
-        sample_name = _read_sample_name(converted_path)
+        sample_name = metadata.sample_name
         entity = _classify_entity_from_sample_name(sample_name)
-        sample_thickness = _read_sample_thickness(converted_path)
+        sample_thickness = metadata.sample_thickness_mm
         if ctx.get_transmission_strategy() == "semi_transparent_beamstop" and entity != "empty_beam":
             mode = "scattering"
         else:
-            mode_guess = guess_measurement_mode_from_nexus_image(converted_path)
-            if mode_guess.mode == "transmission":
+            if metadata.mode == "transmission":
                 mode = "transmission"
-            elif mode_guess.mode == "scattering":
+            elif metadata.mode == "scattering":
                 mode = "scattering"
             else:
                 mode = "transmission" if entity == "empty_beam" else "scattering"
                 ctx.warn(
                     "Could not confidently infer measurement mode; using heuristic fallback",
                     where=where,
-                    key=str(converted_path),
+                    key=str(raw_path),
                     guessed_mode=mode,
                 )
 
@@ -2318,14 +2799,13 @@ def _ingest_raw_directory_into_workflow_context(
                 where=where,
                 key=stored_run_key.short(),
                 previous_path=str(ctx.runs[run_key]),
-                new_path=str(converted_path),
+                new_path=str(raw_path),
             )
-        ctx.add_run(run_key, converted_path)
+        ctx.add_run(run_key, raw_path)
         if sample_thickness is not None and entity in {"sample", "water"}:
             ctx.set_sample_thickness(sample_name, config_id, sample_thickness)
-        existing_run_paths.add(converted_path)
+        existing_run_paths.add(raw_path)
 
-    _initialize_transmission_geometry(ctx, where=where)
     return ctx
 
 
@@ -2387,7 +2867,7 @@ def initialize_workflow_context_from_raw_directory(
     transmission_strategy: TransmissionStrategy | str = "opaque_beamstop",
     overwrite: bool = False,
 ) -> WorkflowContext:
-    """Create a fresh workflow context by scanning and converting a raw-data directory."""
+    """Create a workflow context by inspecting raw data without converting it."""
     input_dir = Path(input_dir).resolve()
     if output_dir is None:
         output_dir = input_dir / "processed"
@@ -2402,6 +2882,7 @@ def initialize_workflow_context_from_raw_directory(
     )
     ctx.set_transmission_strategy(transmission_strategy)
     ctx.set("converted_data_dir", output_dir)
+    ctx.set("conversion_overwrite", bool(overwrite))
     return _ingest_raw_directory_into_workflow_context(
         ctx,
         input_dir=input_dir,
