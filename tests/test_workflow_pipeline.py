@@ -4,11 +4,13 @@ import importlib.util
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import h5py
 import numpy as np
 
+import scarlet.reduction.stiching as st
 from scarlet.reduction.geometry import compute_q_norm_map
 from scarlet.reduction.integration import azimuthal_average
 from scarlet.workflow.configuration import Configuration
@@ -16,6 +18,7 @@ from scarlet.workflow.context import RunKey, WorkflowContext
 from scarlet.workflow.pipeline import (
     ReductionPipeline,
     ReductionState,
+    StichingPipeline,
     azimuthal_averaging_step,
     save_azimuthal_text_step,
     save_processed_detectors_step,
@@ -141,7 +144,7 @@ class TestReductionPipelineFactories(unittest.TestCase):
                     config_id="cfg_4",
                 )
 
-    def test_refresh_and_run_new_skips_processed_runs_and_logs_failures(self) -> None:
+    def test_run_new_skips_processed_runs_without_refreshing_and_logs_failures(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             processed_path = root / "processed.nxs"
@@ -176,7 +179,7 @@ class TestReductionPipelineFactories(unittest.TestCase):
             pipeline = ReductionPipeline(workflow=workflow)
             successful_state = mock.create_autospec(ReductionState, instance=True)
 
-            def run_for_run(_pipeline: ReductionPipeline, run_key: RunKey) -> ReductionState:
+            def run_for_runkey(_pipeline: ReductionPipeline, run_key: RunKey) -> ReductionState:
                 if run_key == keys["broken_sample"]:
                     raise RuntimeError("cannot reduce this run")
                 return successful_state
@@ -185,14 +188,14 @@ class TestReductionPipelineFactories(unittest.TestCase):
                 mock.patch.object(workflow, "refresh_runs", return_value=workflow) as refresh,
                 mock.patch.object(
                     ReductionPipeline,
-                    "run_for_run",
+                    "run_for_runkey",
                     autospec=True,
-                    side_effect=run_for_run,
+                    side_effect=run_for_runkey,
                 ) as run,
             ):
-                states = pipeline.refresh_and_run_new()
+                states = pipeline.run_new()
 
-            refresh.assert_called_once_with()
+            refresh.assert_not_called()
             self.assertEqual(states, [successful_state])
             self.assertEqual(
                 [call.args[1] for call in run.call_args_list],
@@ -203,6 +206,130 @@ class TestReductionPipelineFactories(unittest.TestCase):
                     log.level == "ERROR"
                     and log.meta.get("key") == keys["broken_sample"].short()
                     and "cannot reduce this run" in log.meta.get("error", "")
+                    for log in workflow.logs
+                )
+            )
+
+
+class TestStichingPipeline(unittest.TestCase):
+    def test_run_for_sample_reads_only_processed_nexus_files_without_conversion(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            processed_path = root / "processed.nxs"
+            pending_path = root / "pending.nxs"
+            _write_detector_file(
+                processed_path,
+                sample_name="sample_a",
+                data=np.ones((2, 2), dtype=np.float64),
+            )
+            _write_detector_file(
+                pending_path,
+                sample_name="sample_a",
+                data=np.ones((2, 2), dtype=np.float64),
+            )
+            with h5py.File(processed_path, "a") as handle:
+                handle.create_group("processed")
+
+            workflow = WorkflowContext(root_dir=root, output_dir=root / "out")
+            workflow.add_run(
+                RunKey("cfg_1", "sample", "scattering", "sample_a"),
+                processed_path,
+            )
+            workflow.add_run(
+                RunKey("cfg_2", "sample", "scattering", "sample_a"),
+                pending_path,
+            )
+            pipeline = StichingPipeline(workflow)
+            result = SimpleNamespace(
+                final_curve=SimpleNamespace(
+                    q=np.asarray([0.1]),
+                    i=np.asarray([2.0]),
+                    di=np.asarray([0.2]),
+                    dq=np.asarray([0.01]),
+                ),
+                origin_segment_id=np.asarray([0]),
+                origin_map={0: "cfg_1/detector0"},
+            )
+
+            with (
+                mock.patch.object(
+                    workflow,
+                    "prepare_run",
+                    side_effect=AssertionError("stitching must not prepare or convert runs"),
+                ) as prepare,
+                mock.patch.object(st, "load_segment_from_nexus", return_value=[object()]) as load,
+                mock.patch.object(st, "stitch_segments_greedy", return_value=result),
+            ):
+                final_data = pipeline.run_for_sample("sample_a")
+
+            prepare.assert_not_called()
+            load.assert_called_once_with(processed_path.resolve(), config_id="cfg_1")
+            np.testing.assert_allclose(final_data[:, :4], [[0.1, 2.0, 0.2, 0.01]])
+            self.assertTrue((root / "out" / "sample_a_merged.txt").exists())
+
+    def test_run_new_stitches_only_ready_samples_and_logs_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            output_dir = root / "out"
+            output_dir.mkdir()
+            workflow = WorkflowContext(root_dir=root, output_dir=output_dir)
+            keys: dict[str, RunKey] = {}
+            paths: dict[str, Path] = {}
+            for sample_name in ("already_stitched", "new_sample", "broken_sample", "waiting_sample"):
+                path = root / f"{sample_name}.nxs"
+                _write_detector_file(
+                    path,
+                    sample_name=sample_name,
+                    data=np.ones((2, 2), dtype=np.float64),
+                )
+                if sample_name != "waiting_sample":
+                    with h5py.File(path, "a") as handle:
+                        handle.create_group("processed")
+                key = RunKey("cfg", "sample", "scattering", sample_name)
+                workflow.add_run(key, path)
+                keys[sample_name] = key
+                paths[sample_name] = path
+
+            stitched_output = output_dir / "already_stitched_merged.txt"
+            stitched_output.write_text("already merged", encoding="utf-8")
+            input_mtime = paths["already_stitched"].stat().st_mtime_ns
+            stitched_output.touch()
+            if stitched_output.stat().st_mtime_ns < input_mtime:
+                self.fail("test filesystem did not preserve output modification ordering")
+
+            pipeline = StichingPipeline(workflow)
+            successful_data = np.asarray([[0.1, 1.0, 0.1, 0.01, 0.0]])
+
+            def run_for_sample(
+                _pipeline: StichingPipeline,
+                sample_name: str,
+                scale_on: str | None = None,
+                normalization_factor: float = 1.0,
+            ) -> np.ndarray:
+                del scale_on, normalization_factor
+                if sample_name == "broken_sample":
+                    raise RuntimeError("cannot stitch this sample")
+                return successful_data
+
+            with mock.patch.object(
+                StichingPipeline,
+                "run_for_sample",
+                autospec=True,
+                side_effect=run_for_sample,
+            ) as run:
+                results = pipeline.run_new()
+
+            self.assertEqual(set(results), {"new_sample"})
+            self.assertIs(results["new_sample"], successful_data)
+            self.assertEqual(
+                [call.args[1] for call in run.call_args_list],
+                ["broken_sample", "new_sample"],
+            )
+            self.assertTrue(
+                any(
+                    log.level == "ERROR"
+                    and log.meta.get("key") == "broken_sample"
+                    and "cannot stitch this sample" in log.meta.get("error", "")
                     for log in workflow.logs
                 )
             )

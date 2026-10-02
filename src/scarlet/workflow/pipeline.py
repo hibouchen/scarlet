@@ -861,7 +861,7 @@ class ReductionPipeline:
             state.reductions_steps.append(step.name)
         return state
     
-    def run_for_run(self, run_key: RunKey) -> ReductionState:
+    def run_for_runkey(self, run_key: RunKey) -> ReductionState:
         """Run the pipeline for one exact sample scattering run."""
         if run_key.entity != "sample" or run_key.mode != "scattering" or run_key.sample_name is None:
             raise ValueError(
@@ -903,28 +903,18 @@ class ReductionPipeline:
                 f"for sample_name={sample_name!r}, config_id={config_id!r}. "
                 f"Available scattering configs for this sample: {available_text}"
             )
-        return self.run_for_run(run_key)
+        return self.run_for_runkey(run_key)
 
     def run_all(self) -> list[ReductionState]:
         """Run the pipeline for every registered sample scattering run."""
         states: list[ReductionState] = []
         for run_key in list(self.workflow.runs):
             if run_key.entity == "sample" and run_key.mode == "scattering":
-                states.append(self.run_for_run(run_key))
+                states.append(self.run_for_runkey(run_key))
         return states
 
-    def refresh_and_run_new(self) -> list[ReductionState]:
-        """Refresh the workflow and process unprocessed runs without aborting on failures."""
-        try:
-            self.workflow.refresh_runs()
-        except Exception as exc:
-            self.workflow.error(
-                "Failed to refresh workflow runs; continuing with the current registry",
-                where="ReductionPipeline.refresh_and_run_new",
-                error_type=type(exc).__name__,
-                error=str(exc),
-            )
-
+    def run_new(self) -> list[ReductionState]:
+        """Process registered unprocessed runs without aborting on failures."""
         pending_runs = [
             run_key
             for run_key in list(self.workflow.runs)
@@ -936,12 +926,12 @@ class ReductionPipeline:
         failed_count = 0
         for run_key in pending_runs:
             try:
-                states.append(self.run_for_run(run_key))
+                states.append(self.run_for_runkey(run_key))
             except Exception as exc:
                 failed_count += 1
                 self.workflow.error(
                     "Failed to process run",
-                    where="ReductionPipeline.refresh_and_run_new",
+                    where="ReductionPipeline.run_new",
                     key=run_key.short(),
                     raw_path=str(self.workflow.get_run_path(run_key)),
                     error_type=type(exc).__name__,
@@ -950,75 +940,183 @@ class ReductionPipeline:
 
         self.workflow.info(
             "Finished processing new workflow runs",
-            where="ReductionPipeline.refresh_and_run_new",
+            where="ReductionPipeline.run_new",
             attempted_count=len(pending_runs),
             processed_count=len(states),
             failed_count=failed_count,
         )
         return states
 
+
 @dataclass(frozen=True)
-class StichingPipeline():
+class StichingPipeline:
     workflow: WorkflowContext
 
-    def run_for_sample(self, sample_name: str, scale_on: str | None= None, 
-                       normalization_factor: float =1.0):
-        config = self.workflow.configurations
+    def _sample_run_keys(self, sample_name: str) -> list[RunKey]:
+        """Return all registered scattering run keys for one sample."""
+        return [
+            run_key
+            for run_key in self.workflow.runs
+            if run_key.entity == "sample"
+            and run_key.mode == "scattering"
+            and run_key.sample_name == sample_name
+        ]
+
+    def _output_path(self, sample_name: str) -> Path:
+        """Return the deterministic merged-text output path for one sample."""
+        return (self.workflow.output_dir / f"{sample_name}_merged.txt").resolve()
+
+    def is_sample_ready(self, sample_name: str) -> bool:
+        """Return whether every registered scattering run for a sample is processed."""
+        run_keys = self._sample_run_keys(sample_name)
+        return bool(run_keys) and all(self.workflow.is_run_processed(run_key) for run_key in run_keys)
+
+    def is_sample_stitched(self, sample_name: str) -> bool:
+        """Return whether the merged output is present and newer than its processed inputs."""
+        run_keys = self._sample_run_keys(sample_name)
+        if not run_keys or not all(self.workflow.is_run_processed(run_key) for run_key in run_keys):
+            return False
+        output_path = self._output_path(sample_name)
+        if not output_path.exists():
+            return False
+        input_paths = [self.workflow.get_run_nexus_path(run_key) for run_key in run_keys]
+        processed_paths = [path for path in input_paths if path is not None]
+        if len(processed_paths) != len(run_keys):
+            return False
+        try:
+            newest_input = max(path.stat().st_mtime_ns for path in processed_paths)
+            return output_path.stat().st_mtime_ns >= newest_input
+        except OSError:
+            return False
+
+    def run_for_sample(
+        self,
+        sample_name: str,
+        scale_on: str | None = None,
+        normalization_factor: float = 1.0,
+    ) -> np.ndarray:
+        """Stitch the processed scattering runs currently available for one sample."""
+        run_keys = self._sample_run_keys(sample_name)
+        if not run_keys:
+            raise ValueError(f"No sample scattering runs registered for {sample_name!r}")
+
         segments = []
-        for config_id in config:
-            file_path = self.workflow.prepare_run(RunKey(
-                config_id=config_id,
-                entity="sample",
-                mode="scattering",
-                sample_name=sample_name,
-                )
+        processed_config_ids: set[str] = set()
+        for run_key in run_keys:
+            if not self.workflow.is_run_processed(run_key):
+                continue
+            file_path = self.workflow.get_run_nexus_path(run_key)
+            if file_path is None:
+                continue
+            segments += st.load_segment_from_nexus(file_path, config_id=run_key.config_id)
+            processed_config_ids.add(run_key.config_id)
+
+        if not segments:
+            raise ValueError(f"No processed scattering segments available for {sample_name!r}")
+
+        result = st.stitch_segments_greedy(
+            segments,
+            start_policy="lowest_q",
+            grid="common",
+            min_points=8,
+            min_log_width=0.10,
+            slope_weight=0.10,
+            width_weight=0.05,
+            resolution_weight=0.50,
+            rho_ref=0.20,
+            max_chi2_red=3.0,
+            max_slope_z=2.5,
+            min_new_log_coverage=0.05,
+            segment_quality_weight=4.0,
+            new_coverage_weight=1.5,
+            keep_fraction=0.25,
+        )
+        if scale_on in processed_config_ids:
+            result = st.rebase_result_to_reference(
+                result,
+                reference_config=scale_on,
+                reference_detector="detector0",
             )
-            if file_path:
-                segments += st.load_segment_from_nexus(file_path, config_id=config_id)
-        
-        result = st.stitch_segments_greedy(segments,
-                                            start_policy="lowest_q",
-                                            grid="common",
-                                            min_points=8,
-                                            min_log_width=0.10,
-                                            slope_weight=0.10,
-                                            width_weight=0.05,
-                                            resolution_weight=0.50,
-                                            rho_ref=0.20,
-                                            max_chi2_red=3.0,
-                                            max_slope_z=2.5,
-                                            min_new_log_coverage=0.05,
-                                            segment_quality_weight=4.0,
-                                            new_coverage_weight=1.5,
-                                            keep_fraction=0.25,
-                                        )
-        if scale_on in config:
-            result = st.rebase_result_to_reference(result, reference_config=scale_on, reference_detector="detector0")
-            
-            
-        
-        final_data = np.column_stack([
+
+        final_data = np.column_stack(
+            [
                 result.final_curve.q,
                 result.final_curve.i * normalization_factor,
                 result.final_curve.di * normalization_factor,
                 result.final_curve.dq,
                 result.origin_segment_id,
-            ])
-        
-        header = (
-                "q I I_error q_error origin_segment_id\n"
-                + "\n".join(f"origin_segment_id {idx}: {name}" for idx, name in result.origin_map.items())
-            )
-        
-        np.savetxt(self.workflow.output_dir / f"{sample_name}_merged.txt", final_data, header=header)
-        
+            ]
+        )
+        header = "q I I_error q_error origin_segment_id\n" + "\n".join(
+            f"origin_segment_id {idx}: {name}" for idx, name in result.origin_map.items()
+        )
+        output_path = self._output_path(sample_name)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savetxt(output_path, final_data, header=header)
         return final_data
 
-    
-    def run_all(self, scale_on: str | None= None, normalization_factor: float =1.0):
-        sample_names = []
-        for run in self.workflow.runs:
-            if run.entity=="sample" and run.mode=="scattering":
-                sample_names.append(run.sample_name)
-        for sample in sample_names:
-            self.run_for_sample(sample, scale_on=scale_on, normalization_factor=normalization_factor)
+    def _sample_names(self) -> list[str]:
+        """Return unique registered scattering sample names."""
+        return sorted(
+            {
+                run_key.sample_name
+                for run_key in self.workflow.runs
+                if run_key.entity == "sample"
+                and run_key.mode == "scattering"
+                and run_key.sample_name is not None
+            }
+        )
+
+    def run_all(
+        self,
+        scale_on: str | None = None,
+        normalization_factor: float = 1.0,
+    ) -> dict[str, np.ndarray]:
+        """Stitch every registered sample, raising on the first failure."""
+        return {
+            sample_name: self.run_for_sample(
+                sample_name,
+                scale_on=scale_on,
+                normalization_factor=normalization_factor,
+            )
+            for sample_name in self._sample_names()
+        }
+
+    def run_new(
+        self,
+        scale_on: str | None = None,
+        normalization_factor: float = 1.0,
+    ) -> dict[str, np.ndarray]:
+        """Stitch ready samples without current merged outputs, logging failures."""
+        pending_samples = [
+            sample_name
+            for sample_name in self._sample_names()
+            if self.is_sample_ready(sample_name) and not self.is_sample_stitched(sample_name)
+        ]
+        results: dict[str, np.ndarray] = {}
+        failed_count = 0
+        for sample_name in pending_samples:
+            try:
+                results[sample_name] = self.run_for_sample(
+                    sample_name,
+                    scale_on=scale_on,
+                    normalization_factor=normalization_factor,
+                )
+            except Exception as exc:
+                failed_count += 1
+                self.workflow.error(
+                    "Failed to stitch sample",
+                    where="StichingPipeline.run_new",
+                    key=sample_name,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+
+        self.workflow.info(
+            "Finished stitching new samples",
+            where="StichingPipeline.run_new",
+            attempted_count=len(pending_samples),
+            stitched_count=len(results),
+            failed_count=failed_count,
+        )
+        return results

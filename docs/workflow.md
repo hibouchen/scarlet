@@ -134,11 +134,11 @@ written into the associated NeXus file under the top-level `/processed` entry.
 The context is an attribute of the pipeline. It therefore does not need to be
 passed again to `run_for_sample()` or `run_all()`.
 
-To discover new acquisitions and process only sample-scattering runs that do
-not yet contain `/processed`:
+To process only registered sample-scattering runs that do not yet contain
+`/processed`:
 
 ```python
-states = pipeline.refresh_and_run_new()
+states = pipeline.run_new()
 ```
 
 This method handles runs independently. If one run cannot be reduced, the
@@ -146,6 +146,15 @@ exception is recorded as a structured `ERROR` log on the workflow and the
 pipeline continues with the remaining runs. The returned list contains only
 the successful reduction states. Calling the method again retries failed runs
 because their NeXus files still do not contain `/processed`.
+
+`run_new()` does not rescan directories and does not add or remove workflow
+runs. When new acquisitions must first be discovered, refresh the context
+explicitly before invoking the pipeline:
+
+```python
+workflow.refresh_runs()
+states = pipeline.run_new()
+```
 
 ## Watch processing status
 
@@ -189,6 +198,29 @@ workflow.get_run_nexus_path(key)
 These methods inspect the files each time they are called. They do not maintain
 a background process and do not rely on a cached processing flag, so a notebook
 view reflects the result of the latest completed pipeline execution.
+
+## Stitch newly reduced samples
+
+`StichingPipeline` follows the same incremental principle and uses the workflow
+provided at construction time:
+
+```python
+from scarlet.workflow.pipeline import StichingPipeline
+
+stitching = StichingPipeline(workflow)
+merged = stitching.run_new(scale_on="config_1")
+```
+
+`run_new()` does not refresh the workflow and never converts raw acquisitions.
+An eligible sample must have `/processed` in every registered scattering run.
+The method skips a sample when its `<sample_name>_merged.txt` output is newer
+than all its processed NeXus inputs. It runs the stitching again when a
+processed input is newer than the existing merged output.
+
+As with `ReductionPipeline.run_new()`, samples are handled independently. A
+stitching failure is stored in the workflow log, and processing continues with
+the remaining ready samples. The returned dictionary maps successfully
+stitched sample names to their merged arrays.
 
 ## Save and restore the context
 

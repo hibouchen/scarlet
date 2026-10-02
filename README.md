@@ -35,19 +35,34 @@ workflow.processed_runs_table()         # Runs containing /processed
 workflow.runs_status_table()            # Status of every run
 ```
 
-Create a reduction pipeline bound to this context and process only newly
-discovered, unprocessed sample runs:
+Create a reduction pipeline bound to this context and process only the
+unprocessed sample runs already registered in the workflow:
 
 ```python
 from scarlet.workflow.pipeline import ReductionPipeline
 
 pipeline = ReductionPipeline.default(workflow)
-states = pipeline.refresh_and_run_new()
+states = pipeline.run_new()
 ```
 
 One failing run is recorded in `workflow.logs` without interrupting the other
-runs. `pipeline.run_for_sample(...)` and `pipeline.run_all()` also use the bound
-workflow and therefore do not take it as a method argument.
+runs. `run_new()` does not refresh or change the workflow run registry. Call
+`workflow.refresh_runs()` explicitly beforehand when new acquisitions must be
+discovered. `pipeline.run_for_sample(...)` and `pipeline.run_all()` also use the
+bound workflow and therefore do not take it as a method argument.
+
+Incremental stitching uses the same workflow-owned API:
+
+```python
+from scarlet.workflow.pipeline import StichingPipeline
+
+stitching = StichingPipeline(workflow)
+merged = stitching.run_new()
+```
+
+Only samples whose registered scattering runs are all processed are eligible.
+Existing merged outputs are reused until one of their processed NeXus inputs
+becomes newer.
 
 The detailed workflow, including editable CSV filtering and persistence, is
 documented in the [Workflow context guide](https://hibouchen.github.io/scarlet/workflow/).

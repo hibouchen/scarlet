@@ -65,16 +65,29 @@ workflow.processed_runs_table()
 workflow.runs_status_table()
 ```
 
-Create a pipeline bound to the workflow and reduce only new, unprocessed runs:
+Create a pipeline bound to the workflow and reduce only its registered,
+unprocessed runs:
 
 ```python
 from scarlet.workflow.pipeline import ReductionPipeline
 
 pipeline = ReductionPipeline.default(workflow)
-states = pipeline.refresh_and_run_new()
+states = pipeline.run_new()
 ```
 
-Failures are logged per run and do not stop the remaining reductions.
+The method does not refresh the workflow. Call `workflow.refresh_runs()` first
+when required. Failures are logged per run and do not stop the remaining
+reductions.
+
+Once the required runs have been reduced, stitch only ready samples without a
+current merged output:
+
+```python
+from scarlet.workflow.pipeline import StichingPipeline
+
+stitching = StichingPipeline(workflow)
+merged = stitching.run_new()
+```
 
 See [Workflow context](workflow.md) for CSV filtering, exclusion history,
 on-demand conversion, processing status, and context persistence.
