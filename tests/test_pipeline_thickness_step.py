@@ -12,7 +12,7 @@ from scarlet.workflow.pipeline import ReductionPipeline, ReductionState, normali
 @unittest.skipIf(importlib.util.find_spec("scipp") is None, "scipp is required for pipeline thickness step tests")
 class TestPipelineThicknessStep(unittest.TestCase):
     def test_default_pipeline_includes_thickness_normalization(self) -> None:
-        pipeline = ReductionPipeline.default()
+        pipeline = ReductionPipeline.default(WorkflowContext())
 
         self.assertIn("normalize by thickness", pipeline.step_names)
 

@@ -10,6 +10,48 @@ Documentation: https://hibouchen.github.io/scarlet/
 
 The high-level workflow around reduced outputs is still evolving.
 
+## Python Workflow
+
+Initialize a context directly from instrument raw files:
+
+```python
+from scarlet.workflow import initialize_workflow_context_from_raw_directory
+
+workflow = initialize_workflow_context_from_raw_directory(
+    "data/SANSLLB/raw",
+    output_dir="data/SANSLLB/processed",
+    instrument_name="sansllb",
+)
+```
+
+Initialization records the original raw paths and does not eagerly convert the
+directory. Conversion to SCARLET NeXus occurs only when the reduction pipeline
+requests a run.
+
+```python
+workflow.refresh_runs()                 # Discover new acquisitions
+workflow.excluded_files_table()         # Current exclusions
+workflow.processed_runs_table()         # Runs containing /processed
+workflow.runs_status_table()            # Status of every run
+```
+
+Create a reduction pipeline bound to this context and process only newly
+discovered, unprocessed sample runs:
+
+```python
+from scarlet.workflow.pipeline import ReductionPipeline
+
+pipeline = ReductionPipeline.default(workflow)
+states = pipeline.refresh_and_run_new()
+```
+
+One failing run is recorded in `workflow.logs` without interrupting the other
+runs. `pipeline.run_for_sample(...)` and `pipeline.run_all()` also use the bound
+workflow and therefore do not take it as a method argument.
+
+The detailed workflow, including editable CSV filtering and persistence, is
+documented in the [Workflow context guide](https://hibouchen.github.io/scarlet/workflow/).
+
 ## Installation
 
 Create and activate a Python virtual environment:

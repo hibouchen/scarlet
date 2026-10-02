@@ -4,6 +4,7 @@ import importlib.util
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import h5py
 import numpy as np
@@ -87,8 +88,10 @@ def _write_mask_bundle(path: Path, masks: dict[int, np.ndarray]) -> None:
 
 class TestReductionPipelineFactories(unittest.TestCase):
     def test_with_processed_output_includes_save_step_after_normalization(self) -> None:
-        pipeline = ReductionPipeline.with_processed_output()
+        workflow = WorkflowContext()
+        pipeline = ReductionPipeline.with_processed_output(workflow)
 
+        self.assertIs(pipeline.workflow, workflow)
         self.assertEqual(
             pipeline.step_names,
             (
@@ -99,7 +102,7 @@ class TestReductionPipelineFactories(unittest.TestCase):
         )
 
     def test_with_azimuthal_text_output_includes_save_text_step(self) -> None:
-        pipeline = ReductionPipeline.with_azimuthal_text_output()
+        pipeline = ReductionPipeline.with_azimuthal_text_output(WorkflowContext())
 
         self.assertEqual(
             pipeline.step_names,
@@ -133,11 +136,76 @@ class TestReductionPipelineFactories(unittest.TestCase):
                 ValueError,
                 "Missing sample scattering run .*config_id='cfg_4'.*cfg_2",
             ):
-                ReductionPipeline.default().run_for_sample(
-                    workflow=ctx,
+                ReductionPipeline.default(ctx).run_for_sample(
                     sample_name="sample_a",
                     config_id="cfg_4",
                 )
+
+    def test_refresh_and_run_new_skips_processed_runs_and_logs_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            processed_path = root / "processed.nxs"
+            successful_path = root / "successful.nxs"
+            failing_path = root / "failing.nxs"
+            for path, sample_name in (
+                (processed_path, "already_done"),
+                (successful_path, "new_sample"),
+                (failing_path, "broken_sample"),
+            ):
+                _write_detector_file(
+                    path,
+                    sample_name=sample_name,
+                    data=np.ones((2, 2), dtype=np.float64),
+                )
+            with h5py.File(processed_path, "a") as handle:
+                handle.create_group("processed")
+
+            workflow = WorkflowContext(root_dir=root, output_dir=root / "out")
+            keys = {
+                sample_name: RunKey(
+                    config_id="cfg",
+                    entity="sample",
+                    mode="scattering",
+                    sample_name=sample_name,
+                )
+                for sample_name in ("already_done", "new_sample", "broken_sample")
+            }
+            workflow.add_run(keys["already_done"], processed_path)
+            workflow.add_run(keys["new_sample"], successful_path)
+            workflow.add_run(keys["broken_sample"], failing_path)
+            pipeline = ReductionPipeline(workflow=workflow)
+            successful_state = mock.create_autospec(ReductionState, instance=True)
+
+            def run_for_run(_pipeline: ReductionPipeline, run_key: RunKey) -> ReductionState:
+                if run_key == keys["broken_sample"]:
+                    raise RuntimeError("cannot reduce this run")
+                return successful_state
+
+            with (
+                mock.patch.object(workflow, "refresh_runs", return_value=workflow) as refresh,
+                mock.patch.object(
+                    ReductionPipeline,
+                    "run_for_run",
+                    autospec=True,
+                    side_effect=run_for_run,
+                ) as run,
+            ):
+                states = pipeline.refresh_and_run_new()
+
+            refresh.assert_called_once_with()
+            self.assertEqual(states, [successful_state])
+            self.assertEqual(
+                [call.args[1] for call in run.call_args_list],
+                [keys["new_sample"], keys["broken_sample"]],
+            )
+            self.assertTrue(
+                any(
+                    log.level == "ERROR"
+                    and log.meta.get("key") == keys["broken_sample"].short()
+                    and "cannot reduce this run" in log.meta.get("error", "")
+                    for log in workflow.logs
+                )
+            )
 
 
 class TestAzimuthalTextWriter(unittest.TestCase):

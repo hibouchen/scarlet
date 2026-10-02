@@ -85,7 +85,10 @@ class TestPipelineAzimuthalStep(unittest.TestCase):
             )
             expected = azimuthal_average(detector, q_map, n_bins=3).to_data_array()
 
-            pipeline = ReductionPipeline(steps=(as_reduction_step(azimuthal_averaging_step),))
+            pipeline = ReductionPipeline(
+                workflow=workflow,
+                steps=(as_reduction_step(azimuthal_averaging_step),),
+            )
             updated = pipeline.run(state)
 
             integrated = updated.detectors[0]

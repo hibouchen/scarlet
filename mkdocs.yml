@@ -49,6 +49,7 @@ nav:
       - Installation: installation.md
       - Tutorial: tutorial.md
   - Use SCARLET:
+      - Workflow context: workflow.md
       - Command line: cli.md
       - Data format: format.md
       - NeXus schemas: schemas.md

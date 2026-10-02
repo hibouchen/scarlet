@@ -37,14 +37,18 @@ class ReductionState:
     reductions_steps: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     file_path: str = field(default_factory=str)
+    run_key: RunKey | None = None
 
     def __post_init__(self):
-        run_key = RunKey(
-            config_id=self.config_id,
-            entity="sample",
-            mode="scattering",
-            sample_name=self.sample_name,
-        )
+        run_key = self.run_key
+        if run_key is None:
+            run_key = RunKey(
+                config_id=self.config_id,
+                entity="sample",
+                mode="scattering",
+                sample_name=self.sample_name,
+            )
+            self.run_key = run_key
         file_path = self.workflow.prepare_run(run_key)
         if file_path:
             self.detectors = nexus_reader.read_all_detectors(
@@ -792,11 +796,13 @@ def save_azimuthal_text_step(state: ReductionState) -> ReductionState:
 
 @dataclass(frozen=True)
 class ReductionPipeline:
+    workflow: WorkflowContext
     steps: tuple[ReductionStep, ...] = field(default_factory=tuple)
 
     @classmethod
-    def with_processed_output(cls) -> "ReductionPipeline":
+    def with_processed_output(cls, workflow: WorkflowContext) -> "ReductionPipeline":
         return cls(
+            workflow=workflow,
             steps=(
                 as_reduction_step(subtract_references_step),
                 as_reduction_step(normalization_step),
@@ -805,21 +811,9 @@ class ReductionPipeline:
         )
 
     @classmethod
-    def with_azimuthal_text_output(cls) -> "ReductionPipeline":
+    def with_azimuthal_text_output(cls, workflow: WorkflowContext) -> "ReductionPipeline":
         return cls(
-            steps=(
-                as_reduction_step(subtract_references_step),
-                as_reduction_step(normalization_step),
-                as_reduction_step(normalize_by_thickness),
-                as_reduction_step(azimuthal_averaging_step),
-                as_reduction_step(save_processed_detectors_step),
-                as_reduction_step(save_azimuthal_text_step),
-            )
-        )
-
-    @classmethod
-    def default(cls) -> "ReductionPipeline":
-        return cls(
+            workflow=workflow,
             steps=(
                 as_reduction_step(subtract_references_step),
                 as_reduction_step(normalization_step),
@@ -831,8 +825,23 @@ class ReductionPipeline:
         )
 
     @classmethod
-    def without_water_normalization(cls) -> "ReductionPipeline":
+    def default(cls, workflow: WorkflowContext) -> "ReductionPipeline":
         return cls(
+            workflow=workflow,
+            steps=(
+                as_reduction_step(subtract_references_step),
+                as_reduction_step(normalization_step),
+                as_reduction_step(normalize_by_thickness),
+                as_reduction_step(azimuthal_averaging_step),
+                as_reduction_step(save_processed_detectors_step),
+                as_reduction_step(save_azimuthal_text_step),
+            )
+        )
+
+    @classmethod
+    def without_water_normalization(cls, workflow: WorkflowContext) -> "ReductionPipeline":
+        return cls(
+            workflow=workflow,
             steps=(
                 as_reduction_step(subtract_references_step),
                 as_reduction_step(normalize_by_thickness),
@@ -852,18 +861,36 @@ class ReductionPipeline:
             state.reductions_steps.append(step.name)
         return state
     
-    def run_for_sample(self, workflow: WorkflowContext, sample_name: str, config_id: str) -> ReductionState:
+    def run_for_run(self, run_key: RunKey) -> ReductionState:
+        """Run the pipeline for one exact sample scattering run."""
+        if run_key.entity != "sample" or run_key.mode != "scattering" or run_key.sample_name is None:
+            raise ValueError(
+                "ReductionPipeline can only process sample scattering runs, "
+                f"got {run_key.short()}"
+            )
+        if self.workflow.get_run_path(run_key) is None:
+            raise ValueError(f"Run is not registered in the workflow: {run_key.short()}")
+        state = ReductionState(
+            sample_name=run_key.sample_name,
+            config_id=run_key.config_id,
+            workflow=self.workflow,
+            run_key=run_key,
+        )
+        return self.run(state)
+
+    def run_for_sample(self, sample_name: str, config_id: str) -> ReductionState:
+        """Run the pipeline for the primary scattering run of one sample and configuration."""
         run_key = RunKey(
             config_id=config_id,
             entity="sample",
             mode="scattering",
             sample_name=sample_name,
         )
-        if workflow.get_run_path(run_key) is None:
+        if self.workflow.get_run_path(run_key) is None:
             available_configs = sorted(
                 {
                     key.config_id
-                    for key, _path in workflow.iter_runs(
+                    for key, _path in self.workflow.iter_runs(
                         entity="sample",
                         mode="scattering",
                         sample_name=sample_name,
@@ -876,14 +903,59 @@ class ReductionPipeline:
                 f"for sample_name={sample_name!r}, config_id={config_id!r}. "
                 f"Available scattering configs for this sample: {available_text}"
             )
-        state = ReductionState(sample_name=sample_name, config_id=config_id, workflow=workflow)
-        return self.run(state)
-    
-    def run_all(self, workflow: WorkflowContext):
-        for run in workflow.runs:
-            if run.entity=="sample" and run.mode=="scattering":
-                state = ReductionState(sample_name=run.sample_name, config_id=run.config_id,workflow=workflow)
-                self.run(state)
+        return self.run_for_run(run_key)
+
+    def run_all(self) -> list[ReductionState]:
+        """Run the pipeline for every registered sample scattering run."""
+        states: list[ReductionState] = []
+        for run_key in list(self.workflow.runs):
+            if run_key.entity == "sample" and run_key.mode == "scattering":
+                states.append(self.run_for_run(run_key))
+        return states
+
+    def refresh_and_run_new(self) -> list[ReductionState]:
+        """Refresh the workflow and process unprocessed runs without aborting on failures."""
+        try:
+            self.workflow.refresh_runs()
+        except Exception as exc:
+            self.workflow.error(
+                "Failed to refresh workflow runs; continuing with the current registry",
+                where="ReductionPipeline.refresh_and_run_new",
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+
+        pending_runs = [
+            run_key
+            for run_key in list(self.workflow.runs)
+            if run_key.entity == "sample"
+            and run_key.mode == "scattering"
+            and not self.workflow.is_run_processed(run_key)
+        ]
+        states: list[ReductionState] = []
+        failed_count = 0
+        for run_key in pending_runs:
+            try:
+                states.append(self.run_for_run(run_key))
+            except Exception as exc:
+                failed_count += 1
+                self.workflow.error(
+                    "Failed to process run",
+                    where="ReductionPipeline.refresh_and_run_new",
+                    key=run_key.short(),
+                    raw_path=str(self.workflow.get_run_path(run_key)),
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+
+        self.workflow.info(
+            "Finished processing new workflow runs",
+            where="ReductionPipeline.refresh_and_run_new",
+            attempted_count=len(pending_runs),
+            processed_count=len(states),
+            failed_count=failed_count,
+        )
+        return states
 
 @dataclass(frozen=True)
 class StichingPipeline():

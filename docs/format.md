@@ -144,6 +144,26 @@ with h5py.File("my_file.nxs", "a") as f:
 
 The goal is to write reduced results as a **new `NXentry`** in the same logical NeXus file, keeping raw and processed data together.
 
+The Python workflow keeps instrument raw files unchanged during initialization.
+When the pipeline first needs a run, it creates or reuses the associated SCARLET
+NeXus file in the workflow output directory. The workflow pipeline writes its
+result under the top-level entry:
+
+```
+/processed (NXentry)
+  definition = "SCARLET_processed"
+  /meta (NXcollection)
+  /data (NXcollection)
+    /detector0 (NXdata)
+    /detector1 (NXdata)   # Optional
+  /data0 (NXdata)         # NeXus view for detector0
+  /data1 (NXdata)         # Optional
+```
+
+The presence of `/processed` is also the criterion used by
+`WorkflowContext.is_run_processed()` and the processing-status tables. See
+[Workflow context](workflow.md) for the complete lifecycle.
+
 The high-level reduction command, for example `scarlet reduce`, is not yet implemented in the current repository. Available commands currently cover conversion, validation, generation of `refs_sub` and `refs_norm` reference bundles, and an initial deterministic 2D correction through `scarlet reduce-2d`.
 
 When needed, `scarlet reduce-2d` copies the raw file and then adds:
