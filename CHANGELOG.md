@@ -10,6 +10,8 @@ The project follows a simple Semantic Versioning policy:
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-03
+
 - SANSLLB: improved acquisition-mode detection by prioritizing the physical beam-stop position and using the attenuator state before falling back to detector-image analysis.
 - Workflow: stopped forcing acquisitions to scattering mode when using the `semi_transparent_beamstop` transmission strategy; inferred transmission and scattering modes are now preserved.
 - Reduction: added `ReductionPipeline.run_new()` to process only registered, unprocessed sample-scattering runs while logging individual failures without interrupting the remaining runs.
