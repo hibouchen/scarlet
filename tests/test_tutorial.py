@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -52,6 +53,11 @@ class TestTutorial(unittest.TestCase):
             command = call.call_args.args[0]
             self.assertEqual(command[1:4], ["-m", "jupyter", "lab"])
             self.assertEqual(command[4:], [str(expected_notebook), "--no-browser"])
+            environment = call.call_args.kwargs["env"]
+            self.assertEqual(
+                environment["PATH"].split(os.pathsep)[0],
+                str(Path(command[0]).parent),
+            )
 
     def test_main_uses_gui_launcher_when_no_destination(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -66,6 +72,11 @@ class TestTutorial(unittest.TestCase):
             command = call.call_args.args[0]
             self.assertEqual(command[1:4], ["-m", "jupyter", "lab"])
             self.assertEqual(command[4:], [str(notebook)])
+            environment = call.call_args.kwargs["env"]
+            self.assertEqual(
+                environment["PATH"].split(os.pathsep)[0],
+                str(Path(command[0]).parent),
+            )
 
     def test_main_returns_ok_when_gui_selection_is_cancelled(self) -> None:
         with mock.patch("scarlet.tutorial.select_notebook_with_gui", return_value=None):

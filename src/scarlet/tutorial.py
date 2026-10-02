@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from importlib import resources
+import os
 import shutil
 import subprocess
 import sys
@@ -41,7 +42,20 @@ def open_tutorial(
     command = [sys.executable, "-m", "jupyter", "lab", str(notebook_path)]
     if no_browser:
         command.append("--no-browser")
-    return int(subprocess.call(command))
+
+    # ipykernel's default kernelspec invokes ``python`` rather than the
+    # absolute interpreter path.  Entry points installed by pipx run from an
+    # isolated environment without activating it, so ensure that a child
+    # kernel resolves ``python`` to the same environment as this launcher.
+    environment = os.environ.copy()
+    interpreter_dir = str(Path(sys.executable).parent)
+    current_path = environment.get("PATH")
+    environment["PATH"] = (
+        interpreter_dir
+        if not current_path
+        else os.pathsep.join((interpreter_dir, current_path))
+    )
+    return int(subprocess.call(command, env=environment))
 
 
 class NotebookLauncherDialog:

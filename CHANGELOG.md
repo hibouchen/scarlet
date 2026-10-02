@@ -10,6 +10,8 @@ The project follows a simple Semantic Versioning policy:
 
 ## [Unreleased]
 
+- Notebook: ensured Jupyter kernels launched from a pipx installation use the same isolated Python environment as SCARLET.
+
 ## [0.3.0] - 2026-10-03
 
 - SANSLLB: improved acquisition-mode detection by prioritizing the physical beam-stop position and using the attenuator state before falling back to detector-image analysis.
