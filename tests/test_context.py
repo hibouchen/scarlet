@@ -530,7 +530,7 @@ class TestWorkflowContext(unittest.TestCase):
 
             self.assertAlmostEqual(ctx.get_sample_thickness("sample_a", "config_1"), 2.0)
 
-    def test_initialize_workflow_context_forces_scattering_mode_with_semi_transparent_beamstop(self) -> None:
+    def test_initialize_workflow_context_keeps_inferred_mode_with_semi_transparent_beamstop(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             raw_dir = root / "raw"
@@ -578,10 +578,10 @@ class TestWorkflowContext(unittest.TestCase):
                 )
 
             self.assertIn(
-                RunKey(config_id="config_1", entity="sample", mode="scattering", sample_name="sample_a"),
+                RunKey(config_id="config_1", entity="sample", mode="transmission", sample_name="sample_a"),
                 ctx.runs,
             )
-            mode_guess_mock.assert_not_called()
+            mode_guess_mock.assert_called_once()
 
     def test_initialize_workflow_context_keeps_empty_beam_transmission_in_semi_transparent_mode(self) -> None:
         with tempfile.TemporaryDirectory() as td:

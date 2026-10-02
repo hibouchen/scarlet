@@ -2770,21 +2770,18 @@ def _ingest_raw_directory_into_workflow_context(
         sample_name = metadata.sample_name
         entity = _classify_entity_from_sample_name(sample_name)
         sample_thickness = metadata.sample_thickness_mm
-        if ctx.get_transmission_strategy() == "semi_transparent_beamstop" and entity != "empty_beam":
+        if metadata.mode == "transmission":
+            mode = "transmission"
+        elif metadata.mode == "scattering":
             mode = "scattering"
         else:
-            if metadata.mode == "transmission":
-                mode = "transmission"
-            elif metadata.mode == "scattering":
-                mode = "scattering"
-            else:
-                mode = "transmission" if entity == "empty_beam" else "scattering"
-                ctx.warn(
-                    "Could not confidently infer measurement mode; using heuristic fallback",
-                    where=where,
-                    key=str(raw_path),
-                    guessed_mode=mode,
-                )
+            mode = "transmission" if entity == "empty_beam" else "scattering"
+            ctx.warn(
+                "Could not confidently infer measurement mode; using heuristic fallback",
+                where=where,
+                key=str(raw_path),
+                guessed_mode=mode,
+            )
 
         run_key = RunKey(
             config_id=config_id,

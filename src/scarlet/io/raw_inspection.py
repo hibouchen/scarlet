@@ -326,6 +326,46 @@ def _sansllb_aperture2(handle: h5py.File, instrument: str) -> Aperture:
     return Aperture(type="slit", x_gap=0.01, y_gap=0.01)
 
 
+def _sansllb_mode_from_instrument_state(
+    handle: h5py.File,
+    instrument: str,
+) -> MeasurementMode:
+    """Infer the SANS-LLB mode from the physical beam-stop position.
+
+    The semi-transparent beam stop leaves a direct-beam-like signal in
+    scattering images, so image morphology alone is not a reliable mode
+    discriminator.  SANS-LLB stores the beam-stop centre and size in the raw
+    file.  When its centre overlaps the beam axis the run is scattering; when
+    it is at least one beam-stop diameter away the beam is clear and the run
+    is transmission.  An inserted attenuator is a secondary transmission
+    signal when beam-stop metadata is missing.  Intermediate beam-stop
+    positions are deliberately left unknown for the image fallback (they
+    commonly occur during commissioning scans).
+    """
+    beam_stop = f"{instrument}/beam_stop"
+    x_mm = length_dataset_to_mm(safe_get_dataset(handle, f"{beam_stop}/x"))
+    y_mm = length_dataset_to_mm(safe_get_dataset(handle, f"{beam_stop}/y"))
+    size_mm = length_dataset_to_mm(safe_get_dataset(handle, f"{beam_stop}/size"))
+    if x_mm is not None and y_mm is not None and size_mm is not None:
+        if all(np.isfinite(value) for value in (x_mm, y_mm, size_mm)) and size_mm > 0.0:
+            distance_from_axis_mm = float(np.hypot(x_mm, y_mm))
+            if distance_from_axis_mm <= 0.5 * size_mm:
+                return "scattering"
+            if distance_from_axis_mm >= size_mm:
+                return "transmission"
+
+    attenuator_selection = _dataset_text(handle, f"{instrument}/attenuator/selection")
+    if attenuator_selection is not None:
+        normalized_selection = attenuator_selection.strip().lower()
+        try:
+            if float(normalized_selection) > 0.0:
+                return "transmission"
+        except ValueError:
+            if normalized_selection in {"in", "inserted", "attenuated", "closed"}:
+                return "transmission"
+    return "unknown"
+
+
 def _inspect_sansllb(path: Path) -> RawRunMetadata:
     from .converters.sansllb import _wavelength_dataset_to_angstrom
 
@@ -392,8 +432,8 @@ def _inspect_sansllb(path: Path) -> RawRunMetadata:
             ),
         )
         sample_name = _dataset_text(handle, f"{entry}/sample/name") or path.stem
-        mode = "unknown"
-        if detector_names:
+        mode = _sansllb_mode_from_instrument_state(handle, instrument)
+        if mode == "unknown" and detector_names:
             detector = handle[f"{instrument}/{detector_names[0]}"]
             if "data" in detector:
                 mode = _guess_from_image(detector["data"][()])

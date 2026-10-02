@@ -10,6 +10,13 @@ The project follows a simple Semantic Versioning policy:
 
 ## [Unreleased]
 
+- SANSLLB: improved acquisition-mode detection by prioritizing the physical beam-stop position and using the attenuator state before falling back to detector-image analysis.
+- Workflow: stopped forcing acquisitions to scattering mode when using the `semi_transparent_beamstop` transmission strategy; inferred transmission and scattering modes are now preserved.
+- Reduction: added `ReductionPipeline.run_new()` to process only registered, unprocessed sample-scattering runs while logging individual failures without interrupting the remaining runs.
+- Reduction API: renamed `ReductionPipeline.run_for_run()` to `run_for_runkey()` to make its `RunKey` input explicit.
+- Stitching: added incremental `StichingPipeline.run_new()` processing for ready samples, with stale-output detection, per-sample failure logging, and no implicit raw-data conversion.
+- Workflow: added live processing-status views for all registered runs and for runs containing the requested processed NeXus entry.
+
 ## [0.2.4] - 2026-09-14
 
 - CLI: removed the `reduce-2d` command, which depended on the deprecated `refs_sub` / `refs_norm` bundle workflow.

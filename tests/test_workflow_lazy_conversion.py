@@ -13,9 +13,19 @@ from scarlet.workflow.context import RunKey, initialize_workflow_context_from_ra
 from scarlet.workflow.pipeline import ReductionState
 
 
-def _write_d11_raw(path: Path, *, sample_name: str = "sample_a") -> None:
+def _write_d11_raw(
+    path: Path,
+    *,
+    sample_name: str = "sample_a",
+    measurement_mode: str = "scattering",
+) -> None:
     counts = np.zeros((7, 7, 1), dtype=np.float64)
-    counts[1:3, 1:3, 0] = 100.0
+    if measurement_mode == "scattering":
+        counts[0, 0, 0] = 100.0
+    elif measurement_mode == "transmission":
+        counts[3, 3, 0] = 100.0
+    else:
+        raise ValueError(f"Unsupported measurement mode: {measurement_mode}")
     with h5py.File(path, "w") as handle:
         entry = handle.create_group("entry0")
         entry.attrs["NX_class"] = np.bytes_("NXentry")
@@ -52,6 +62,30 @@ def _write_d11_raw(path: Path, *, sample_name: str = "sample_a") -> None:
 
 
 class TestWorkflowLazyConversion(unittest.TestCase):
+    def test_semi_transparent_strategy_does_not_override_detected_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            raw_directory = root / "raw"
+            output_directory = root / "out"
+            raw_directory.mkdir()
+            raw_path = raw_directory / "transmission.nxs"
+            _write_d11_raw(raw_path, measurement_mode="transmission")
+
+            workflow = initialize_workflow_context_from_raw_directory(
+                raw_directory,
+                output_dir=output_directory,
+                instrument_name="d11",
+                transmission_strategy="semi_transparent_beamstop",
+            )
+
+            key = RunKey(
+                config_id="config_1",
+                entity="sample",
+                mode="transmission",
+                sample_name="sample_a",
+            )
+            self.assertEqual(workflow.get_run_path(key), raw_path.resolve())
+
     def test_initialization_registers_raw_paths_without_converting(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
