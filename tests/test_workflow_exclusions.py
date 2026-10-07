@@ -12,6 +12,52 @@ from scarlet.workflow.context import RunKey, WorkflowContext
 
 
 class TestWorkflowExclusions(unittest.TestCase):
+    def test_exclude_run_removes_registration_and_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            file_path = Path(temporary_directory) / "empty_beam.hdf"
+            file_path.touch()
+            context = WorkflowContext()
+            key = RunKey(
+                config_id="config_1",
+                entity="empty_beam",
+                mode="scattering",
+                sample_name="EB",
+            )
+            context.add_run(key, file_path)
+
+            excluded_path = context.exclude_run(key, reason="Incomplete acquisition")
+
+            self.assertEqual(excluded_path, file_path.resolve())
+            self.assertNotIn(key, context.runs)
+            self.assertIsNone(context.get_empty_beam("config_1", "scattering"))
+            self.assertTrue(context.is_file_excluded(file_path))
+            event = context.active_excluded_files()[0]
+            self.assertEqual(event.reason, "Incomplete acquisition")
+            self.assertEqual(event.run_key, key.short())
+
+    def test_exclude_runs_uses_default_reason_and_removes_multiple_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            context = WorkflowContext()
+            keys = [
+                RunKey("config_1", "sample", "scattering", "sample-a"),
+                RunKey("config_1", "sample", "scattering", "sample-b"),
+            ]
+            paths = [root / "sample-a.hdf", root / "sample-b.hdf"]
+            for key, file_path in zip(keys, paths, strict=True):
+                file_path.touch()
+                context.add_run(key, file_path)
+
+            excluded_paths = context.exclude_runs(keys)
+
+            self.assertEqual(excluded_paths, [path.resolve() for path in paths])
+            self.assertEqual(context.runs, {})
+            self.assertEqual(len(context.active_excluded_files()), 2)
+            self.assertEqual(
+                {event.reason for event in context.active_excluded_files()},
+                {"Excluded by user"},
+            )
+
     def test_add_run_records_reinstatement_of_excluded_file(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             file_path = Path(temporary_directory) / "run.hdf"

@@ -62,6 +62,28 @@ class TestCli(unittest.TestCase):
         self.assertEqual(status, 0)
         run_viewer.assert_called_once_with(Path("tests/data/sam/raw_data"), instrument="sam")
 
+    def test_gui_command_dispatches_workflow_application(self) -> None:
+        with mock.patch("scarlet.gui.run_gui", return_value=0) as run_gui:
+            status = main(["gui", "tests/data/sam/raw_data", "--instrument", "sam"])
+
+        self.assertEqual(status, 0)
+        run_gui.assert_called_once_with(
+            initial_raw_directory=Path("tests/data/sam/raw_data"),
+            initial_workflow=None,
+            initial_instrument="sam",
+        )
+
+    def test_gui_command_opens_saved_workflow(self) -> None:
+        with mock.patch("scarlet.gui.run_gui", return_value=0) as run_gui:
+            status = main(["gui", "--workflow", "workflow.nxs"])
+
+        self.assertEqual(status, 0)
+        run_gui.assert_called_once_with(
+            initial_raw_directory=None,
+            initial_workflow=Path("workflow.nxs"),
+            initial_instrument="sansllb",
+        )
+
     def test_notebook_command_dispatches_tutorial_runner(self) -> None:
         with mock.patch("scarlet.tutorial.run", return_value=0) as run:
             status = main(["notebook", "notebooks", "--copy-only"])

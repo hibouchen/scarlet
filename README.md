@@ -123,6 +123,62 @@ SCARLET installs the main command:
 scarlet --help
 ```
 
+### Workflow application
+
+Open the desktop application and optionally preselect a raw data directory:
+
+```bash
+scarlet gui data/SANSLLB/raw_june --instrument sansllb
+```
+
+The application can create, inspect, refresh, save, and reopen a workflow
+context. Sample names, acquisition modes, entities, and positive optional
+thicknesses can be corrected directly in the table; configuration identifiers
+remain read-only. Rows can be searched, filtered, sorted from any column, and
+excluded in a multi-row selection. SCARLET records an automatic exclusion
+reason without prompting the user. CSV import/export supports larger edits,
+and a readiness indicator reports missing inputs before processing. The
+selected acquisition is also displayed below the table with the same detector
+mask-selection tools as the standalone NeXus viewer. Saving there creates a
+mask bundle in the workflow output folder and attaches it to the acquisition
+configuration. The standalone viewer remains available for independent NeXus
+inspection and mask editing.
+
+The **Settings** step sits between acquisition review and processing. It
+groups beam-center and transmission-ROI verification, mask assignment, and
+flatfield preparation by configuration.
+Its configuration overview already reports defined, missing, invalid, stale,
+or unavailable inputs and shows their detailed values when a row is selected.
+The beam-center editor uses the empty-beam transmission image, while the ROI
+editor uses the empty beam selected by the transmission strategy. Both load in
+the background. A center can be positioned by clicking the image and a ROI by
+dragging a rectangle; both remain editable numerically before saving. Separate
+automatic-detection buttons can propose a center or ROI without saving it
+until the user confirms the result. The selected configuration offers
+**Create flatfield** or **Rebuild flatfield** to prepare its water flatfield
+in the background using the current settings and masks. An existing validated
+flatfield file can be attached, or a configuration can reuse the flatfield of
+another active configuration. The **Transmission** tab can likewise declare
+that a configuration reuses transmissions from another active configuration;
+its transmission ROI follows that source, and any locally built flatfield is
+then invalidated.
+
+The **Processing** page lists sample-scattering reduction candidates, their
+pending/processed status, and the current readiness diagnostic. Select one or
+more rows to reduce them, or use **Process pending** to reduce all currently
+pending sample acquisitions. Reductions run in the background and the table is
+updated when the job finishes. The separate **Stitching** page merges every
+processed configuration of a selected sample. Its control table identifies
+already stitched samples from the presence of `<sample>_merged.txt` in the
+output folder. Select one or more ready samples to stitch them; a reference
+configuration can be chosen when a single sample is selected.
+Use **Settings → Stitching options…** to adjust and save the greedy-stitching
+algorithm parameters used for the workflow.
+
+The **Results** page discovers reduced and stitched I(Q) text files in the
+workflow output folder. Select multiple rows to overlay their curves in the
+silx plot, including their available intensity uncertainties.
+
 ### Notebook
 
 Open the SCARLET tutorial notebook launcher:

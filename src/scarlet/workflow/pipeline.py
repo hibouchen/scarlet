@@ -949,6 +949,99 @@ class ReductionPipeline:
 
 
 @dataclass(frozen=True)
+class StitchingOptions:
+    """Tunable parameters of the greedy stitching algorithm."""
+
+    start_policy: str = "lowest_q"
+    grid: str = "common"
+    n_common: int | None = None
+    min_points: int = 8
+    min_log_width: float = 0.10
+    slope_weight: float = 0.10
+    width_weight: float = 0.05
+    resolution_weight: float = 0.50
+    rho_ref: float = 0.20
+    max_chi2_red: float = 3.0
+    max_slope_z: float = 2.5
+    min_new_log_coverage: float = 0.05
+    segment_quality_weight: float = 4.0
+    new_coverage_weight: float = 1.5
+    keep_fraction: float = 0.25
+
+    def __post_init__(self) -> None:
+        if self.start_policy not in {"lowest_q", "best_low_q_quality"}:
+            raise ValueError("start_policy must be 'lowest_q' or 'best_low_q_quality'")
+        if self.grid not in {"common", "a", "b"}:
+            raise ValueError("grid must be 'common', 'a', or 'b'")
+        if self.n_common is not None and int(self.n_common) < 2:
+            raise ValueError("n_common must be None or >= 2")
+        if int(self.min_points) < 2:
+            raise ValueError("min_points must be >= 2")
+        numeric_values = {
+            "min_log_width": self.min_log_width,
+            "slope_weight": self.slope_weight,
+            "width_weight": self.width_weight,
+            "resolution_weight": self.resolution_weight,
+            "rho_ref": self.rho_ref,
+            "max_chi2_red": self.max_chi2_red,
+            "max_slope_z": self.max_slope_z,
+            "min_new_log_coverage": self.min_new_log_coverage,
+            "segment_quality_weight": self.segment_quality_weight,
+            "new_coverage_weight": self.new_coverage_weight,
+            "keep_fraction": self.keep_fraction,
+        }
+        if any(not np.isfinite(value) or value < 0.0 for value in numeric_values.values()):
+            raise ValueError("Stitching options must be finite and non-negative")
+
+    def as_dict(self) -> dict[str, str | int | float | None]:
+        """Return a JSON-serializable form suitable for a workflow context."""
+        return {
+            "start_policy": self.start_policy,
+            "grid": self.grid,
+            "n_common": self.n_common,
+            "min_points": int(self.min_points),
+            "min_log_width": float(self.min_log_width),
+            "slope_weight": float(self.slope_weight),
+            "width_weight": float(self.width_weight),
+            "resolution_weight": float(self.resolution_weight),
+            "rho_ref": float(self.rho_ref),
+            "max_chi2_red": float(self.max_chi2_red),
+            "max_slope_z": float(self.max_slope_z),
+            "min_new_log_coverage": float(self.min_new_log_coverage),
+            "segment_quality_weight": float(self.segment_quality_weight),
+            "new_coverage_weight": float(self.new_coverage_weight),
+            "keep_fraction": float(self.keep_fraction),
+        }
+
+    @classmethod
+    def from_dict(cls, values: object) -> "StitchingOptions":
+        """Build options from persisted workflow data, falling back to defaults."""
+        if not isinstance(values, dict):
+            return cls()
+        defaults = cls()
+        fields = defaults.as_dict()
+        values = {key: values.get(key, default) for key, default in fields.items()}
+        n_common = values["n_common"]
+        return cls(
+            start_policy=str(values["start_policy"]),
+            grid=str(values["grid"]),
+            n_common=None if n_common is None else int(n_common),
+            min_points=int(values["min_points"]),
+            min_log_width=float(values["min_log_width"]),
+            slope_weight=float(values["slope_weight"]),
+            width_weight=float(values["width_weight"]),
+            resolution_weight=float(values["resolution_weight"]),
+            rho_ref=float(values["rho_ref"]),
+            max_chi2_red=float(values["max_chi2_red"]),
+            max_slope_z=float(values["max_slope_z"]),
+            min_new_log_coverage=float(values["min_new_log_coverage"]),
+            segment_quality_weight=float(values["segment_quality_weight"]),
+            new_coverage_weight=float(values["new_coverage_weight"]),
+            keep_fraction=float(values["keep_fraction"]),
+        )
+
+
+@dataclass(frozen=True)
 class StichingPipeline:
     workflow: WorkflowContext
 
@@ -994,8 +1087,10 @@ class StichingPipeline:
         sample_name: str,
         scale_on: str | None = None,
         normalization_factor: float = 1.0,
+        options: StitchingOptions | None = None,
     ) -> np.ndarray:
         """Stitch the processed scattering runs currently available for one sample."""
+        options = options or StitchingOptions()
         run_keys = self._sample_run_keys(sample_name)
         if not run_keys:
             raise ValueError(f"No sample scattering runs registered for {sample_name!r}")
@@ -1016,20 +1111,7 @@ class StichingPipeline:
 
         result = st.stitch_segments_greedy(
             segments,
-            start_policy="lowest_q",
-            grid="common",
-            min_points=8,
-            min_log_width=0.10,
-            slope_weight=0.10,
-            width_weight=0.05,
-            resolution_weight=0.50,
-            rho_ref=0.20,
-            max_chi2_red=3.0,
-            max_slope_z=2.5,
-            min_new_log_coverage=0.05,
-            segment_quality_weight=4.0,
-            new_coverage_weight=1.5,
-            keep_fraction=0.25,
+            **options.as_dict(),
         )
         if scale_on in processed_config_ids:
             result = st.rebase_result_to_reference(
@@ -1071,14 +1153,17 @@ class StichingPipeline:
         self,
         scale_on: str | None = None,
         normalization_factor: float = 1.0,
+        options: StitchingOptions | None = None,
     ) -> dict[str, np.ndarray]:
         """Stitch every registered sample, raising on the first failure."""
+        kwargs: dict[str, Any] = {
+            "scale_on": scale_on,
+            "normalization_factor": normalization_factor,
+        }
+        if options is not None:
+            kwargs["options"] = options
         return {
-            sample_name: self.run_for_sample(
-                sample_name,
-                scale_on=scale_on,
-                normalization_factor=normalization_factor,
-            )
+            sample_name: self.run_for_sample(sample_name, **kwargs)
             for sample_name in self._sample_names()
         }
 
@@ -1086,6 +1171,7 @@ class StichingPipeline:
         self,
         scale_on: str | None = None,
         normalization_factor: float = 1.0,
+        options: StitchingOptions | None = None,
     ) -> dict[str, np.ndarray]:
         """Stitch ready samples without current merged outputs, logging failures."""
         pending_samples = [
@@ -1095,13 +1181,15 @@ class StichingPipeline:
         ]
         results: dict[str, np.ndarray] = {}
         failed_count = 0
+        kwargs: dict[str, Any] = {
+            "scale_on": scale_on,
+            "normalization_factor": normalization_factor,
+        }
+        if options is not None:
+            kwargs["options"] = options
         for sample_name in pending_samples:
             try:
-                results[sample_name] = self.run_for_sample(
-                    sample_name,
-                    scale_on=scale_on,
-                    normalization_factor=normalization_factor,
-                )
+                results[sample_name] = self.run_for_sample(sample_name, **kwargs)
             except Exception as exc:
                 failed_count += 1
                 self.workflow.error(

@@ -50,6 +50,7 @@ nav:
       - Tutorial: tutorial.md
   - Use SCARLET:
       - Workflow context: workflow.md
+      - Graphical interface design: gui-design.md
       - Command line: cli.md
       - Data format: format.md
       - NeXus schemas: schemas.md

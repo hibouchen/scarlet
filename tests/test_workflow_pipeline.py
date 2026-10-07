@@ -18,6 +18,7 @@ from scarlet.workflow.context import RunKey, WorkflowContext
 from scarlet.workflow.pipeline import (
     ReductionPipeline,
     ReductionState,
+    StitchingOptions,
     StichingPipeline,
     azimuthal_averaging_step,
     save_azimuthal_text_step,
@@ -258,12 +259,24 @@ class TestStichingPipeline(unittest.TestCase):
                     side_effect=AssertionError("stitching must not prepare or convert runs"),
                 ) as prepare,
                 mock.patch.object(st, "load_segment_from_nexus", return_value=[object()]) as load,
-                mock.patch.object(st, "stitch_segments_greedy", return_value=result),
+                mock.patch.object(st, "stitch_segments_greedy", return_value=result) as stitch,
             ):
-                final_data = pipeline.run_for_sample("sample_a")
+                final_data = pipeline.run_for_sample(
+                    "sample_a",
+                    options=StitchingOptions(
+                        start_policy="best_low_q_quality",
+                        grid="a",
+                        n_common=16,
+                        min_points=12,
+                    ),
+                )
 
             prepare.assert_not_called()
             load.assert_called_once_with(processed_path.resolve(), config_id="cfg_1")
+            self.assertEqual(stitch.call_args.kwargs["start_policy"], "best_low_q_quality")
+            self.assertEqual(stitch.call_args.kwargs["grid"], "a")
+            self.assertEqual(stitch.call_args.kwargs["n_common"], 16)
+            self.assertEqual(stitch.call_args.kwargs["min_points"], 12)
             np.testing.assert_allclose(final_data[:, :4], [[0.1, 2.0, 0.2, 0.01]])
             self.assertTrue((root / "out" / "sample_a_merged.txt").exists())
 

@@ -197,6 +197,24 @@ class TestWorkflowNormalizationRegistry(unittest.TestCase):
             self.assertEqual(attached, {"cfg_a": mask_path.resolve()})
             self.assertEqual(ctx.get_mask_file("cfg_a"), mask_path.resolve())
 
+    def test_find_compatible_mask_bundle_does_not_attach_it(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ctx = WorkflowContext(output_dir=root)
+            ctx.configurations["cfg_a"] = Configuration(
+                wavelength=6.0,
+                sample_detector_distance=4.2,
+                collimation=_test_collimation(),
+                config_id="cfg_a",
+            )
+            mask_path = root / "cfg_a_masks.nxs"
+            _write_mask_bundle(mask_path, {0: np.asarray([[1, 0], [0, 1]], dtype=np.uint8)})
+
+            found = ctx.find_compatible_mask_bundle("cfg_a")
+
+            self.assertEqual(found, mask_path.resolve())
+            self.assertIsNone(ctx.get_mask_file("cfg_a"))
+
     def test_attach_mask_bundles_from_output_dir_matches_source_file_when_snapshot_is_stale(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

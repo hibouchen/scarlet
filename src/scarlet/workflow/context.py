@@ -5,6 +5,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from html import escape
 import json
+import math
 from pathlib import Path
 import re
 from typing import Any, Dict, Iterable, Iterator, Literal, Mapping, Optional, cast
@@ -254,6 +255,15 @@ class WorkflowContext:
             self.set_water(key.config_id, key.mode, file_path)
             self.invalidate_flatfield(key.config_id)
 
+    def _rebuild_reference_stores(self) -> None:
+        """Rebuild derived reference registries from the canonical run mapping."""
+        self.dark.clear()
+        self.empty_beam.clear()
+        self.empty_cell.clear()
+        self.water.clear()
+        for key, file_path in self.runs.items():
+            self._sync_reference_store(key, file_path)
+
     def _allocate_run_key(self, key: RunKey) -> RunKey:
         """Return a unique run key, preserving duplicate logical runs."""
         candidate = key
@@ -276,6 +286,188 @@ class WorkflowContext:
             run_key=stored_key.short(),
         )
         return stored_key
+
+    def replace_run(
+        self,
+        old_key: RunKey,
+        new_key: RunKey,
+        file_path: str | Path | None = None,
+    ) -> RunKey:
+        """Replace one run registration and return its allocated logical key.
+
+        Duplicate logical keys are preserved using ``duplicate_index``. The
+        dedicated reference registries are rebuilt so changing a mode or an
+        entity cannot leave a stale empty-beam, empty-cell, dark, or water
+        reference behind.
+        """
+        if old_key not in self.runs:
+            raise KeyError(f"Run is not registered in the workflow: {old_key.short()}")
+        if not new_key.config_id.strip():
+            raise ValueError("Run configuration ID must not be empty")
+        if new_key.mode not in {"scattering", "transmission"}:
+            raise ValueError(f"Invalid run mode: {new_key.mode!r}")
+        if new_key.entity not in {"sample", "empty_beam", "empty_cell", "dark", "water"}:
+            raise ValueError(f"Invalid run entity: {new_key.entity!r}")
+        if new_key.entity == "sample" and not (new_key.sample_name or "").strip():
+            raise ValueError("A sample run requires a non-empty sample name")
+
+        previous_path = self.runs[old_key]
+        resolved_path = previous_path if file_path is None else self._resolve_path(Path(file_path))
+        if new_key == old_key and resolved_path == previous_path:
+            return old_key
+
+        base_key = replace(new_key, duplicate_index=0)
+        occupied_keys = set(self.runs).difference({old_key})
+        stored_key = base_key
+        duplicate_index = 0
+        while stored_key in occupied_keys:
+            duplicate_index += 1
+            stored_key = replace(base_key, duplicate_index=duplicate_index)
+
+        updated_runs: Dict[RunKey, Path] = {}
+        for key, path in self.runs.items():
+            if key == old_key:
+                updated_runs[stored_key] = resolved_path
+            else:
+                updated_runs[key] = path
+        self.runs.clear()
+        self.runs.update(updated_runs)
+
+        self.invalidate_flatfield(old_key.config_id)
+        self.invalidate_flatfield(stored_key.config_id)
+        self._rebuild_reference_stores()
+        self.info(
+            "Workflow run updated",
+            where="replace_run",
+            key=stored_key.short(),
+            previous_key=old_key.short(),
+            file_path=str(resolved_path),
+            previous_mode=old_key.mode,
+            new_mode=stored_key.mode,
+            previous_entity=old_key.entity,
+            new_entity=stored_key.entity,
+        )
+        return stored_key
+
+    def exclude_run(
+        self,
+        key: RunKey,
+        *,
+        reason: str | None = None,
+        source: str = "manual",
+    ) -> Path:
+        """Remove one registered run and append an exclusion-history event."""
+        return self.exclude_runs([key], reason=reason, source=source)[0]
+
+    def rename_sample(self, key: RunKey, sample_name: str) -> dict[RunKey, RunKey]:
+        """Rename all modes of one sample/configuration pair atomically."""
+        if key not in self.runs:
+            raise KeyError(f"Run is not registered in the workflow: {key.short()}")
+        if key.entity != "sample" or not key.sample_name:
+            raise ValueError("Only sample runs can be renamed")
+        normalized_name = sample_name.strip()
+        if not normalized_name:
+            raise ValueError("Sample name must not be empty")
+        if normalized_name == key.sample_name:
+            return {key: key}
+
+        affected_keys = [
+            candidate
+            for candidate in self.runs
+            if candidate.entity == "sample"
+            and candidate.config_id == key.config_id
+            and candidate.sample_name == key.sample_name
+        ]
+        conflicting_keys = [
+            candidate
+            for candidate in self.runs
+            if candidate.entity == "sample"
+            and candidate.config_id == key.config_id
+            and candidate.sample_name == normalized_name
+            and candidate not in affected_keys
+        ]
+        if conflicting_keys:
+            raise ValueError(
+                f"Sample {normalized_name!r} already exists for configuration {key.config_id!r}"
+            )
+
+        old_storage_key = (key.sample_name, key.config_id)
+        new_storage_key = (normalized_name, key.config_id)
+        for metadata, label in (
+            (self.sample_thicknesses, "thickness"),
+            (self.transmissions, "transmission"),
+        ):
+            if old_storage_key in metadata and new_storage_key in metadata:
+                raise ValueError(
+                    f"Sample {normalized_name!r} already has stored {label} metadata "
+                    f"for configuration {key.config_id!r}"
+                )
+
+        replacements: dict[RunKey, RunKey] = {}
+        updated_runs: Dict[RunKey, Path] = {}
+        for candidate, path in self.runs.items():
+            if candidate not in affected_keys:
+                updated_runs[candidate] = path
+                continue
+            base_key = replace(candidate, sample_name=normalized_name, duplicate_index=0)
+            stored_key = _allocate_unique_run_key(updated_runs, base_key)
+            replacements[candidate] = stored_key
+            updated_runs[stored_key] = path
+
+        self.runs.clear()
+        self.runs.update(updated_runs)
+        for metadata in (self.sample_thicknesses, self.transmissions):
+            if old_storage_key in metadata:
+                metadata[new_storage_key] = metadata.pop(old_storage_key)
+        self.info(
+            "Workflow sample renamed",
+            where="rename_sample",
+            previous_sample_name=key.sample_name,
+            sample_name=normalized_name,
+            config_id=key.config_id,
+            renamed_count=len(replacements),
+        )
+        return replacements
+
+    def exclude_runs(
+        self,
+        keys: Iterable[RunKey],
+        *,
+        reason: str | None = None,
+        source: str = "manual",
+    ) -> list[Path]:
+        """Remove several registered runs as one validated exclusion operation."""
+        unique_keys = list(dict.fromkeys(keys))
+        if not unique_keys:
+            return []
+        missing = [key for key in unique_keys if key not in self.runs]
+        if missing:
+            missing_text = ", ".join(key.short() for key in missing)
+            raise KeyError(f"Runs are not registered in the workflow: {missing_text}")
+        normalized_reason = (reason or "").strip() or "Excluded by user"
+
+        excluded_paths: list[Path] = []
+        for key in unique_keys:
+            file_path = self.runs.pop(key)
+            excluded_paths.append(file_path)
+            self.exclude_file(
+                file_path,
+                reason=normalized_reason,
+                source=source,
+                run_key=key,
+            )
+            self.invalidate_flatfield(key.config_id)
+        self._rebuild_reference_stores()
+        self.info(
+            "Workflow runs excluded",
+            where="exclude_runs",
+            keys=[key.short() for key in unique_keys],
+            file_paths=[str(path) for path in excluded_paths],
+            excluded_count=len(excluded_paths),
+            reason=normalized_reason,
+            source=source,
+        )
+        return excluded_paths
 
     def get_run_path(self, key: RunKey) -> Optional[Path]:
         """Return the registered raw path for a run key, or ``None`` when missing."""
@@ -1457,6 +1649,35 @@ class WorkflowContext:
         """Store one detector beam center for a configuration."""
         self.beam_centers.setdefault(config_id, {})[detector_number] = center
 
+    def update_beam_center(
+        self,
+        config_id: str,
+        detector_number: int,
+        center: BeamCenter,
+    ) -> BeamCenter:
+        """Validate a user beam-center correction and invalidate its flatfield."""
+        normalized_config = str(config_id).strip()
+        detector_number = int(detector_number)
+        if not normalized_config:
+            raise ValueError("config_id must not be empty")
+        if detector_number < 0:
+            raise ValueError("detector_number must be >= 0")
+        if len(center) != 2:
+            raise ValueError("beam center must contain exactly x and y")
+        normalized_center = (float(center[0]), float(center[1]))
+        if not all(math.isfinite(value) for value in normalized_center):
+            raise ValueError("beam center coordinates must be finite")
+        self.set_beam_center(normalized_config, detector_number, normalized_center)
+        self.invalidate_flatfield(normalized_config)
+        self.info(
+            "Workflow beam center updated",
+            where="update_beam_center",
+            config_id=normalized_config,
+            detector_number=detector_number,
+            center=normalized_center,
+        )
+        return normalized_center
+
     def get_beam_center(self, config_id: str, detector_number: int) -> Optional[BeamCenter]:
         """Return one detector beam center for a configuration, or ``None`` when missing."""
         return self.beam_centers.get(config_id, {}).get(detector_number)
@@ -1464,6 +1685,41 @@ class WorkflowContext:
     def set_roi(self, config_id: str, roi: TransmissionRoi) -> None:
         """Store the transmission ROI for a configuration."""
         self.rois[config_id] = roi
+
+    def update_roi(self, config_id: str, roi: TransmissionRoi) -> TransmissionRoi:
+        """Validate a user ROI correction and invalidate dependent results."""
+        normalized_config = str(config_id).strip()
+        if not normalized_config:
+            raise ValueError("config_id must not be empty")
+        if len(roi) != 4:
+            raise ValueError("transmission ROI must contain x0, x1, y0, and y1")
+        normalized_roi = tuple(int(value) for value in roi)
+        x0, x1, y0, y1 = normalized_roi
+        if not (0 <= x0 < x1 and 0 <= y0 < y1):
+            raise ValueError("transmission ROI must satisfy 0 <= x0 < x1 and 0 <= y0 < y1")
+        self.set_roi(normalized_config, cast(TransmissionRoi, normalized_roi))
+
+        affected_configs = {normalized_config}
+        known_configs = set(self.configurations).union(
+            key.config_id for key in self.runs
+        ).union(self.transmission_sources)
+        for candidate in known_configs:
+            if self.resolve_transmission_config(candidate) == normalized_config:
+                affected_configs.add(candidate)
+        for storage_key in list(self.transmissions):
+            if storage_key[1] == normalized_config:
+                self.transmissions.pop(storage_key, None)
+        self.empty_cell_transmissions.pop(normalized_config, None)
+        for affected_config in affected_configs:
+            self.invalidate_flatfield(affected_config)
+        self.info(
+            "Workflow transmission ROI updated",
+            where="update_roi",
+            config_id=normalized_config,
+            roi=normalized_roi,
+            invalidated_configs=sorted(affected_configs),
+        )
+        return cast(TransmissionRoi, normalized_roi)
 
     def get_roi(self, config_id: str) -> Optional[TransmissionRoi]:
         """Return the transmission ROI for a configuration, or ``None`` when missing."""
@@ -1589,6 +1845,31 @@ class WorkflowContext:
         """Store one sample thickness in millimeters."""
         self.sample_thicknesses[(sample_name, config_id)] = float(value)
 
+    def update_run_thickness(self, key: RunKey, value: float | None) -> float | None:
+        """Set or clear a run's strictly positive sample thickness in millimeters."""
+        if key not in self.runs:
+            raise KeyError(f"Run is not registered in the workflow: {key.short()}")
+        if key.entity not in {"sample", "water"} or not key.sample_name:
+            raise ValueError("Thickness is only available for sample and water runs")
+
+        storage_key = (key.sample_name, key.config_id)
+        if value is None:
+            self.sample_thicknesses.pop(storage_key, None)
+            normalized_value = None
+        else:
+            normalized_value = float(value)
+            if not math.isfinite(normalized_value) or normalized_value <= 0.0:
+                raise ValueError("Thickness must be strictly positive or empty")
+            self.sample_thicknesses[storage_key] = normalized_value
+
+        self.info(
+            "Workflow run thickness updated",
+            where="update_run_thickness",
+            key=key.short(),
+            thickness_mm=normalized_value,
+        )
+        return normalized_value
+
     def get_sample_thickness(self, sample_name: str, config_id: str) -> Optional[float]:
         """Return one stored sample thickness in millimeters, or ``None`` when missing."""
         return self.sample_thicknesses.get((sample_name, config_id))
@@ -1710,6 +1991,41 @@ class WorkflowContext:
         for bundle_config_id, path in selected.items():
             self.set_mask_file(bundle_config_id, path)
         return dict(selected)
+
+    def find_compatible_mask_bundle(
+        self,
+        config_id: str,
+        *,
+        output_dir: str | Path | None = None,
+    ) -> Optional[Path]:
+        """Return the newest compatible ``SCARLET_masks`` bundle for one configuration.
+
+        This lookup is deliberately read-only. It uses the same source-file and
+        geometry matching rules as bulk output-directory attachment, but leaves
+        attaching the selected bundle to the caller.
+        """
+        config_id = str(config_id).strip()
+        if not config_id:
+            raise ValueError("config_id must not be empty")
+        search_root = self.output_dir if output_dir is None else self._resolve_path(Path(output_dir))
+        if not search_root.is_dir():
+            return None
+
+        candidates: list[Path] = []
+        for path in sorted(search_root.rglob("*")):
+            if not path.is_file() or not _is_hdf5_file(path):
+                continue
+            try:
+                definition, _bundle_config_id = _read_bundle_definition_and_config_id(path)
+                if definition != "SCARLET_masks":
+                    continue
+                if config_id in self._find_matching_config_ids_for_mask_bundle(path):
+                    candidates.append(path.resolve())
+            except Exception:
+                continue
+        if not candidates:
+            return None
+        return max(candidates, key=lambda candidate: (candidate.stat().st_mtime, str(candidate)))
 
     def _find_matching_config_ids_for_mask_bundle(self, file_path: Path) -> list[str]:
         """Return workflow configuration ids compatible with one mask bundle snapshot."""

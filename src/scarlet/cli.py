@@ -235,6 +235,22 @@ def _cmd_viewer(args: argparse.Namespace) -> int:
         return 2
 
 
+def _cmd_gui(args: argparse.Namespace) -> int:
+    from scarlet.gui import run_gui
+
+    try:
+        return int(
+            run_gui(
+                initial_raw_directory=None if args.raw_directory is None else Path(args.raw_directory),
+                initial_workflow=None if args.workflow is None else Path(args.workflow),
+                initial_instrument=args.instrument,
+            )
+        )
+    except (FileNotFoundError, NotADirectoryError, ValueError, OSError) as e:
+        print(str(e), file=sys.stderr)
+        return 2
+
+
 def _cmd_tutorial(args: argparse.Namespace) -> int:
     from scarlet.tutorial import run
 
@@ -326,6 +342,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Instrument used to convert raw files before display (default: sansllb)",
     )
     viewer.set_defaults(func=_cmd_viewer)
+
+    gui = sub.add_parser("gui", help="Open the SCARLET workflow application")
+    gui.add_argument("raw_directory", nargs="?", help="Raw acquisition folder to preselect")
+    gui.add_argument("--workflow", help="Saved SCARLET workflow to open")
+    gui.add_argument(
+        "--instrument",
+        choices=("sam", "sansllb"),
+        default="sansllb",
+        help="Initial instrument selection (default: sansllb)",
+    )
+    gui.set_defaults(func=_cmd_gui)
 
     tutorial = sub.add_parser("notebook", help="Open the packaged SCARLET tutorial notebook")
     tutorial.add_argument(
