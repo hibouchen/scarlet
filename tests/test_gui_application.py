@@ -10,7 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import h5py
 import numpy as np
-from PySide6 import QtCore, QtTest, QtWidgets
+from PySide6 import QtCore, QtGui, QtTest, QtWidgets
 
 from scarlet.gui.jobs import JobController
 from scarlet.gui.main_window import ScarletMainWindow
@@ -33,6 +33,7 @@ from scarlet.gui.readiness import assess_workflow_readiness
 from scarlet.gui.settings_data import (
     SettingsImagePayload,
     detect_settings_geometry,
+    load_center_from_empty_beam_file,
     load_settings_image,
 )
 from scarlet.gui.widgets import SettingsImageView, StitchingOptionsDialog
@@ -61,6 +62,8 @@ def _write_settings_image_file(path: Path, image: np.ndarray) -> None:
         detector.attrs["NX_class"] = b"NXdetector"
         detector.create_dataset("data", data=np.asarray(image, dtype=np.float64))
         detector.create_dataset("deadtime_corrected", data=True)
+        detector.create_dataset("beam_center_x", data=2.25)
+        detector.create_dataset("beam_center_y", data=1.75)
 
 
 class TestRunsTableModel(unittest.TestCase):
@@ -157,6 +160,7 @@ class TestRunsTableModel(unittest.TestCase):
             workflow = WorkflowContext(root_dir=root, output_dir=root / "processed")
             key = RunKey("config_1", "sample", "scattering", "sample-a")
             workflow.add_run(key, raw_path)
+            workflow.set_beam_center("config_1", 0, (2.0, 1.5))
             model = RunsTableModel()
             model.set_workflow(workflow)
             index = model.index(0, model.column_index("thickness"))
@@ -426,7 +430,15 @@ class TestRunsTableModel(unittest.TestCase):
             page.show()
             app.processEvents()
 
-            page.set_preview(SimpleNamespace(run_key=key, source=source, masks={}))
+            page.set_preview(
+                SimpleNamespace(
+                    run_key=key,
+                    source=source,
+                    masks={},
+                    beam_centers={0: (2.0, 1.5)},
+                )
+            )
+            self.assertEqual(page.mask_editor._detector_tabs[0].beam_center, (2.0, 1.5))
             page.table.clearSelection()  # Happens after raw-file conversion rebuilds the model.
             emitted: list[tuple[str, MaskEditorSource, dict[int, np.ndarray]]] = []
             page.mask_save_requested.connect(
@@ -676,6 +688,13 @@ class TestResultsPage(unittest.TestCase):
             app.processEvents()
 
             self.assertEqual(len(page.plot.getAllCurves()), 2)
+            self.assertTrue(page.legend_dock.isVisible())
+            legend_view = page.legend_dock.findChild(QtWidgets.QAbstractItemView)
+            self.assertIsNotNone(legend_view)
+            self.assertEqual(
+                legend_view.palette().color(QtGui.QPalette.ColorRole.Text).name(),
+                "#202124",
+            )
             self.assertEqual(page.error_label.text(), "")
             page.close()
 
@@ -732,6 +751,13 @@ class TestSettingsPage(unittest.TestCase):
             x0, x1, y0, y1 = detected_roi.roi
             self.assertLess(x0, x1)
             self.assertLess(y0, y1)
+
+            stored_center = load_center_from_empty_beam_file(
+                workflow,
+                config_id="config_1",
+                detector_number=0,
+            )
+            self.assertEqual(stored_center.center, (2.25, 1.75))
 
     def test_image_view_emits_center_and_roi_graphical_edits(self) -> None:
         app = _application()
@@ -907,6 +933,13 @@ class TestSettingsPage(unittest.TestCase):
                     ("config_1", "roi", 0),
                 ],
             )
+
+            file_requests: list[tuple[str, int]] = []
+            page.center_file_requested.connect(
+                lambda config, detector: file_requests.append((config, detector))
+            )
+            page.load_center_button.click()
+            self.assertEqual(file_requests, [("config_1", 0)])
 
             payload = SettingsImagePayload(
                 config_id="config_1",

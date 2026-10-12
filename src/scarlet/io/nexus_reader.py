@@ -157,6 +157,38 @@ def read_detector_deadtime(file_path: Path | str, detector_number: int) -> float
     return read_deadtime_value(file_path, detector_number)
 
 
+def read_detector_beam_center(
+    file_path: Path | str,
+    detector_number: int,
+) -> tuple[float, float]:
+    """Read the stored ``(x, y)`` beam-center coordinates for one detector.
+
+    Converted measurement files store the coordinates in the detector group,
+    while reference bundles may store them in the optional ``beam_center``
+    collection. Both layouts are supported.
+    """
+    file_path = Path(file_path).resolve()
+    detector_number = int(detector_number)
+    if detector_number < 0:
+        raise ValueError(f"Detector index must be >= 0, got {detector_number}")
+
+    with h5py.File(file_path, "r") as handle:
+        entry_path = _resolve_entry_path(handle, file_path=file_path)
+        detector_root = f"{entry_path}/instrument/detector{detector_number}"
+        beam_center_x_path = f"{detector_root}/beam_center_x"
+        beam_center_y_path = f"{detector_root}/beam_center_y"
+        if beam_center_x_path not in handle or beam_center_y_path not in handle:
+            fallback_root = f"{entry_path}/beam_center/detector{detector_number}"
+            beam_center_x_path = f"{fallback_root}/beam_center_x"
+            beam_center_y_path = f"{fallback_root}/beam_center_y"
+        if beam_center_x_path not in handle or beam_center_y_path not in handle:
+            raise ValueError(f"Missing beam center for detector{detector_number} in {file_path}")
+        return (
+            float(np.asarray(handle[beam_center_x_path][()]).reshape(())),
+            float(np.asarray(handle[beam_center_y_path][()]).reshape(())),
+        )
+
+
 def read_empty_beam_transmission_source_file(file_path: Path | str) -> Path:
     """Read the source-file path of ``empty_beam_transmission`` from a refs bundle."""
     file_path = Path(file_path).resolve()

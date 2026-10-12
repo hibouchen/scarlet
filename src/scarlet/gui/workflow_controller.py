@@ -14,7 +14,11 @@ from scarlet.workflow.pipeline import StitchingOptions
 from .jobs import JobController, JobFailure
 from .mask_editor import MaskEditorSource, write_mask_bundle
 from .scarlet_viewer import build_mask_source
-from .settings_data import detect_settings_geometry, load_settings_image
+from .settings_data import (
+    detect_settings_geometry,
+    load_center_from_empty_beam_file,
+    load_settings_image,
+)
 
 
 @dataclass(frozen=True)
@@ -24,6 +28,7 @@ class AcquisitionPreviewPayload:
     run_key: RunKey
     source: MaskEditorSource
     masks: dict[int, Any]
+    beam_centers: dict[int, tuple[float, float]]
     converted_for_preview: bool
     display_count_time: float | None
 
@@ -167,6 +172,22 @@ class WorkflowController(QtCore.QObject):
             ),
         )
 
+    def load_center_from_empty_beam_file(
+        self,
+        config_id: str,
+        detector_number: int,
+    ) -> None:
+        """Read the beam-center metadata stored in an empty-beam file."""
+        workflow = self._require_workflow()
+        self._jobs.start(
+            "settings_load_center",
+            lambda: load_center_from_empty_beam_file(
+                workflow,
+                config_id=config_id,
+                detector_number=int(detector_number),
+            ),
+        )
+
     @QtCore.Slot(object)
     def load_acquisition_preview(self, run_key: object) -> None:
         workflow = self._require_workflow()
@@ -204,6 +225,12 @@ class WorkflowController(QtCore.QObject):
                 run_key=run_key,
                 source=source,
                 masks=workflow.get_masks(run_key.config_id),
+                beam_centers={
+                    detector_number: center
+                    for detector_number in source.detector_data
+                    if (center := workflow.get_beam_center(run_key.config_id, detector_number))
+                    is not None
+                },
                 converted_for_preview=prepared_path.resolve() != raw_path.resolve(),
                 display_count_time=display_count_time,
             )
@@ -801,14 +828,13 @@ class WorkflowController(QtCore.QObject):
             exported_path = Path(result).resolve()
             self._set_dirty(True)
             self.activity.emit("INFO", f"Exported acquisitions to {exported_path}.")
-        elif kind in {"settings_image", "settings_detect"}:
+        elif kind in {"settings_image", "settings_detect", "settings_load_center"}:
             self._set_dirty(True)
             self.settings_image_loaded.emit(result)
-            action = (
-                "Detected geometry from"
-                if kind == "settings_detect"
-                else "Loaded Settings image from"
-            )
+            action = {
+                "settings_detect": "Detected geometry from",
+                "settings_load_center": "Loaded beam center from",
+            }.get(kind, "Loaded Settings image from")
             self.activity.emit("INFO", f"{action} {result.source_path}.")
         elif kind == "acquisition_preview":
             if result.converted_for_preview:

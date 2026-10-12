@@ -183,6 +183,9 @@ class ScarletMainWindow(QtWidgets.QMainWindow):
         self.settings_page.auto_detect_requested.connect(
             self.controller.detect_settings_geometry
         )
+        self.settings_page.center_file_requested.connect(
+            self.controller.load_center_from_empty_beam_file
+        )
         self.settings_page.beam_center_change_requested.connect(
             self.controller.update_beam_center
         )

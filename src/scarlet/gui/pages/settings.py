@@ -16,6 +16,7 @@ class SettingsPage(QtWidgets.QWidget):
 
     image_requested = QtCore.Signal(str, str, int)
     auto_detect_requested = QtCore.Signal(str, str, int)
+    center_file_requested = QtCore.Signal(str, int)
     beam_center_change_requested = QtCore.Signal(str, int, object)
     roi_change_requested = QtCore.Signal(str, object)
     flatfield_build_requested = QtCore.Signal(str)
@@ -91,8 +92,10 @@ class SettingsPage(QtWidgets.QWidget):
         center_form = QtWidgets.QFormLayout()
         center_form.addRow("Center X", self.center_x_spin)
         center_form.addRow("Center Y", self.center_y_spin)
+        self.load_center_button = QtWidgets.QPushButton("Load center from file")
         self.detect_center_button = QtWidgets.QPushButton("Detect center automatically")
         self.save_center_button = QtWidgets.QPushButton("Save beam center")
+        center_form.addRow(self.load_center_button)
         center_form.addRow(self.detect_center_button)
         center_form.addRow(self.save_center_button)
         self.center_editor = QtWidgets.QWidget()
@@ -217,6 +220,7 @@ class SettingsPage(QtWidgets.QWidget):
         self.purpose_combo.currentIndexChanged.connect(self._purpose_changed)
         self.detector_combo.currentIndexChanged.connect(self._metadata_selection_changed)
         self.load_image_button.clicked.connect(self._request_image)
+        self.load_center_button.clicked.connect(self._request_center_from_file)
         self.detect_center_button.clicked.connect(self._request_auto_detection)
         self.detect_roi_button.clicked.connect(self._request_auto_detection)
         self.save_center_button.clicked.connect(self._save_center)
@@ -272,6 +276,7 @@ class SettingsPage(QtWidgets.QWidget):
             self.purpose_combo,
             self.detector_combo,
             self.load_image_button,
+            self.load_center_button,
             self.detect_center_button,
             self.detect_roi_button,
             self.save_center_button,
@@ -591,6 +596,12 @@ class SettingsPage(QtWidgets.QWidget):
         if config_id is not None:
             detector = self._detector_number() if self._purpose() == "center" else 0
             self.auto_detect_requested.emit(config_id, self._purpose(), detector)
+
+    @QtCore.Slot()
+    def _request_center_from_file(self) -> None:
+        config_id = self._selected_config_id()
+        if config_id is not None:
+            self.center_file_requested.emit(config_id, self._detector_number())
 
     @QtCore.Slot()
     def _save_center(self) -> None:

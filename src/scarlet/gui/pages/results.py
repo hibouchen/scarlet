@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 from silx.gui.plot import Plot1D
 
 from scarlet.workflow import WorkflowContext
@@ -51,6 +51,25 @@ class ResultsPage(QtWidgets.QWidget):
         self.plot.setGraphTitle("I(q) curves")
         self.plot.setGraphGrid(True)
         self.plot.setDataMargins(0.05, 0.05, 0.05, 0.05)
+        # Plot1D provides a native, dockable silx legend panel. Keep it open
+        # so every selected curve can be identified by its output-file name.
+        self.legend_dock = self.plot.getLegendsDockWidget()
+        self.legend_dock.setWindowTitle("Curves")
+        legend_view = self.legend_dock.findChild(QtWidgets.QAbstractItemView)
+        if legend_view is not None:
+            palette = legend_view.palette()
+            palette.setColor(QtGui.QPalette.ColorRole.Window, QtGui.QColor("#ffffff"))
+            palette.setColor(QtGui.QPalette.ColorRole.Base, QtGui.QColor("#ffffff"))
+            palette.setColor(QtGui.QPalette.ColorRole.WindowText, QtGui.QColor("#202124"))
+            palette.setColor(QtGui.QPalette.ColorRole.Text, QtGui.QColor("#202124"))
+            palette.setColor(QtGui.QPalette.ColorRole.Highlight, QtGui.QColor("#245a92"))
+            palette.setColor(QtGui.QPalette.ColorRole.HighlightedText, QtGui.QColor("#ffffff"))
+            legend_view.setPalette(palette)
+            legend_view.setStyleSheet(
+                "LegendListView { background: #ffffff; color: #202124; }"
+                "LegendListView::item:selected { background: #245a92; color: #ffffff; }"
+            )
+        self.legend_dock.show()
 
         self.refresh_button = QtWidgets.QPushButton("Refresh results")
         self.refresh_button.clicked.connect(self._refresh)

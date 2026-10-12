@@ -21,6 +21,7 @@ class DetectorMaskEditorWidget(QtWidgets.QWidget):
         self._plot_2d = plot_2d
         self._source: MaskEditorSource | None = None
         self._detector_tabs: dict[int, _DetectorPlotTab] = {}
+        self._beam_centers: dict[int, tuple[float, float]] = {}
 
         self.source_label = QtWidgets.QLabel(
             "Select an acquisition to display its detector images."
@@ -52,6 +53,7 @@ class DetectorMaskEditorWidget(QtWidgets.QWidget):
     def clear(self, message: str = "Select an acquisition to display its detector images.") -> None:
         self._source = None
         self._detector_tabs.clear()
+        self._beam_centers.clear()
         self.tabs.clear()
         self.source_label.setText(message)
 
@@ -61,6 +63,7 @@ class DetectorMaskEditorWidget(QtWidgets.QWidget):
         masks: Mapping[int, np.ndarray] | None = None,
         *,
         display_count_time: float | None = None,
+        beam_centers: Mapping[int, tuple[float, float]] | None = None,
     ) -> None:
         self._source = source
         self._detector_tabs.clear()
@@ -86,6 +89,8 @@ class DetectorMaskEditorWidget(QtWidgets.QWidget):
             self._detector_tabs[detector_number] = tab
             self.tabs.addTab(tab.widget, _detector_tab_label(dataset_path))
 
+        self.set_beam_centers(beam_centers or {})
+
         if self._detector_tabs:
             display_text = "corrected counts"
             if display_count_time is not None:
@@ -102,6 +107,20 @@ class DetectorMaskEditorWidget(QtWidgets.QWidget):
             detector_number: tab.get_mask_data()
             for detector_number, tab in self._detector_tabs.items()
         }
+
+    def set_beam_centers(self, beam_centers: Mapping[int, tuple[float, float]]) -> None:
+        """Overlay the stored beam center on every matching detector tab."""
+        normalized: dict[int, tuple[float, float]] = {}
+        for detector_number, center in beam_centers.items():
+            try:
+                x, y = float(center[0]), float(center[1])
+            except (IndexError, TypeError, ValueError):
+                continue
+            if np.isfinite(x) and np.isfinite(y):
+                normalized[int(detector_number)] = (x, y)
+        self._beam_centers = normalized
+        for detector_number, tab in self._detector_tabs.items():
+            tab.set_beam_center(self._beam_centers.get(detector_number))
 
     @QtCore.Slot(str)
     def _set_scale_mode(self, _text: str) -> None:

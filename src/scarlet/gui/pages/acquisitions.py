@@ -378,6 +378,7 @@ class AcquisitionsPage(QtWidgets.QWidget):
         self._has_excluded = bool(workflow.active_excluded_files())
         self.reconsider_button.setEnabled(self._has_excluded)
         self._set_readiness(assess_workflow_readiness(workflow))
+        self._update_preview_beam_centers(workflow)
         self._selection_changed()
 
     def set_busy(self, busy: bool, message: str = "") -> None:
@@ -530,6 +531,7 @@ class AcquisitionsPage(QtWidgets.QWidget):
         source = getattr(payload, "source", None)
         run_key = getattr(payload, "run_key", None)
         masks = getattr(payload, "masks", None)
+        beam_centers = getattr(payload, "beam_centers", {})
         display_count_time = getattr(payload, "display_count_time", None)
         if source is None or run_key is None:
             self.clear_preview()
@@ -544,6 +546,7 @@ class AcquisitionsPage(QtWidgets.QWidget):
             source,
             masks,
             display_count_time=display_count_time,
+            beam_centers=beam_centers,
         )
         self.save_mask_button.setEnabled(self.mask_editor.has_source and self.table.isEnabled())
 
@@ -552,6 +555,13 @@ class AcquisitionsPage(QtWidgets.QWidget):
         self._requested_preview_run_key = None
         self.mask_editor.clear()
         self.save_mask_button.setEnabled(False)
+
+    def _update_preview_beam_centers(self, workflow: WorkflowContext) -> None:
+        run_key = self._preview_run_key
+        config_id = getattr(run_key, "config_id", None)
+        if not isinstance(config_id, str):
+            return
+        self.mask_editor.set_beam_centers(workflow.beam_centers.get(config_id, {}))
 
     @QtCore.Slot()
     def _save_mask(self) -> None:

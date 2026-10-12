@@ -72,6 +72,7 @@ class _DetectorPlotTab:
         self._normalization = "linear"
         self._initial_mask = None if initial_mask is None else np.asarray(initial_mask, dtype=np.uint8)
         self._mask_initialized = False
+        self._beam_center: tuple[float, float] | None = None
 
     def set_scale_mode(self, mode: str, *, reset_zoom: bool = False) -> None:
         self._normalization = mode
@@ -94,6 +95,7 @@ class _DetectorPlotTab:
         elif not self._mask_initialized and self._initial_mask is not None:
             _set_selection_mask(self.widget, self._initial_mask)
             self._mask_initialized = True
+        self._render_beam_center()
 
     def set_colormap(self, *, name: str | None = None, normalization: str | None = None, reset_zoom: bool = False) -> None:
         if name is not None:
@@ -119,6 +121,35 @@ class _DetectorPlotTab:
         if mask is None:
             return np.zeros(self.data.shape, dtype=np.uint8)
         return np.asarray(mask > 0, dtype=np.uint8)
+
+    @property
+    def beam_center(self) -> tuple[float, float] | None:
+        """Beam-center overlay currently displayed on this detector image."""
+        return self._beam_center
+
+    def set_beam_center(self, center: tuple[float, float] | None) -> None:
+        """Display a non-editable cross at the supplied pixel coordinates."""
+        if center is None:
+            self._beam_center = None
+        else:
+            x, y = float(center[0]), float(center[1])
+            self._beam_center = (x, y) if np.isfinite(x) and np.isfinite(y) else None
+        self._render_beam_center()
+
+    def _render_beam_center(self) -> None:
+        self.widget.removeMarker("beam_center")
+        if self._beam_center is None:
+            return
+        x, y = self._beam_center
+        self.widget.addMarker(
+            x,
+            y,
+            legend="beam_center",
+            color="#ff1744",
+            selectable=False,
+            draggable=False,
+            symbol="+",
+        )
 
 
 def _get_selection_mask(plot) -> np.ndarray | None:

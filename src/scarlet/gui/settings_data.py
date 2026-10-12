@@ -97,3 +97,23 @@ def detect_settings_geometry(
         detector_number=detector_number,
     )
     return replace(payload, roi=roi)
+
+
+def load_center_from_empty_beam_file(
+    workflow: WorkflowContext,
+    *,
+    config_id: str,
+    detector_number: int,
+) -> SettingsImagePayload:
+    """Load a detector's stored beam center from its empty-beam file."""
+    payload = load_settings_image(
+        workflow,
+        config_id=config_id,
+        purpose="center",
+        detector_number=detector_number,
+    )
+    center = nexus_reader.read_detector_beam_center(
+        payload.source_path,
+        detector_number,
+    )
+    return replace(payload, center=center)
