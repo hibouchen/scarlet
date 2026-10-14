@@ -539,10 +539,12 @@ class WorkflowContext:
         if not isinstance(converted_paths, dict):
             converted_paths = {}
             self.store["converted_run_paths"] = converted_paths
+        from scarlet.io.converters import is_conversion_cache_compatible
+
         cached_value = converted_paths.get(str(raw_path))
         if cached_value is not None:
             cached_path = Path(cached_value).resolve()
-            if cached_path.exists():
+            if is_conversion_cache_compatible(instrument_name, raw_path, cached_path):
                 return cached_path
 
         from scarlet.io.converters import convert_to_scarlet_nxsas_raw
@@ -551,7 +553,12 @@ class WorkflowContext:
         converted_path = self._converted_path_for_run(raw_path)
         converted_path.parent.mkdir(parents=True, exist_ok=True)
         overwrite = bool(self.store.get("conversion_overwrite", False))
-        if not converted_path.exists() or overwrite:
+        cache_is_compatible = is_conversion_cache_compatible(
+            instrument_name,
+            raw_path,
+            converted_path,
+        )
+        if overwrite or not cache_is_compatible:
             convert_to_scarlet_nxsas_raw(
                 instrument_name,
                 raw_path,

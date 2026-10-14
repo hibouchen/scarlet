@@ -29,6 +29,9 @@ class TestSansLlbConverterSchema(unittest.TestCase):
         sample_mask_size_y: float | None = 8.0,
         sample_thickness: float | None = None,
         sample_thickness_units: str | None = None,
+        attenuator_selection: str | None = None,
+        attenuator_transmission: float | None = None,
+        attenuation_factor: float | None = None,
     ) -> None:
         raw0 = numpy.array([[10.0, 20.0], [30.0, 40.0]], dtype=numpy.float64)
         with h5py.File(input_path, "w") as fin:
@@ -53,6 +56,26 @@ class TestSansLlbConverterSchema(unittest.TestCase):
 
             instrument = entry.create_group("SANS-LLB")
             instrument.attrs["NX_class"] = b"NXinstrument"
+
+            if (
+                attenuator_selection is not None
+                or attenuator_transmission is not None
+                or attenuation_factor is not None
+            ):
+                attenuator = instrument.create_group("attenuator")
+                attenuator.attrs["NX_class"] = b"NXattenuator"
+                if attenuator_selection is not None:
+                    attenuator.create_dataset("selection", data=numpy.bytes_(attenuator_selection))
+                if attenuator_transmission is not None:
+                    attenuator.create_dataset(
+                        "attenuator_transmission",
+                        data=float(attenuator_transmission),
+                    )
+                if attenuation_factor is not None:
+                    attenuator.create_dataset(
+                        "attenuation_factor",
+                        data=float(attenuation_factor),
+                    )
 
             source = instrument.create_group("source")
             incident_wavelength = source.create_dataset("incident_wavelength", data=0.6)
@@ -96,6 +119,85 @@ class TestSansLlbConverterSchema(unittest.TestCase):
             central_detector.create_dataset("beam_center_x", data=0.5)
             central_detector.create_dataset("beam_center_y", data=0.5)
             central_detector.create_dataset("dead_time", data=1.0e-3)
+
+    def test_sansllb_converter_writes_nxattenuator(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            input_path = Path(td) / "sansllb_attenuator.hdf"
+            output_path = Path(td) / "sansllb_attenuator_out.h5"
+            self._write_minimal_sansllb_input(
+                input_path,
+                attenuator_selection="2",
+                attenuator_transmission=0.213,
+            )
+
+            convert_sansllb_to_scarlet_nxsas_raw(input_path, output_path, overwrite=True)
+
+            schema = load_schema("scarlet_nxsas_raw_v1.3_mono.yaml")
+            report = validate_nexus_file(output_path, schema)
+            self.assertTrue(report.ok, "\n".join(report.format_lines()))
+
+            with h5py.File(output_path, "r") as fout:
+                attenuator = fout["/raw_data/instrument/attenuator"]
+                self.assertEqual(attenuator.attrs["NX_class"], b"NXattenuator")
+                self.assertEqual(attenuator["selection"][()].decode(), "2")
+                self.assertAlmostEqual(float(attenuator["attenuator_transmission"][()]), 0.213)
+                self.assertEqual(set(attenuator.keys()), {"selection", "attenuator_transmission"})
+
+    def test_sansllb_converter_writes_selection_when_attenuator_transmission_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            input_path = Path(td) / "sansllb_attenuator_selection_only.hdf"
+            output_path = Path(td) / "sansllb_attenuator_selection_only_out.h5"
+            self._write_minimal_sansllb_input(
+                input_path,
+                attenuator_selection="2",
+            )
+
+            report = convert_sansllb_to_scarlet_nxsas_raw(input_path, output_path, overwrite=True)
+
+            schema = load_schema("scarlet_nxsas_raw_v1.3_mono.yaml")
+            validation = validate_nexus_file(output_path, schema)
+            self.assertTrue(validation.ok, "\n".join(validation.format_lines()))
+            self.assertTrue(any("contains selection only" in warning for warning in report.warnings))
+
+            with h5py.File(output_path, "r") as fout:
+                attenuator = fout["/raw_data/instrument/attenuator"]
+                self.assertEqual(attenuator.attrs["NX_class"], b"NXattenuator")
+                self.assertEqual(attenuator["selection"][()].decode(), "2")
+                self.assertEqual(set(attenuator.keys()), {"selection"})
+
+    def test_sansllb_converter_converts_new_attenuation_factor_to_transmission(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            input_path = Path(td) / "sansllb_attenuation_factor.hdf"
+            output_path = Path(td) / "sansllb_attenuation_factor_out.h5"
+            self._write_minimal_sansllb_input(
+                input_path,
+                attenuator_selection="2",
+                attenuation_factor=1.0 / 0.217,
+            )
+
+            convert_sansllb_to_scarlet_nxsas_raw(input_path, output_path, overwrite=True)
+
+            with h5py.File(output_path, "r") as fout:
+                attenuator = fout["/raw_data/instrument/attenuator"]
+                self.assertEqual(attenuator["selection"][()].decode(), "2")
+                self.assertAlmostEqual(float(attenuator["attenuator_transmission"][()]), 0.217)
+
+    def test_sansllb_converter_ignores_invalid_transmission_without_failing(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            input_path = Path(td) / "sansllb_invalid_attenuator.hdf"
+            output_path = Path(td) / "sansllb_invalid_attenuator_out.h5"
+            self._write_minimal_sansllb_input(
+                input_path,
+                attenuator_selection="2",
+                attenuator_transmission=2.0,
+            )
+
+            report = convert_sansllb_to_scarlet_nxsas_raw(input_path, output_path, overwrite=True)
+
+            self.assertTrue(any("must be <= 1" in warning for warning in report.warnings))
+            with h5py.File(output_path, "r") as fout:
+                attenuator = fout["/raw_data/instrument/attenuator"]
+                self.assertEqual(set(attenuator.keys()), {"selection"})
 
     def test_sansllb_converter_maps_square_sample_mask_to_aperture2_slit(self) -> None:
         with tempfile.TemporaryDirectory() as td:

@@ -50,6 +50,11 @@ class TestSamConverterSchema(unittest.TestCase):
                 instrument = entry.create_group("instrument")
                 instrument.attrs["NX_class"] = b"NXinstrument"
 
+                attenuator = instrument.create_group("attenuator")
+                attenuator.attrs["NX_class"] = b"NXattenuator"
+                attenuator.create_dataset("state", data=np.array([np.bytes_("1 (2073)")]))
+                attenuator.create_dataset("state_index", data=np.array([1], dtype=np.int64))
+
                 beam = instrument.create_group("Beam")
                 beam.create_dataset("center_x", data=1.5)
                 beam.create_dataset("center_y", data=0.5)
@@ -104,6 +109,11 @@ class TestSamConverterSchema(unittest.TestCase):
                     float(fout["/raw_data/instrument/monochromator/wavelength_error"][()]),
                     expected_wavelength_error,
                 )
+                attenuator = fout["/raw_data/instrument/attenuator"]
+                self.assertEqual(attenuator.attrs["NX_class"], b"NXattenuator")
+                self.assertEqual(attenuator["selection"][()].decode(), "1")
+                self.assertAlmostEqual(float(attenuator["attenuator_transmission"][()]), 1.0 / 2073.0)
+                self.assertEqual(set(attenuator.keys()), {"selection", "attenuator_transmission"})
 
     def test_sam_converter_maps_zero_sample_ap_y_to_slit4_pinhole(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -163,6 +173,10 @@ class TestSamConverterSchema(unittest.TestCase):
 
             convert_sam_to_scarlet_nxsas_raw(input_path, output_path, overwrite=True)
 
+            schema = load_schema("scarlet_nxsas_raw_v1.3_mono.yaml")
+            report = validate_nexus_file(output_path, schema)
+            self.assertTrue(report.ok, "\n".join(report.format_lines()))
+
             expected = correct_detector_dead_time(raw_counts, acq_time=10.0, deadtime=0.0)
             expected_wavelength_error = 0.1 * 6.0
 
@@ -187,6 +201,7 @@ class TestSamConverterSchema(unittest.TestCase):
                     float(fout["/raw_data/instrument/monochromator/wavelength_error"][()]),
                     expected_wavelength_error,
                 )
+                self.assertNotIn("attenuator", fout["/raw_data/instrument"])
 
     def test_sam_sample_validates_with_schema(self) -> None:
         root = Path(__file__).resolve().parent.parent

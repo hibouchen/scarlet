@@ -266,6 +266,85 @@ def _write_instrument_monitors(
             _write_dataset(mon_out, "count_time", count_time)
 
 
+def _write_attenuator(
+    fin: h5py.File,
+    inst_in: str,
+    inst_out: h5py.Group,
+    warnings: List[str],
+) -> None:
+    """Copy SANS-LLB attenuator metadata while accepting old and new exports."""
+    attenuator_path = f"{inst_in}/attenuator"
+    if attenuator_path not in fin or not isinstance(fin[attenuator_path], h5py.Group):
+        return
+
+    selection = _safe_get(fin, f"{attenuator_path}/selection")
+    if selection is None:
+        warnings.append(f"{attenuator_path}: missing selection; NXattenuator omitted from converted output.")
+        return
+    selection_text = _as_str(selection).strip()
+    if not selection_text:
+        warnings.append(f"{attenuator_path}: empty selection; NXattenuator omitted from converted output.")
+        return
+
+    attenuator_out = _ensure_group(inst_out, "attenuator", "NXattenuator")
+    _write_dataset(attenuator_out, "selection", selection_text, as_string=True)
+
+    # ``attenuator_transmission`` is the current NeXus field and the output
+    # convention: I_attenuated / I_incident, hence 0 < value <= 1.  During the
+    # SANS-LLB format transition, files may instead expose an
+    # ``attenuation_factor`` (the multiplicative correction, i.e. its inverse)
+    # or one of the early transmission field names below.
+    transmission_candidates = (
+        ("attenuator_transmission", False),
+        ("attenuation_transmission", False),
+        ("transmission", False),
+        ("attenuation_factor", True),
+    )
+    source_name: Optional[str] = None
+    raw_value = None
+    invert = False
+    for candidate, candidate_is_factor in transmission_candidates:
+        value = _safe_get(fin, f"{attenuator_path}/{candidate}")
+        if value is not None:
+            source_name = candidate
+            raw_value = value
+            invert = candidate_is_factor
+            break
+
+    if source_name is None:
+        warnings.append(
+            f"{attenuator_path}: missing attenuator transmission/factor; "
+            "converted NXattenuator contains selection only."
+        )
+        return
+
+    try:
+        value = _as_float_scalar(raw_value)
+    except (TypeError, ValueError):
+        warnings.append(
+            f"{attenuator_path}/{source_name}: invalid scalar value {raw_value!r}; "
+            "converted NXattenuator contains selection only."
+        )
+        return
+
+    if not np.isfinite(value) or value <= 0.0:
+        warnings.append(
+            f"{attenuator_path}/{source_name}: value must be finite and > 0, got {value!r}; "
+            "converted NXattenuator contains selection only."
+        )
+        return
+
+    transmission = 1.0 / value if invert else value
+    if transmission > 1.0:
+        warnings.append(
+            f"{attenuator_path}/{source_name}: resulting attenuator_transmission must be <= 1, "
+            f"got {transmission!r}; converted NXattenuator contains selection only."
+        )
+        return
+
+    _write_dataset(attenuator_out, "attenuator_transmission", transmission)
+
+
 def _sansllb_guide_state_from_selection(selection) -> str:
     """Map raw SANS-LLB guide selection strings to SCARLET NXguide/state."""
     if selection is None:
@@ -552,6 +631,7 @@ def convert_sansllb_to_scarlet_nxsas_raw(
           /geometry
           /monochromator
           /collimation (SCARLET detailed)
+          /attenuator (NXattenuator, optional)
           /detector0..N
           /monitor0..N (optional)
         /control (NXmonitor, required by SCARLET schema)
@@ -708,6 +788,8 @@ def convert_sansllb_to_scarlet_nxsas_raw(
                 col_len_m=col_len_m,
                 warnings=warnings,
             )
+
+            _write_attenuator(fin, inst_in, inst_out, warnings)
 
             # detectors + NXdata views
             for i, det_name in enumerate(det_names):

@@ -200,6 +200,55 @@ def _sam_guide_state(value) -> str:
     return "in"
 
 
+def _sam_attenuator_metadata(
+    fin: h5py.File,
+    inst_in: str,
+    warnings: List[str],
+) -> Optional[tuple[str, float]]:
+    """Return the SAM attenuator selection and transmission, when available."""
+    attenuator_path = f"{inst_in}/attenuator"
+    if attenuator_path not in fin or not isinstance(fin[attenuator_path], h5py.Group):
+        return None
+
+    state = _safe_get(fin, f"{attenuator_path}/state")
+    if state is None:
+        warnings.append(f"{attenuator_path}: missing state; NXattenuator omitted from converted output.")
+        return None
+
+    state_text = _as_str(state).strip()
+    factor_start = state_text.rfind("(")
+    factor_end = state_text.rfind(")")
+    if factor_start < 0 or factor_end <= factor_start:
+        warnings.append(
+            f"{attenuator_path}/state: cannot parse attenuation factor from {state_text!r}; "
+            "NXattenuator omitted from converted output."
+        )
+        return None
+
+    try:
+        attenuation_factor = float(state_text[factor_start + 1 : factor_end].strip())
+    except ValueError:
+        warnings.append(
+            f"{attenuator_path}/state: invalid attenuation factor in {state_text!r}; "
+            "NXattenuator omitted from converted output."
+        )
+        return None
+    if not np.isfinite(attenuation_factor) or attenuation_factor <= 0.0:
+        warnings.append(
+            f"{attenuator_path}/state: attenuation factor must be finite and > 0, "
+            f"got {attenuation_factor!r}; NXattenuator omitted from converted output."
+        )
+        return None
+
+    state_index = _safe_get(fin, f"{attenuator_path}/state_index")
+    selection = _as_str(state_index).strip() if state_index is not None else state_text[:factor_start].strip()
+    if not selection:
+        warnings.append(f"{attenuator_path}: missing selection; NXattenuator omitted from converted output.")
+        return None
+
+    return selection, 1.0 / attenuation_factor
+
+
 def _copy_aperture_snapshot(coll_out: h5py.Group, name: str, src: h5py.Group) -> None:
     dst = _ensure_group(coll_out, name, _as_str(src.attrs.get("NX_class")))
     for field in ("x_gap", "y_gap", "diameter"):
@@ -284,6 +333,7 @@ def convert_sam_to_scarlet_nxsas_raw(
         notes.append(f"Using input entry: {entry}")
 
         inst_in = _sam_instrument_path(fin, entry)
+        attenuator_metadata = _sam_attenuator_metadata(fin, inst_in, warnings)
 
         # monochromator / selector wavelength
         wl = _safe_get(fin, f"{inst_in}/Selector/wavelength")
@@ -389,6 +439,16 @@ def convert_sam_to_scarlet_nxsas_raw(
             _write_dataset(mono_out, "wavelength", wavelength)
             if not np.isnan(wavelength_error):
                 _write_dataset(mono_out, "wavelength_error", wavelength_error)
+
+            if attenuator_metadata is not None:
+                attenuator_selection, attenuator_transmission = attenuator_metadata
+                attenuator_out = _ensure_group(inst_out, "attenuator", "NXattenuator")
+                _write_dataset(attenuator_out, "selection", attenuator_selection, as_string=True)
+                _write_dataset(
+                    attenuator_out,
+                    "attenuator_transmission",
+                    attenuator_transmission,
+                )
 
             # collimation
             coll_out = _ensure_group(inst_out, "collimation", None)

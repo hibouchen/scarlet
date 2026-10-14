@@ -9,6 +9,7 @@ from unittest import mock
 import h5py
 import numpy as np
 
+from scarlet.io.converters import is_conversion_cache_compatible
 from scarlet.workflow.context import RunKey, initialize_workflow_context_from_raw_directory
 from scarlet.workflow.pipeline import ReductionState
 
@@ -62,6 +63,83 @@ def _write_d11_raw(
 
 
 class TestWorkflowLazyConversion(unittest.TestCase):
+    def test_sansllb_cache_without_source_attenuator_metadata_is_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            raw_path = root / "raw.hdf"
+            converted_path = root / "converted.nxs"
+
+            with h5py.File(raw_path, "w") as handle:
+                entry = handle.create_group("entry0")
+                instrument = entry.create_group("SANS-LLB")
+                instrument.attrs["NX_class"] = np.bytes_("NXinstrument")
+                attenuator = instrument.create_group("attenuator")
+                attenuator.attrs["NX_class"] = np.bytes_("NXattenuator")
+                attenuator.create_dataset("selection", data=np.bytes_("2"))
+                attenuator.create_dataset("attenuator_transmission", data=0.213)
+
+            with h5py.File(converted_path, "w") as handle:
+                entry = handle.create_group("raw_data")
+                entry.create_group("instrument")
+
+            self.assertFalse(
+                is_conversion_cache_compatible("sansllb", raw_path, converted_path)
+            )
+
+            with h5py.File(converted_path, "a") as handle:
+                attenuator = handle["/raw_data/instrument"].create_group("attenuator")
+                attenuator.attrs["NX_class"] = np.bytes_("NXattenuator")
+                attenuator.create_dataset("selection", data=np.bytes_("2"))
+                attenuator.create_dataset("attenuator_transmission", data=0.213)
+
+            self.assertTrue(
+                is_conversion_cache_compatible("sansllb", raw_path, converted_path)
+            )
+
+    def test_prepare_run_reconverts_an_incompatible_cached_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            raw_directory = root / "raw"
+            output_directory = root / "out"
+            raw_directory.mkdir()
+            output_directory.mkdir()
+            raw_path = raw_directory / "run_001.nxs"
+            converted_path = output_directory / "run_001.nxs"
+            _write_d11_raw(raw_path)
+            converted_path.write_bytes(b"stale conversion")
+
+            workflow = initialize_workflow_context_from_raw_directory(
+                raw_directory,
+                output_dir=output_directory,
+                instrument_name="d11",
+            )
+            key = next(iter(workflow.runs))
+            workflow.store["converted_run_paths"] = {
+                str(raw_path.resolve()): str(converted_path.resolve())
+            }
+            configuration = workflow.configurations[key.config_id]
+
+            with (
+                mock.patch(
+                    "scarlet.io.converters.is_conversion_cache_compatible",
+                    return_value=False,
+                ),
+                mock.patch("scarlet.io.converters.convert_to_scarlet_nxsas_raw") as converter,
+                mock.patch(
+                    "scarlet.workflow.configuration.configuration_from_nexus",
+                    return_value=(configuration, []),
+                ),
+            ):
+                prepared_path = workflow.prepare_run(key)
+
+            self.assertEqual(prepared_path, converted_path.resolve())
+            converter.assert_called_once_with(
+                "d11",
+                raw_path.resolve(),
+                converted_path.resolve(),
+                overwrite=True,
+            )
+
     def test_semi_transparent_strategy_does_not_override_detected_mode(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

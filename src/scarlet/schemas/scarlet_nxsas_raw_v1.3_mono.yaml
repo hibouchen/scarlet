@@ -169,6 +169,17 @@ nodes:
     nx_class: NXbeamstop
     required: false
 
+  # ---------------- Attenuator (optional) ----------------
+  - path: /entry/instrument/attenuator
+    kind: group
+    nx_class: NXattenuator
+    required: false
+    rules:
+      required_datasets:
+        - selection
+      optional_datasets:
+        - attenuator_transmission
+
   # ---------------- Detectors ----------------
   - path_pattern: '^/entry/instrument/detector\d+$'
     kind: group

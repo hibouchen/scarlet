@@ -54,6 +54,7 @@ Ce format **ne contient pas** :
     /monochromator (NXmonochromator)  (requis en profil mono)
     /collimation (NXcollection)       (requis)
     /beamstop (NXbeamstop)            (optionnel)
+    /attenuator (NXattenuator)         (optionnel)
 
     /detector0 (NXdetector)           (au moins un, requis)
     /detector1 (NXdetector)           (optionnel)
