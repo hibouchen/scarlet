@@ -1,13 +1,109 @@
 from __future__ import annotations
 
 from pathlib import Path
+
+import h5py
 import numpy as np
 
-from scarlet.io.nexus_reader import read_detector_data
+from scarlet.io.nexus_reader import read_detector_data, resolve_entry_path
 
 
 ROI = tuple[int, int, int, int]
 BeamCenter = tuple[float, float]
+
+
+def _read_attenuator_transmission(file_path: Path) -> float:
+    """Return ``I_attenuated / I_incident`` from a SCARLET NeXus file.
+
+    A missing ``NXattenuator`` means that no attenuator is present and therefore
+    has a neutral transmission of one.  An attenuator group without a usable
+    transmission is rejected because silently assuming one would overestimate
+    or underestimate the direct flux.
+    """
+    entry_path = resolve_entry_path(file_path)
+    attenuator_path = f"{entry_path}/instrument/attenuator"
+    transmission_path = f"{attenuator_path}/attenuator_transmission"
+    with h5py.File(file_path, "r") as handle:
+        if attenuator_path not in handle:
+            return 1.0
+        if transmission_path not in handle:
+            raise ValueError(
+                f"Missing attenuator transmission in {file_path}: {transmission_path}"
+            )
+        raw_value = np.asarray(handle[transmission_path][()])
+
+    if raw_value.size != 1:
+        raise ValueError(
+            f"Attenuator transmission must be scalar in {file_path}: {transmission_path}"
+        )
+    try:
+        transmission = float(raw_value.reshape(()))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid attenuator transmission in {file_path}: {transmission_path}"
+        ) from exc
+    if not np.isfinite(transmission) or not (0.0 < transmission <= 1.0):
+        raise ValueError(
+            "Attenuator transmission must be finite and in (0, 1] in "
+            f"{file_path}: got {transmission!r}"
+        )
+    return transmission
+
+
+def compute_direct_flux(
+    direct_beam_file: str | Path,
+    *,
+    detector_number: int = 0,
+    roi: ROI | None = None,
+) -> float:
+    """Compute the attenuation-corrected direct flux per monitor unit.
+
+    Detector counts are corrected for dead time, normalized by the monitor,
+    summed over the complete detector by default, and divided by the
+    ``attenuator_transmission`` stored in the file.  When ``roi`` is provided,
+    only that ``(x0, x1, y0, y1)`` rectangle is integrated.
+
+    Files without an ``NXattenuator`` group are treated as unattenuated
+    measurements (transmission equal to one).
+    """
+    direct_beam_file = Path(direct_beam_file).resolve()
+    detector_number = int(detector_number)
+    if detector_number < 0:
+        raise ValueError(f"Detector index must be >= 0, got {detector_number}")
+
+    data = np.asarray(
+        read_detector_data(
+            direct_beam_file,
+            detector_number,
+            normalize_by_monitor=True,
+            correct_deadtime=True,
+        ),
+        dtype=np.float64,
+    )
+    if data.ndim != 2:
+        raise ValueError(f"Direct-beam image must be 2D, got shape {data.shape}")
+    if not np.all(np.isfinite(data)):
+        raise ValueError("Direct-beam image must contain only finite values")
+
+    if roi is not None:
+        x0, x1, y0, y1 = (int(value) for value in roi)
+        if x0 < 0 or y0 < 0 or x1 <= x0 or y1 <= y0:
+            raise ValueError(f"Invalid ROI: {(x0, x1, y0, y1)}")
+        if x1 > data.shape[1] or y1 > data.shape[0]:
+            raise ValueError(
+                f"ROI {(x0, x1, y0, y1)} is outside detector{detector_number} "
+                f"data shape {data.shape}"
+            )
+        data = data[y0:y1, x0:x1]
+
+    normalized_sum = float(np.sum(data, dtype=np.float64))
+    if normalized_sum <= 0.0:
+        raise ValueError(
+            "Monitor-normalized direct-beam detector sum must be > 0, "
+            f"got {normalized_sum!r}"
+        )
+    return normalized_sum / _read_attenuator_transmission(direct_beam_file)
+
 
 def compute_beam_center(
     transmission_file: str | Path,

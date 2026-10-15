@@ -36,6 +36,7 @@ from .resolution import (
     compute_qy_uncertainty_vector,
 )
 from .transmission import (
+    compute_direct_flux,
     compute_transmission,
 )
 from .utils import apply_prefactor, concatenate_curves, crop_curve
@@ -58,6 +59,7 @@ __all__ = [
     "compute_qy_vector",
     "compute_qy_uncertainty_vector",
     "compute_theta_map",
+    "compute_direct_flux",
     "crop_curve",
     "CurveSegment",
     "MultiStitchResult",

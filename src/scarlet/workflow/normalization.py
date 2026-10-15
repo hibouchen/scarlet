@@ -8,7 +8,7 @@ import numpy as np
 
 from scarlet.io import nexus_reader
 from scarlet.reduction.correction import normalize_by_solid_angle, subtract_scattering_references
-from scarlet.reduction.transmission import compute_transmission
+from scarlet.reduction.transmission import compute_direct_flux, compute_transmission
 
 if TYPE_CHECKING:
     import scipp as sc
@@ -248,6 +248,10 @@ def save_flatfield_file(
     dark_path: Path | None,
     empty_cell_path: Path | None,
     mask_file_path: Path | None,
+    direct_flux: float | None = None,
+    direct_flux_detector_number: int = 0,
+    direct_beam_path: Path | None = None,
+    normalisation_factors: dict[int, float] | None = None,
 ) -> Path:
     """Persist per-detector flatfield arrays to a NeXus/HDF5 artifact."""
     output_path = Path(file_path).resolve()
@@ -258,7 +262,14 @@ def save_flatfield_file(
         _write_text_dataset(entry, "definition", "SCARLET_flatfield")
         _write_text_dataset(entry, "title", f"Water flatfield for {config_id}")
         _write_text_dataset(entry, "config_id", config_id)
-
+        if direct_flux is not None:
+            direct_flux_value = float(direct_flux)
+            if not np.isfinite(direct_flux_value) or direct_flux_value <= 0.0:
+                raise ValueError(f"direct_flux must be finite and > 0, got {direct_flux_value!r}")
+            direct_flux_dataset = entry.create_dataset("direct_flux", data=direct_flux_value)
+            direct_flux_dataset.attrs["units"] = np.bytes_("counts/monitor")
+            direct_flux_dataset.attrs["detector_number"] = int(direct_flux_detector_number)
+            direct_flux_dataset.attrs["integration"] = np.bytes_("full_detector")
         instrument = entry.create_group("instrument")
         instrument.attrs["NX_class"] = np.bytes_("NXinstrument")
         with h5py.File(water_scattering_path, "r") as source_handle:
@@ -276,6 +287,25 @@ def save_flatfield_file(
                     data=np.asarray((masks or {}).get(detector_number, np.zeros_like(values, dtype=np.uint8)), dtype=np.uint8),
                 )
                 detector_group.create_dataset("flatfield_applied", data=np.bool_(False))
+                if normalisation_factors is not None:
+                    if detector_number not in normalisation_factors:
+                        raise ValueError(
+                            f"Missing normalisation factor for detector{detector_number}"
+                        )
+                    factor_value = float(normalisation_factors[detector_number])
+                    if not np.isfinite(factor_value) or factor_value <= 0.0:
+                        raise ValueError(
+                            f"Normalisation factor for detector{detector_number} must be "
+                            f"finite and > 0, got {factor_value!r}"
+                        )
+                    factor_dataset = detector_group.create_dataset(
+                        "normalisation_factor",
+                        data=factor_value,
+                    )
+                    factor_dataset.attrs["method"] = np.bytes_(
+                        "10_times_mean_valid_flatfield_divided_by_direct_flux"
+                    )
+                    factor_dataset.attrs["target_units"] = np.bytes_("cm^-1")
 
                 detector_root = f"{entry_path}/instrument/detector{detector_number}"
                 _copy_optional_scalar(source_handle, detector_group, f"{detector_root}/x_pixel_size", "x_pixel_size")
@@ -298,6 +328,8 @@ def save_flatfield_file(
         provenance.attrs["NX_class"] = np.bytes_("NXnote")
         _write_text_dataset(provenance, "water_scattering_file", str(water_scattering_path))
         _write_text_dataset(provenance, "water_transmission_file", str(water_transmission_path))
+        if direct_beam_path is not None:
+            _write_text_dataset(provenance, "direct_beam_file", str(direct_beam_path))
         if dark_path is not None:
             _write_text_dataset(provenance, "dark_file", str(dark_path))
         if empty_cell_path is not None:
@@ -431,6 +463,22 @@ def build_water_flatfield_from_workflow_context(
 
     transmission_source_mode = workflow.get_transmission_source_mode()
     transmission_config_id = workflow.resolve_transmission_config(source_config_id)
+    selected_direct_beam = _select_reference_run(
+        workflow,
+        config_id=transmission_config_id,
+        entity="empty_beam",
+        mode=transmission_source_mode,
+    )
+    if selected_direct_beam is None:
+        raise ValueError(
+            f"Missing empty_beam {transmission_source_mode} reference required to compute "
+            f"direct_flux for configuration {transmission_config_id!r}"
+        )
+    _direct_beam_key, direct_beam_path = selected_direct_beam
+    direct_flux = compute_direct_flux(
+        direct_beam_path,
+        detector_number=detector_number_for_transmission,
+    )
     if transmission_source_mode == "scattering" and transmission_config_id == source_config_id:
         water_transmission_path = water_scattering_path
         water_transmission_sample_name = water_scattering_key.sample_name
@@ -486,6 +534,7 @@ def build_water_flatfield_from_workflow_context(
     flatfields: dict[int, np.ndarray] = {}
     flatfield_errors: dict[int, np.ndarray] = {}
     flatfield_masks: dict[int, np.ndarray] = {}
+    normalisation_factors: dict[int, float] = {}
     invalid_pixels = 0
     configuration = _get_workflow_configuration(
         workflow,
@@ -525,6 +574,11 @@ def build_water_flatfield_from_workflow_context(
         flatfields[detector_number] = normalized
         flatfield_errors[detector_number] = normalized_errors
         flatfield_masks[detector_number] = pixel_mask
+        valid_flatfield = normalized[pixel_mask == 0]
+        mean_flatfield = float(np.mean(valid_flatfield, dtype=np.float64))
+        # The pipeline normalizes sample thickness in mm.  Multiplication by
+        # 10 converts the final inverse-length scale to inverse centimetres.
+        normalisation_factors[detector_number] = 10.0 * mean_flatfield / direct_flux
         invalid_pixels += replaced
 
     written_path = save_flatfield_file(
@@ -538,6 +592,10 @@ def build_water_flatfield_from_workflow_context(
         dark_path=dark_path,
         empty_cell_path=empty_cell_path,
         mask_file_path=workflow.get_mask_file(source_config_id),
+        direct_flux=direct_flux,
+        direct_flux_detector_number=detector_number_for_transmission,
+        direct_beam_path=direct_beam_path,
+        normalisation_factors=normalisation_factors,
     )
     workflow.set_flatfield(source_config_id, written_path)
     workflow.add_artifact(written_path.name, written_path, kind="flatfield")
@@ -555,5 +613,8 @@ def build_water_flatfield_from_workflow_context(
         requested_config_id=config_id,
         file_path=str(written_path),
         detectors=sorted(flatfields),
+        direct_flux=direct_flux,
+        direct_flux_detector_number=detector_number_for_transmission,
+        normalisation_factors=normalisation_factors,
     )
     return written_path

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 import re
-from typing import TYPE_CHECKING, Any, Callable, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Callable, Literal, TypeVar, cast
 
 import h5py
 import numpy as np
@@ -14,6 +15,7 @@ from scarlet.reduction.correction import normalize_by_solid_angle, subtract_scat
 from scarlet.reduction.geometry import compute_q_norm_map
 from scarlet.reduction.integration import azimuthal_average
 from scarlet.reduction.resolution import compute_beam_divergence, compute_q_resolution_circular, compute_q_resolution_rectangular
+from scarlet.reduction.transmission import compute_direct_flux
 from scarlet.workflow.configuration import Configuration
 from scarlet.workflow.context import RunKey, WorkflowContext
 from scarlet.workflow.normalization import load_flatfield_file
@@ -24,6 +26,8 @@ if TYPE_CHECKING:
 
 StepFunction = Callable[["ReductionState"], "ReductionState"]
 _F = TypeVar("_F", bound=StepFunction)
+AzimuthalNBins = int | Mapping[int, int]
+AzimuthalQScale = Literal["linear", "log"]
 
 @dataclass
 class ReductionState:
@@ -31,8 +35,8 @@ class ReductionState:
     config_id: str
     workflow: WorkflowContext
     transmission: float = field(default_factory=float)
-    azimuthal_n_bins: int = 200
-    azimuthal_q_scale: str = "linear"
+    azimuthal_n_bins: AzimuthalNBins = 200
+    azimuthal_q_scale: AzimuthalQScale = "linear"
     detectors: dict[int, Any] = field(default_factory=dict)
     reductions_steps: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
@@ -84,6 +88,66 @@ def _require_dataarray(value: Any, *, name: str, ndim: int | None = None) -> "sc
     if ndim is not None and value.ndim != ndim:
         raise ValueError(f"{name} must be a {ndim}D DataArray, got shape {value.shape}")
     return value
+
+
+def _normalize_azimuthal_n_bins(value: AzimuthalNBins) -> int | dict[int, int]:
+    """Validate and normalize a global or per-detector azimuthal bin count."""
+    if isinstance(value, Mapping):
+        if not value:
+            raise ValueError("n_bins per-detector mapping must not be empty")
+        normalized: dict[int, int] = {}
+        for raw_detector_number, raw_n_bins in value.items():
+            if isinstance(raw_detector_number, bool) or not isinstance(
+                raw_detector_number,
+                (int, np.integer),
+            ):
+                raise TypeError(
+                    "n_bins detector keys must be non-negative integers, "
+                    f"got {raw_detector_number!r}"
+                )
+            detector_number = int(raw_detector_number)
+            if detector_number < 0:
+                raise ValueError(
+                    f"n_bins detector keys must be >= 0, got {detector_number}"
+                )
+            if isinstance(raw_n_bins, bool) or not isinstance(raw_n_bins, (int, np.integer)):
+                raise TypeError(
+                    f"n_bins for detector{detector_number} must be an integer, "
+                    f"got {raw_n_bins!r}"
+                )
+            n_bins = int(raw_n_bins)
+            if n_bins <= 0:
+                raise ValueError(
+                    f"n_bins for detector{detector_number} must be > 0, got {n_bins}"
+                )
+            normalized[detector_number] = n_bins
+        return normalized
+
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise TypeError(f"n_bins must be an integer or a detector mapping, got {value!r}")
+    n_bins = int(value)
+    if n_bins <= 0:
+        raise ValueError(f"n_bins must be > 0, got {n_bins}")
+    return n_bins
+
+
+def _n_bins_for_detector(value: AzimuthalNBins, detector_number: int) -> int:
+    normalized = _normalize_azimuthal_n_bins(value)
+    if isinstance(normalized, dict):
+        if detector_number not in normalized:
+            raise ValueError(
+                f"Missing n_bins for detector{detector_number}; configured detectors are "
+                f"{sorted(normalized)}"
+            )
+        return normalized[detector_number]
+    return normalized
+
+
+def _normalize_azimuthal_q_scale(value: str) -> AzimuthalQScale:
+    normalized = str(value).strip().lower()
+    if normalized not in {"linear", "log"}:
+        raise ValueError(f"q_scale must be 'linear' or 'log', got {value!r}")
+    return cast(AzimuthalQScale, normalized)
 
 
 def _read_state_configuration(state: ReductionState) -> Configuration:
@@ -453,13 +517,19 @@ def _write_dataarray_dataset(parent: h5py.Group, name: str, detector: Any) -> No
     if axis_names:
         group.attrs["axes"] = np.asarray([np.bytes_(dim) for dim in axis_names], dtype="S")
 
-    group.create_dataset("data", data=np.asarray(data_array.data.values))
+    data_dataset = group.create_dataset("data", data=np.asarray(data_array.data.values))
+    if data_array.data.unit is not None:
+        data_dataset.attrs["units"] = np.bytes_(str(data_array.data.unit))
     if data_array.data.variances is not None:
         errors = np.sqrt(np.clip(np.asarray(data_array.data.variances, dtype=np.float64), 0.0, None))
-        group.create_dataset("errors", data=errors)
+        errors_dataset = group.create_dataset("errors", data=errors)
+        if data_array.data.unit is not None:
+            errors_dataset.attrs["units"] = np.bytes_(str(data_array.data.unit))
 
     for coord_name, coord_value in data_array.coords.items():
-        group.create_dataset(coord_name, data=np.asarray(coord_value.values))
+        coord_dataset = group.create_dataset(coord_name, data=np.asarray(coord_value.values))
+        if coord_value.unit is not None:
+            coord_dataset.attrs["units"] = np.bytes_(str(coord_value.unit))
 
     if data_array.masks:
         masks_group = group.create_group("masks")
@@ -686,7 +756,127 @@ def normalize_by_thickness(state: ReductionState) -> ReductionState:
         state.detectors[detector_number] = detector / thickness
     state.notes.append(f"Normalized detector data by sample thickness {thickness:g} mm")
     return state
-    
+
+
+def _read_absolute_calibration_from_flatfield(
+    flatfield_path: str | Path,
+    *,
+    detector_numbers: list[int],
+) -> tuple[float, int, dict[int, float]]:
+    """Read the absolute-calibration metadata stored in a flatfield file."""
+    flatfield_path = Path(flatfield_path).resolve()
+    entry_path = resolve_entry_path(flatfield_path)
+    direct_flux_path = f"{entry_path}/direct_flux"
+    factors: dict[int, float] = {}
+
+    with h5py.File(flatfield_path, "r") as handle:
+        if direct_flux_path not in handle:
+            raise ValueError(
+                f"Missing direct_flux in flatfield {flatfield_path}; "
+                "rebuild the flatfield to enable absolute normalization"
+            )
+        direct_flux_dataset = handle[direct_flux_path]
+        direct_flux_array = np.asarray(direct_flux_dataset[()])
+        if direct_flux_array.size != 1:
+            raise ValueError(f"direct_flux must be scalar in flatfield {flatfield_path}")
+        flatfield_flux = float(direct_flux_array.reshape(()))
+        if not np.isfinite(flatfield_flux) or flatfield_flux <= 0.0:
+            raise ValueError(
+                f"direct_flux must be finite and > 0 in flatfield {flatfield_path}, "
+                f"got {flatfield_flux!r}"
+            )
+
+        try:
+            flux_detector_number = int(direct_flux_dataset.attrs.get("detector_number", 0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid direct_flux detector_number in flatfield {flatfield_path}"
+            ) from exc
+        if flux_detector_number < 0:
+            raise ValueError(
+                f"direct_flux detector_number must be >= 0 in flatfield {flatfield_path}"
+            )
+
+        for detector_number in detector_numbers:
+            factor_path = (
+                f"{entry_path}/instrument/detector{detector_number}/normalisation_factor"
+            )
+            if factor_path not in handle:
+                raise ValueError(
+                    f"Missing normalisation_factor for detector{detector_number} in "
+                    f"flatfield {flatfield_path}; rebuild the flatfield to enable "
+                    "absolute normalization"
+                )
+            factor_array = np.asarray(handle[factor_path][()])
+            if factor_array.size != 1:
+                raise ValueError(
+                    f"normalisation_factor must be scalar for detector{detector_number} "
+                    f"in flatfield {flatfield_path}"
+                )
+            factor = float(factor_array.reshape(()))
+            if not np.isfinite(factor) or factor <= 0.0:
+                raise ValueError(
+                    f"normalisation_factor must be finite and > 0 for "
+                    f"detector{detector_number} in flatfield {flatfield_path}, got {factor!r}"
+                )
+            factors[detector_number] = factor
+
+    return flatfield_flux, flux_detector_number, factors
+
+
+@reduction_step("absolute normalization")
+def absolute_normalization_step(state: ReductionState) -> ReductionState:
+    """Convert data with ``p_detector * flatfield_flux / configuration_flux``."""
+    flatfield_path = state.workflow.get_flatfield(state.config_id)
+    if flatfield_path is None:
+        flatfield_path = state.workflow.build_water_flatfield(state.config_id)
+
+    detector_numbers = sorted(int(number) for number in state.detectors)
+    flatfield_flux, flux_detector_number, factors = _read_absolute_calibration_from_flatfield(
+        flatfield_path,
+        detector_numbers=detector_numbers,
+    )
+
+    transmission_config_id = state.workflow.resolve_transmission_config(state.config_id)
+    transmission_source_mode = state.workflow.get_transmission_source_mode()
+    direct_beam_path = state.workflow.prepare_reference(
+        "empty_beam",
+        transmission_source_mode,
+        transmission_config_id,
+    )
+    if direct_beam_path is None:
+        raise ValueError(
+            f"Missing empty_beam {transmission_source_mode} reference required to "
+            f"compute direct flux for configuration {transmission_config_id!r}"
+        )
+    configuration_flux = compute_direct_flux(
+        direct_beam_path,
+        detector_number=flux_detector_number,
+    )
+    if not np.isfinite(configuration_flux) or configuration_flux <= 0.0:
+        raise ValueError(
+            f"Direct flux must be finite and > 0 for configuration "
+            f"{transmission_config_id!r}, got {configuration_flux!r}"
+        )
+
+    sc = _require_scipp()
+    flux_ratio = flatfield_flux / configuration_flux
+    normalized: dict[int, Any] = {}
+    for detector_number, detector in state.detectors.items():
+        detector_array = _require_dataarray(
+            detector,
+            name=f"detector{detector_number}",
+        )
+        scale = factors[detector_number] * flux_ratio
+        normalized[detector_number] = detector_array * sc.scalar(scale, unit="1/cm")
+
+    state.detectors = normalized
+    state.notes.append(
+        "Converted detector data to absolute units (cm^-1) using "
+        f"{Path(flatfield_path).name}; direct-flux ratio "
+        f"flatfield/configuration={flux_ratio:.8g}"
+    )
+    return state
 
 
 @reduction_step("azimuthal averaging")
@@ -704,7 +894,12 @@ def azimuthal_averaging_step(state: ReductionState) -> ReductionState:
         aperture1_opening = _aperture_opening(configuration.collimation.aperture1)
         collimation_distance = configuration.collimation.collimation_distance
     integrated: dict[int, Any] = {}
+    used_n_bins: dict[int, int] = {}
     for detector_number, detector in state.detectors.items():
+        detector_n_bins = _n_bins_for_detector(
+            state.azimuthal_n_bins,
+            detector_number,
+        )
         detector_array = _require_dataarray(detector, name=f"detector{detector_number}", ndim=2)
         beam_center = _get_beam_center(state, detector_number=detector_number)
         detector_distance = _get_detector_distance(configuration, detector_number=detector_number)
@@ -764,14 +959,19 @@ def azimuthal_averaging_step(state: ReductionState) -> ReductionState:
             q_map,
             mask=mask,
             q_error=q_error,
-            n_bins=state.azimuthal_n_bins,
+            n_bins=detector_n_bins,
             q_scale=state.azimuthal_q_scale,
         )
         integrated[detector_number] = result.to_data_array()
+        used_n_bins[detector_number] = detector_n_bins
 
     state.detectors = integrated
+    bins_text = ", ".join(
+        f"detector{detector_number}={n_bins}"
+        for detector_number, n_bins in sorted(used_n_bins.items())
+    )
     state.notes.append(
-        f"Computed azimuthal average with {state.azimuthal_n_bins} bins ({state.azimuthal_q_scale})"
+        f"Computed azimuthal average with {bins_text} bins ({state.azimuthal_q_scale})"
     )
     return state
 
@@ -798,6 +998,18 @@ def save_azimuthal_text_step(state: ReductionState) -> ReductionState:
 class ReductionPipeline:
     workflow: WorkflowContext
     steps: tuple[ReductionStep, ...] = field(default_factory=tuple)
+    n_bins: AzimuthalNBins | None = None
+    q_scale: AzimuthalQScale | None = None
+
+    def __post_init__(self) -> None:
+        if self.n_bins is not None:
+            object.__setattr__(self, "n_bins", _normalize_azimuthal_n_bins(self.n_bins))
+        if self.q_scale is not None:
+            object.__setattr__(
+                self,
+                "q_scale",
+                _normalize_azimuthal_q_scale(self.q_scale),
+            )
 
     @classmethod
     def with_processed_output(cls, workflow: WorkflowContext) -> "ReductionPipeline":
@@ -811,35 +1023,59 @@ class ReductionPipeline:
         )
 
     @classmethod
-    def with_azimuthal_text_output(cls, workflow: WorkflowContext) -> "ReductionPipeline":
+    def with_azimuthal_text_output(
+        cls,
+        workflow: WorkflowContext,
+        *,
+        n_bins: AzimuthalNBins = 200,
+        q_scale: AzimuthalQScale = "linear",
+    ) -> "ReductionPipeline":
         return cls(
             workflow=workflow,
             steps=(
                 as_reduction_step(subtract_references_step),
                 as_reduction_step(normalization_step),
                 as_reduction_step(normalize_by_thickness),
+                as_reduction_step(absolute_normalization_step),
                 as_reduction_step(azimuthal_averaging_step),
                 as_reduction_step(save_processed_detectors_step),
                 as_reduction_step(save_azimuthal_text_step),
-            )
+            ),
+            n_bins=n_bins,
+            q_scale=q_scale,
         )
 
     @classmethod
-    def default(cls, workflow: WorkflowContext) -> "ReductionPipeline":
+    def default(
+        cls,
+        workflow: WorkflowContext,
+        *,
+        n_bins: AzimuthalNBins = {0:120,1:30,2:30},
+        q_scale: AzimuthalQScale = "linear",
+    ) -> "ReductionPipeline":
         return cls(
             workflow=workflow,
             steps=(
                 as_reduction_step(subtract_references_step),
                 as_reduction_step(normalization_step),
                 as_reduction_step(normalize_by_thickness),
+                as_reduction_step(absolute_normalization_step),
                 as_reduction_step(azimuthal_averaging_step),
                 as_reduction_step(save_processed_detectors_step),
                 as_reduction_step(save_azimuthal_text_step),
-            )
+            ),
+            n_bins=n_bins,
+            q_scale=q_scale,
         )
 
     @classmethod
-    def without_water_normalization(cls, workflow: WorkflowContext) -> "ReductionPipeline":
+    def without_water_normalization(
+        cls,
+        workflow: WorkflowContext,
+        *,
+        n_bins: AzimuthalNBins = 200,
+        q_scale: AzimuthalQScale = "linear",
+    ) -> "ReductionPipeline":
         return cls(
             workflow=workflow,
             steps=(
@@ -848,7 +1084,9 @@ class ReductionPipeline:
                 as_reduction_step(azimuthal_averaging_step),
                 as_reduction_step(save_processed_detectors_step),
                 as_reduction_step(save_azimuthal_text_step),
-            )
+            ),
+            n_bins=n_bins,
+            q_scale=q_scale,
         )
 
     @property
@@ -856,6 +1094,12 @@ class ReductionPipeline:
         return tuple(step.name for step in self.steps)
 
     def run(self, state: ReductionState) -> ReductionState:
+        if self.n_bins is not None:
+            state.azimuthal_n_bins = (
+                dict(self.n_bins) if isinstance(self.n_bins, Mapping) else self.n_bins
+            )
+        if self.q_scale is not None:
+            state.azimuthal_q_scale = self.q_scale
         for step in self.steps:
             state = step.fn(state)
             state.reductions_steps.append(step.name)

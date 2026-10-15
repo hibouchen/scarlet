@@ -114,6 +114,7 @@ class TestReductionPipelineFactories(unittest.TestCase):
                 "subtract references",
                 "water normalization",
                 "normalize by thickness",
+                "absolute normalization",
                 "azimuthal averaging",
                 "save processed detectors",
                 "save azimuthal text",
@@ -516,6 +517,10 @@ class TestWorkflowPipeline(unittest.TestCase):
                 self.assertEqual(handle["/processed/data"].attrs["NX_class"], b"NXcollection")
                 self.assertEqual(handle["/processed/data/detector0"].attrs["NX_class"], b"NXdata")
                 self.assertEqual(handle["/processed/data/detector0"].attrs["signal"], b"data")
+                self.assertEqual(
+                    handle["/processed/data/detector0/data"].attrs["units"],
+                    b"dimensionless",
+                )
                 self.assertEqual(handle["/processed/data0"].attrs["NX_class"], b"NXdata")
                 self.assertEqual(handle["/processed/data0"].attrs["signal"], b"data")
                 np.testing.assert_allclose(handle["/processed/data/detector0/data"][()], sample_data)

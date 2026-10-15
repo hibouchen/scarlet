@@ -23,6 +23,7 @@ def _write_detector_file(
     monitor_integral: float = 1.0,
     wavelength: float = 6.0,
     detector_distance: float = 4.2,
+    attenuator_transmission: float | None = None,
 ) -> None:
     with h5py.File(path, "w") as handle:
         entry = handle.create_group("entry")
@@ -39,6 +40,14 @@ def _write_detector_file(
 
         instrument = entry.create_group("instrument")
         instrument.attrs["NX_class"] = b"NXinstrument"
+        if attenuator_transmission is not None:
+            attenuator = instrument.create_group("attenuator")
+            attenuator.attrs["NX_class"] = b"NXattenuator"
+            attenuator.create_dataset("selection", data=np.bytes_("test"))
+            attenuator.create_dataset(
+                "attenuator_transmission",
+                data=float(attenuator_transmission),
+            )
         monochromator = instrument.create_group("monochromator")
         monochromator.attrs["NX_class"] = b"NXmonochromator"
         monochromator.create_dataset("wavelength", data=float(wavelength))
@@ -379,6 +388,10 @@ class TestWorkflowNormalizationRegistry(unittest.TestCase):
                 dark_path=None,
                 empty_cell_path=None,
                 mask_file_path=None,
+                direct_flux=12.5,
+                direct_flux_detector_number=0,
+                direct_beam_path=source_path,
+                normalisation_factors={0: 1.25},
             )
 
             self.assertEqual(written, flatfield_path.resolve())
@@ -386,6 +399,21 @@ class TestWorkflowNormalizationRegistry(unittest.TestCase):
             with h5py.File(written, "r") as handle:
                 self.assertEqual(handle["/entry/definition"][()].decode(), "SCARLET_flatfield")
                 self.assertEqual(handle["/entry/config_id"][()].decode(), "cfg")
+                self.assertAlmostEqual(float(handle["/entry/direct_flux"][()]), 12.5)
+                self.assertEqual(handle["/entry/direct_flux"].attrs["units"].decode(), "counts/monitor")
+                self.assertEqual(int(handle["/entry/direct_flux"].attrs["detector_number"]), 0)
+                self.assertEqual(handle["/entry/direct_flux"].attrs["integration"].decode(), "full_detector")
+                self.assertAlmostEqual(
+                    float(handle["/entry/instrument/detector0/normalisation_factor"][()]),
+                    1.25,
+                )
+                self.assertEqual(
+                    handle["/entry/instrument/detector0/normalisation_factor"].attrs[
+                        "target_units"
+                    ].decode(),
+                    "cm^-1",
+                )
+                self.assertNotIn("/entry/normalisation_factor", handle)
                 np.testing.assert_allclose(
                     handle["/entry/instrument/detector0/flatfield"][()],
                     np.asarray([[0.5, 1.0], [1.5, 1.0]], dtype=np.float64),
@@ -402,6 +430,10 @@ class TestWorkflowNormalizationRegistry(unittest.TestCase):
                     handle["/entry/provenance/water_scattering_file"][()].decode(),
                     str(source_path.resolve()),
                 )
+                self.assertEqual(
+                    handle["/entry/provenance/direct_beam_file"][()].decode(),
+                    str(source_path.resolve()),
+                )
 
 
 @unittest.skipIf(importlib.util.find_spec("scipp") is None, "scipp is required for workflow normalization tests")
@@ -412,6 +444,7 @@ class TestWorkflowNormalizationPipeline(unittest.TestCase):
             sample_path = root / "sample_scattering.nxs"
             water_scattering_path = root / "water_scattering.nxs"
             water_transmission_path = root / "water_transmission.nxs"
+            empty_beam_path = root / "empty_beam_transmission.nxs"
             _write_detector_file(
                 sample_path,
                 sample_name="sample_a",
@@ -427,6 +460,12 @@ class TestWorkflowNormalizationPipeline(unittest.TestCase):
                 sample_name="water",
                 data=np.ones((2, 2), dtype=np.float64),
             )
+            _write_detector_file(
+                empty_beam_path,
+                sample_name="empty_beam",
+                data=np.ones((2, 2), dtype=np.float64),
+                attenuator_transmission=0.25,
+            )
 
             ctx = WorkflowContext(output_dir=root / "out")
             ctx.add_run(
@@ -440,6 +479,10 @@ class TestWorkflowNormalizationPipeline(unittest.TestCase):
             ctx.add_run(
                 RunKey(config_id="cfg", entity="water", mode="transmission", sample_name="water"),
                 water_transmission_path,
+            )
+            ctx.add_run(
+                RunKey(config_id="cfg", entity="empty_beam", mode="transmission", sample_name="empty_beam"),
+                empty_beam_path,
             )
             ctx.set_transmission("water", "cfg", 1.0)
             mask_path = root / "masks.nxs"
@@ -478,6 +521,12 @@ class TestWorkflowNormalizationPipeline(unittest.TestCase):
             )
 
             with h5py.File(flatfield_path, "r") as handle:
+                self.assertAlmostEqual(float(handle["/entry/direct_flux"][()]), 16.0)
+                valid_flatfield = expected_flatfield[np.asarray([[True, False], [True, True]])]
+                self.assertAlmostEqual(
+                    float(handle["/entry/instrument/detector0/normalisation_factor"][()]),
+                    10.0 * float(np.mean(valid_flatfield)) / 16.0,
+                )
                 np.testing.assert_array_equal(
                     handle["/entry/instrument/detector0/pixel_mask"][()],
                     np.asarray([[0, 1], [0, 0]], dtype=np.uint8),
@@ -509,6 +558,7 @@ class TestWorkflowNormalizationPipeline(unittest.TestCase):
             sample_path = root / "sample_scattering.nxs"
             water_scattering_path = root / "water_scattering.nxs"
             water_transmission_path = root / "water_transmission.nxs"
+            empty_beam_path = root / "empty_beam_transmission.nxs"
             _write_detector_file(
                 sample_path,
                 sample_name="sample_a",
@@ -524,6 +574,11 @@ class TestWorkflowNormalizationPipeline(unittest.TestCase):
                 sample_name="water",
                 data=np.ones((2, 2), dtype=np.float64),
             )
+            _write_detector_file(
+                empty_beam_path,
+                sample_name="empty_beam",
+                data=np.ones((2, 2), dtype=np.float64),
+            )
 
             ctx = WorkflowContext(output_dir=root / "out")
             ctx.add_run(
@@ -537,6 +592,10 @@ class TestWorkflowNormalizationPipeline(unittest.TestCase):
             ctx.add_run(
                 RunKey(config_id="cfg_ff", entity="water", mode="transmission", sample_name="water"),
                 water_transmission_path,
+            )
+            ctx.add_run(
+                RunKey(config_id="cfg_ff", entity="empty_beam", mode="transmission", sample_name="empty_beam"),
+                empty_beam_path,
             )
             ctx.set_transmission("water", "cfg_ff", 1.0)
             ctx.set_flatfield_source("cfg", "cfg_ff")
@@ -579,6 +638,7 @@ class TestWorkflowNormalizationPipeline(unittest.TestCase):
             root = Path(td)
             water_scattering_path = root / "water_scattering.nxs"
             water_transmission_path = root / "water_transmission.nxs"
+            empty_beam_path = root / "empty_beam_transmission.nxs"
             _write_detector_file(
                 water_scattering_path,
                 sample_name="water",
@@ -587,6 +647,11 @@ class TestWorkflowNormalizationPipeline(unittest.TestCase):
             _write_detector_file(
                 water_transmission_path,
                 sample_name="water",
+                data=np.ones((2, 2), dtype=np.float64),
+            )
+            _write_detector_file(
+                empty_beam_path,
+                sample_name="empty_beam",
                 data=np.ones((2, 2), dtype=np.float64),
             )
 
@@ -598,6 +663,15 @@ class TestWorkflowNormalizationPipeline(unittest.TestCase):
             ctx.add_run(
                 RunKey(config_id="cfg_source", entity="water", mode="transmission", sample_name="water"),
                 water_transmission_path,
+            )
+            ctx.add_run(
+                RunKey(
+                    config_id="cfg_source",
+                    entity="empty_beam",
+                    mode="transmission",
+                    sample_name="empty_beam",
+                ),
+                empty_beam_path,
             )
             ctx.set_transmission("water", "cfg_source", 1.0)
             ctx.set_flatfield_source("cfg_target", "cfg_source")
@@ -622,6 +696,7 @@ class TestWorkflowNormalizationPipeline(unittest.TestCase):
             root = Path(td)
             water_scattering_path = root / "water_scattering_target.nxs"
             water_transmission_path = root / "water_transmission_source.nxs"
+            empty_beam_path = root / "empty_beam_transmission_source.nxs"
             _write_detector_file(
                 water_scattering_path,
                 sample_name="water",
@@ -630,6 +705,11 @@ class TestWorkflowNormalizationPipeline(unittest.TestCase):
             _write_detector_file(
                 water_transmission_path,
                 sample_name="water",
+                data=np.ones((2, 2), dtype=np.float64),
+            )
+            _write_detector_file(
+                empty_beam_path,
+                sample_name="empty_beam",
                 data=np.ones((2, 2), dtype=np.float64),
             )
 
@@ -641,6 +721,15 @@ class TestWorkflowNormalizationPipeline(unittest.TestCase):
             ctx.add_run(
                 RunKey(config_id="cfg_source", entity="water", mode="transmission", sample_name="water"),
                 water_transmission_path,
+            )
+            ctx.add_run(
+                RunKey(
+                    config_id="cfg_source",
+                    entity="empty_beam",
+                    mode="transmission",
+                    sample_name="empty_beam",
+                ),
+                empty_beam_path,
             )
             ctx.set_transmission("water", "cfg_source", 1.0)
             ctx.set_transmission_source("cfg_target", "cfg_source")
