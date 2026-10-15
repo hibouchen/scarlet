@@ -10,7 +10,17 @@ The project follows a simple Semantic Versioning policy:
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-15
+
+- GUI: added the desktop workflow interface for acquisition review, instrument settings, processing, stitching, and result visualization.
+- GUI: added per-detector azimuthal bin counts and linear or logarithmic q-bin spacing to the Processing page.
+- GUI: added result-file search and sorting, multi-sample stitching references, and a stitching normalization-factor control.
+- Converters: preserved optional attenuator selection and transmission metadata for SANSLLB and SAM while retaining compatibility with older raw files.
+- Acquisition detection: stopped using the attenuator as a transmission criterion and based fallback classification on detector-image morphology.
+- Absolute calibration: added attenuator-corrected direct-flux computation, stored direct flux and detector normalization factors in flatfields, and added absolute-intensity normalization to the reduction pipeline.
+- Reduction: added detector-specific azimuthal binning defaults and propagated integration settings through workflow and GUI processing.
 - Notebook: ensured Jupyter kernels launched from a pipx installation use the same isolated Python environment as SCARLET.
+- Maintenance: removed the generated notebook workflow from version control and ignored future local copies.
 
 ## [0.3.0] - 2026-10-03
 

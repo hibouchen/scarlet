@@ -112,9 +112,11 @@ validated coordinates. The automatic center and ROI buttons calculate a
 proposal in the background and leave the final save under user control. The
 selected configuration also provides **Create flatfield** or **Rebuild
 flatfield**. It prepares the water flatfield in the background, using the
-current centers, ROI, and detector masks. **Choose flatfield file** validates
-and attaches an existing `SCARLET_flatfield` bundle; the flatfield-source menu
-can instead reuse the flatfield of another active configuration.
+current centers, ROI, and detector masks. It also records the corrected direct
+flux and the absolute-calibration factor of every detector. **Choose flatfield
+file** validates and attaches an existing `SCARLET_flatfield` bundle; the
+flatfield-source menu can instead reuse the flatfield of another active
+configuration.
 The **Transmission** tab can declare that a configuration reuses the
 transmissions of another active configuration. Its transmission ROI then
 follows the selected source and any locally built flatfield is invalidated.
@@ -125,16 +127,20 @@ The **Processing** page lists only sample-scattering candidates, reports their
 pending, processed, or unavailable status, and supports multiple-row
 selection. **Process selected** reduces the chosen rows, while **Process
 pending** reduces every pending sample acquisition. Both run in the background
-and remain disabled until the readiness diagnostic has no blocking issue.
-The separate **Stitching** page merges all processed configurations for one
-selected sample. Its control table marks samples as stitched from the presence
-of their `<sample>_merged.txt` output file. It supports selecting multiple
-ready samples, or every pending one; a single selected sample can be rebased
-to one of its processed configurations. Result visualization is introduced in
-a subsequent milestone.
+and remain disabled until the readiness diagnostic has no blocking issue. The
+azimuthal-integration controls provide one `n_bins` value per instrument
+detector and a linear or logarithmic q scale.
+The separate **Stitching** page merges all processed configurations for the
+selected samples. Its control table marks samples as stitched from the
+presence of their `<sample>_merged.txt` output file. It supports selecting
+multiple ready samples, or every pending one. The reference list contains only
+processed configurations common to every selected sample. The
+**Normalization factor** is applied multiplicatively to `I` and `I_error` for
+both selected and pending stitching jobs.
 The application menu **Settings → Stitching options…** exposes the complete
 set of greedy-stitching algorithm parameters (except the per-run reference and
 normalization factor) and stores them in the workflow context.
 The **Results** page discovers reduced and stitched I(Q) text files in the
-workflow output folder. Multiple selected rows are overlaid in a silx curve
-plot, including available intensity uncertainties.
+workflow output folder. Its search field filters filenames and result types,
+and its column headers sort the visible rows. Multiple selected rows are
+overlaid in a silx curve plot, including available intensity uncertainties.

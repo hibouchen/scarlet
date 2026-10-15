@@ -51,11 +51,14 @@ One main window contains six pages and a persistent activity area:
 - **Settings** verifies beam centers and transmission ROIs, assigns detector
   masks, declares transmission reuse, and creates or assigns flatfields for
   each configuration.
-- **Processing** starts reduction and reports progress.
+- **Processing** starts reduction, configures detector-specific azimuthal bins
+  and q spacing, and reports progress.
 - **Stitching** lists the merged text outputs found in the output directory
-  and merges selected ready samples.
+  and merges selected ready samples with a common reference configuration and
+  a multiplicative normalization factor.
 - **Results** overlays selected reduced or stitched I(Q) text curves using
-  silx. Detector-image review is a later extension.
+  silx and provides filename/type search and table sorting. Detector-image
+  review is a later extension.
 - **Activity** is a dock containing workflow logs, task messages, and errors.
 
 Navigation is gated by available state, not by a rigid wizard. A user can
@@ -152,15 +155,13 @@ transmission source invalidates the selected configuration's flatfield.
 +--------------------------------+-----------------------------------------+
 | Processing                     | Stitching                               |
 |                                |                                         |
-| Reduction                      | Sample       [sample-a v]                |
-| 12 processed                   | Configuration [config-1 v]              |
-|  6 pending                     |                                         |
-|  1 failed                      |       detector image or I(Q) plot       |
+| Sample runs and status table   | Ready sample groups table               |
 |                                |                                         |
-| [Process selected]             |                                         |
-| [Process new runs]             | Reference    [automatic v]              |
+| detector0 bins [120]           | Reference [automatic v]                 |
+| detector1 bins [ 30]           | Normalization factor [1.0]              |
+| q scale        [linear v]      |                                         |
 |                                |                                         |
-|                                 | [Stitch sample]                         |
+| [Process selected] [pending]   | [Stitch selected] [pending]             |
 +--------------------------------+-----------------------------------------+
 ```
 

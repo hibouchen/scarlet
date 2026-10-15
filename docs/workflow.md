@@ -115,12 +115,65 @@ workflow.exclude_file(
 Calling `add_run()` for an excluded file records a `reinstated` event. The
 history is persisted in `/entry/excluded_files` when the context is saved.
 
+## Prepare flatfields and absolute calibration
+
+The default reduction pipeline requires a current water flatfield for every
+effective flatfield configuration. Build one from the registered water,
+empty-beam, dark, and optional empty-cell references:
+
+```python
+flatfield_path = workflow.build_water_flatfield(
+    "config_1",
+    detector_number_for_transmission=0,
+)
+```
+
+The generated `SCARLET_flatfield` file stores:
+
+- `/entry/direct_flux`, the dead-time-corrected direct-beam counts per monitor
+  unit, integrated over the full selected detector and corrected for the
+  attenuator transmission;
+- `/entry/instrument/detectorN/normalisation_factor`, one absolute-calibration
+  prefactor per detector;
+- the flatfield, its propagated errors, and `pixel_mask` for every detector.
+
+Only finite, positive, unmasked flatfield pixels contribute to the detector
+mean used for the prefactor. If `F_flat` is the stored direct flux and `W_N`
+is the mean valid flatfield value for detector `N`, SCARLET stores:
+
+```text
+p_N = 10 * W_N / F_flat
+```
+
+The factor `10` converts the thickness-normalized inverse-millimetre scale to
+`cm^-1`. To inspect a direct beam independently:
+
+```python
+from scarlet.reduction import compute_direct_flux
+
+flux = compute_direct_flux(
+    "data/SANSLLB/processed/empty_beam.nxs",
+    detector_number=0,
+)
+```
+
+`compute_direct_flux()` reads detector values with dead-time correction and
+monitor normalization, sums the full detector by default, and divides by
+`attenuator_transmission`. An optional `(x0, x1, y0, y1)` ROI can be supplied.
+A missing `NXattenuator` group means an unattenuated beam and therefore a
+transmission of one. If an attenuator group exists without a usable
+transmission, the calculation fails instead of silently assuming one.
+
 ## Run the pipeline
 
 ```python
 from scarlet.workflow.pipeline import ReductionPipeline
 
-pipeline = ReductionPipeline.default(workflow)
+pipeline = ReductionPipeline.default(
+    workflow,
+    n_bins={0: 120, 1: 30, 2: 30},
+    q_scale="linear",
+)
 state = pipeline.run_for_sample(
     sample_name="sample_a",
     config_id="config_1",
@@ -130,6 +183,23 @@ state = pipeline.run_for_sample(
 The first pipeline access converts the requested raw run when necessary. Runs
 that are never requested are never converted. Processed detector data are
 written into the associated NeXus file under the top-level `/processed` entry.
+
+`n_bins` accepts either one positive integer for every detector or a mapping
+from detector number to bin count. `q_scale` accepts `"linear"` or `"log"`.
+When omitted, the default mapping is `{0: 120, 1: 30, 2: 30}`; only detector
+numbers present in the data are used.
+
+After reference subtraction, water-flatfield correction, and thickness
+normalization, the absolute-normalization step multiplies detector `N` by:
+
+```text
+p_N * F_flat / F_config
+```
+
+where `F_config` is recomputed from the effective configuration's direct beam
+with its own attenuator transmission. The resulting detector arrays and
+azimuthal curves have intensity units of `cm^-1`. Flatfields created before
+the absolute-calibration metadata was introduced must be rebuilt.
 
 The context is an attribute of the pipeline. It therefore does not need to be
 passed again to `run_for_sample()` or `run_all()`.
@@ -208,8 +278,17 @@ provided at construction time:
 from scarlet.workflow.pipeline import StichingPipeline
 
 stitching = StichingPipeline(workflow)
-merged = stitching.run_new(scale_on="config_1")
+merged = stitching.run_new(
+    scale_on="config_1",
+    normalization_factor=1.0,
+)
 ```
+
+`scale_on` rebases each stitched curve to the requested processed
+configuration. `normalization_factor` then multiplies the final `I` and
+`I_error` columns; q and `q_error` are unchanged. In the GUI, a reference is
+offered for a multi-sample selection only when that configuration is processed
+for every selected sample.
 
 `run_new()` does not refresh the workflow and never converts raw acquisitions.
 An eligible sample must have `/processed` in every registered scattering run.

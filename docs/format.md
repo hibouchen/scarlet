@@ -21,13 +21,36 @@ Simplified paths:
   /instrument (NXinstrument)
     /geometry                          # Existing reserved SCARLET group
     /collimation (NXcollection)        # SCARLET extension, detailed below
-    /detector
+    /attenuator (NXattenuator)         # Optional
+    /detector0 (NXdetector)
   /control (NXmonitor)
   /data
     /data0/data                        # Raw 2D image (SCARLET v0.1)
 ```
 
 The current implementation converges on the `scarlet_nxsas_raw_v1.3_mono.yaml` profile: raw data are stored in `NXdetector` groups (`/raw_data/instrument/detector0`, `/raw_data/instrument/detector1`, and so on) and exposed through `NXdata` groups (`/raw_data/data0`, `/raw_data/data1`, and so on) containing links to those detectors.
+
+## Attenuator
+
+The optional attenuator group is stored below the active raw entry:
+
+```text
+/<entry>/instrument/attenuator (NXattenuator)
+  selection = "..."
+  attenuator_transmission = 0.217
+```
+
+`selection` identifies the instrument setting. `attenuator_transmission` is
+the physical ratio `I_attenuated / I_incident`, so it must satisfy
+`0 < attenuator_transmission <= 1`. It is not the inverse correction factor.
+
+The SANSLLB converter accepts current and transitional raw field names. A raw
+`attenuation_factor` is inverted before being written as
+`attenuator_transmission`. For SAM, the factor between parentheses in the raw
+attenuator state is interpreted as the inverse correction factor and is also
+inverted. The converted group is optional so older files without attenuator
+metadata remain valid. If the group exists but no valid transmission can be
+read, direct-flux calibration reports an error rather than assuming unity.
 
 ## Collimation (SCARLET extension)
 
@@ -164,49 +187,33 @@ The presence of `/processed` is also the criterion used by
 `WorkflowContext.is_run_processed()` and the processing-status tables. See
 [Workflow context](workflow.md) for the complete lifecycle.
 
-The high-level reduction command, for example `scarlet reduce`, is not yet implemented in the current repository. Available commands currently cover conversion, validation, generation of `refs_sub` and `refs_norm` reference bundles, and an initial deterministic 2D correction through `scarlet reduce-2d`.
+The workflow pipeline writes one azimuthal text curve per detector and records
+the processed detector arrays in `/processed`. Bin counts may differ by
+detector and bin boundaries may be linear or logarithmic in q. Text outputs
+contain q, `I`, `I_error`, and `q_error`.
 
-When needed, `scarlet reduce-2d` copies the raw file and then adds:
+## Flatfield calibration format
 
-```
-/raw_data (NXentry)   # Present in recent converted files
-  definition = "NXsas_raw"
-  ...
+Water flatfields use a separate `SCARLET_flatfield` NeXus file:
 
-/processed_data (NXentry)
-  definition = "SCARLET_azimuthal_iq"
-  schema_version = "0.2"
-  /data (NXdata)
-    # Alias to the first reduced detector
-  /data0 (NXdata)
-    I                 # 1D azimuthal curve for detector0
-    Q                 # Bin centers in 1/angstrom
-    Q_edges           # Bin edges
-    n_pixels          # Number of accumulated pixels per bin
-  /data1 (NXdata)     # Optional when detector1 exists
-    I
-    Q
-    Q_edges
-    n_pixels
-  /detector0 (NXcollection)
-    I_2d              # Corrected 2D image for detector0
-    Qx
-    Qy
-    sample_corrected
-    water_corrected   # Optional
-    mask              # Optional, 1 means masked
-  /detector1 (NXcollection)   # Optional when detector1 exists
-    I_2d
-    Qx
-    Qy
-    sample_corrected
-    water_corrected   # Optional when refs_norm is supplied
-    mask              # Optional, 1 means masked
-  /reduction (NXprocess)
-    /detector_indices
-    /sample_transmission/value
-    /water_transmission/value   # Optional
-    /inputs/...
+```text
+/entry (NXentry)
+  definition = "SCARLET_flatfield"
+  direct_flux                         # counts/monitor, full detector
+  /instrument (NXinstrument)
+    /detector0 (NXdetector)
+      flatfield
+      flatfield_errors
+      pixel_mask
+      normalisation_factor            # target units cm^-1
+    /detector1 (NXdetector)            # Optional
+      ...
 ```
 
-The `SCARLET_azimuthal_iq` product remains deliberately preliminary: it does not yet include uncertainty propagation or multi-detector merging.
+For detector `N`, the stored factor is `10 * mean(valid flatfield_N) /
+direct_flux`. Pixels marked in `pixel_mask`, as well as non-finite or
+non-positive pixels, do not contribute to the mean. During reduction SCARLET
+multiplies the corrected detector by this factor and by the ratio between the
+flatfield direct flux and the active configuration direct flux. See
+[Workflow context](workflow.md#prepare-flatfields-and-absolute-calibration)
+for the complete formula and failure behavior.

@@ -41,9 +41,19 @@ unprocessed sample runs already registered in the workflow:
 ```python
 from scarlet.workflow.pipeline import ReductionPipeline
 
-pipeline = ReductionPipeline.default(workflow)
+pipeline = ReductionPipeline.default(
+    workflow,
+    n_bins={0: 120, 1: 30, 2: 30},
+    q_scale="linear",
+)
 states = pipeline.run_new()
 ```
+
+The default pipeline produces absolute intensities in `cm^-1`. Its water
+flatfield must contain the attenuation-corrected direct flux and one
+`normalisation_factor` per detector. Flatfields built by the current workflow
+store this calibration metadata automatically. `n_bins` may be a single
+integer or a detector-number mapping; `q_scale` accepts `"linear"` or `"log"`.
 
 One failing run is recorded in `workflow.logs` without interrupting the other
 runs. `run_new()` does not refresh or change the workflow run registry. Call
@@ -57,7 +67,10 @@ Incremental stitching uses the same workflow-owned API:
 from scarlet.workflow.pipeline import StichingPipeline
 
 stitching = StichingPipeline(workflow)
-merged = stitching.run_new()
+merged = stitching.run_new(
+    scale_on="config_1",
+    normalization_factor=1.0,
+)
 ```
 
 Only samples whose registered scattering runs are all processed are eligible.
@@ -156,9 +169,11 @@ dragging a rectangle; both remain editable numerically before saving. Separate
 automatic-detection buttons can propose a center or ROI without saving it
 until the user confirms the result. The selected configuration offers
 **Create flatfield** or **Rebuild flatfield** to prepare its water flatfield
-in the background using the current settings and masks. An existing validated
-flatfield file can be attached, or a configuration can reuse the flatfield of
-another active configuration. The **Transmission** tab can likewise declare
+in the background using the current settings and masks. The generated file
+also stores the attenuation-corrected direct flux and the absolute-calibration
+factor of each detector. An existing validated flatfield file can be attached,
+or a configuration can reuse the flatfield of another active configuration.
+The **Transmission** tab can likewise declare
 that a configuration reuses transmissions from another active configuration;
 its transmission ROI follows that source, and any locally built flatfield is
 then invalidated.
@@ -167,17 +182,23 @@ The **Processing** page lists sample-scattering reduction candidates, their
 pending/processed status, and the current readiness diagnostic. Select one or
 more rows to reduce them, or use **Process pending** to reduce all currently
 pending sample acquisitions. Reductions run in the background and the table is
-updated when the job finishes. The separate **Stitching** page merges every
+updated when the job finishes. The page exposes a separate radial-bin count
+for every detector present on the instrument and linear or logarithmic q-bin
+spacing. The separate **Stitching** page merges every
 processed configuration of a selected sample. Its control table identifies
 already stitched samples from the presence of `<sample>_merged.txt` in the
 output folder. Select one or more ready samples to stitch them; a reference
-configuration can be chosen when a single sample is selected.
+configuration common to every selection can be chosen. The per-run
+**Normalization factor** multiplies the stitched intensity and its uncertainty;
+it does not change q or its uncertainty.
 Use **Settings → Stitching options…** to adjust and save the greedy-stitching
 algorithm parameters used for the workflow.
 
 The **Results** page discovers reduced and stitched I(Q) text files in the
-workflow output folder. Select multiple rows to overlay their curves in the
-silx plot, including their available intensity uncertainties.
+workflow output folder. Its search field filters by filename or result type,
+and column headers sort the visible files. Select multiple rows to overlay
+their curves in the silx plot, including their available intensity
+uncertainties.
 
 ### Notebook
 
