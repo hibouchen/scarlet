@@ -675,13 +675,16 @@ class TestProcessingPage(unittest.TestCase):
             page.reference_combo.setCurrentIndex(
                 page.reference_combo.findData("config_2")
             )
-            requests: list[tuple[list[str], object]] = []
+            page.normalization_factor_spin.setValue(2.5)
+            requests: list[tuple[list[str], object, float]] = []
             page.stitch_selected_requested.connect(
-                lambda sample_names, reference: requests.append((sample_names, reference))
+                lambda sample_names, reference, factor: requests.append(
+                    (sample_names, reference, factor)
+                )
             )
             page.stitch_selected_button.click()
 
-            self.assertEqual(requests, [(["sample-a"], "config_2")])
+            self.assertEqual(requests, [(["sample-a"], "config_2", 2.5)])
             page.table.selectionModel().select(
                 page.model.index(1, 0),
                 QtCore.QItemSelectionModel.SelectionFlag.Select
@@ -694,7 +697,14 @@ class TestProcessingPage(unittest.TestCase):
                 page.reference_combo.findData("config_1")
             )
             page.stitch_selected_button.click()
-            self.assertEqual(requests[-1], (["sample-a", "sample-b"], "config_1"))
+            self.assertEqual(
+                requests[-1],
+                (["sample-a", "sample-b"], "config_1", 2.5),
+            )
+            pending_requests: list[float] = []
+            page.stitch_pending_requested.connect(pending_requests.append)
+            page.stitch_pending_button.click()
+            self.assertEqual(pending_requests, [2.5])
             output_path = workflow.output_dir / "sample-a_merged.txt"
             output_path.parent.mkdir(parents=True)
             output_path.write_text("merged", encoding="utf-8")
@@ -1129,12 +1139,17 @@ class TestWorkflowController(unittest.TestCase):
         controller._workflow = workflow
 
         with mock.patch.object(controller, "_start_stitching") as start_stitching:
-            controller.stitch_selected(["sample-a", "sample-b"], "config_1")
+            controller.stitch_selected(
+                ["sample-a", "sample-b"],
+                "config_1",
+                2.5,
+            )
 
         start_stitching.assert_called_once_with(
             workflow,
             ("sample-a", "sample-b"),
             "config_1",
+            2.5,
             kind="stitch_selected",
         )
 

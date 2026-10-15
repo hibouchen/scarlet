@@ -10,8 +10,8 @@ from ..models import StitchingSamplesModel
 class StitchingPage(QtWidgets.QWidget):
     """Review stitched outputs and merge selected ready sample groups."""
 
-    stitch_selected_requested = QtCore.Signal(object, object)
-    stitch_pending_requested = QtCore.Signal()
+    stitch_selected_requested = QtCore.Signal(object, object, float)
+    stitch_pending_requested = QtCore.Signal(float)
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -45,6 +45,15 @@ class StitchingPage(QtWidgets.QWidget):
 
         self.selection_label = QtWidgets.QLabel("No sample selected")
         self.reference_combo = QtWidgets.QComboBox()
+        self.normalization_factor_spin = QtWidgets.QDoubleSpinBox()
+        self.normalization_factor_spin.setObjectName("stitchingNormalizationFactor")
+        self.normalization_factor_spin.setRange(0.000000001, 1_000_000_000.0)
+        self.normalization_factor_spin.setDecimals(9)
+        self.normalization_factor_spin.setSingleStep(0.1)
+        self.normalization_factor_spin.setValue(1.0)
+        self.normalization_factor_spin.setToolTip(
+            "Multiplicative factor applied to the stitched intensity and its error."
+        )
         self.stitch_selected_button = QtWidgets.QPushButton("Stitch selected")
         self.stitch_pending_button = QtWidgets.QPushButton("Stitch pending")
 
@@ -53,6 +62,8 @@ class StitchingPage(QtWidgets.QWidget):
         actions.addStretch(1)
         actions.addWidget(QtWidgets.QLabel("Reference"))
         actions.addWidget(self.reference_combo)
+        actions.addWidget(QtWidgets.QLabel("Normalization factor"))
+        actions.addWidget(self.normalization_factor_spin)
         actions.addWidget(self.stitch_selected_button)
         actions.addWidget(self.stitch_pending_button)
 
@@ -64,7 +75,7 @@ class StitchingPage(QtWidgets.QWidget):
         layout.addLayout(actions)
 
         self.stitch_selected_button.clicked.connect(self._request_selected_stitching)
-        self.stitch_pending_button.clicked.connect(self.stitch_pending_requested)
+        self.stitch_pending_button.clicked.connect(self._request_pending_stitching)
         self._update_controls()
 
     def set_workflow(self, workflow: WorkflowContext | None) -> None:
@@ -162,6 +173,9 @@ class StitchingPage(QtWidgets.QWidget):
         can_stitch_selected = bool(selected) and selected_ready and not self._busy
         can_stitch_pending = self.model.status_count("ready") > 0 and not self._busy
         self.reference_combo.setEnabled(bool(selected) and not self._busy)
+        self.normalization_factor_spin.setEnabled(
+            self._workflow is not None and not self._busy
+        )
         self.stitch_selected_button.setEnabled(can_stitch_selected)
         self.stitch_pending_button.setEnabled(can_stitch_pending)
         tooltip = "" if can_stitch_selected else "Select only samples ready for stitching."
@@ -172,4 +186,12 @@ class StitchingPage(QtWidgets.QWidget):
         samples = self.selected_sample_names()
         if samples:
             reference = self.reference_combo.currentData()
-            self.stitch_selected_requested.emit(samples, reference)
+            self.stitch_selected_requested.emit(
+                samples,
+                reference,
+                self.normalization_factor_spin.value(),
+            )
+
+    @QtCore.Slot()
+    def _request_pending_stitching(self) -> None:
+        self.stitch_pending_requested.emit(self.normalization_factor_spin.value())

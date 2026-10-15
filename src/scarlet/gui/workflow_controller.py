@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, replace
 from pathlib import Path
 import traceback
@@ -409,13 +410,23 @@ class WorkflowController(QtCore.QObject):
             q_scale=q_scale,
         )
 
-    @QtCore.Slot(str, object)
-    def stitch_sample(self, sample_name: str, scale_on: object) -> None:
+    @QtCore.Slot(str, object, object)
+    def stitch_sample(
+        self,
+        sample_name: str,
+        scale_on: object,
+        normalization_factor: object = 1.0,
+    ) -> None:
         """Backward-compatible entry point for stitching one sample."""
-        self.stitch_selected([sample_name], scale_on)
+        self.stitch_selected([sample_name], scale_on, normalization_factor)
 
-    @QtCore.Slot(object, object)
-    def stitch_selected(self, sample_names: object, scale_on: object) -> None:
+    @QtCore.Slot(object, object, object)
+    def stitch_selected(
+        self,
+        sample_names: object,
+        scale_on: object,
+        normalization_factor: object = 1.0,
+    ) -> None:
         """Merge the selected ready sample groups into I(Q) text curves."""
         workflow = self._require_workflow()
         if not isinstance(sample_names, (list, tuple)) or not all(
@@ -426,12 +437,20 @@ class WorkflowController(QtCore.QObject):
         if not samples or any(not sample_name for sample_name in samples):
             raise ValueError("At least one non-empty sample name is required")
         reference = None if scale_on is None else str(scale_on).strip() or None
-        self._start_stitching(workflow, samples, reference, kind="stitch_selected")
+        factor = self._validate_normalization_factor(normalization_factor)
+        self._start_stitching(
+            workflow,
+            samples,
+            reference,
+            factor,
+            kind="stitch_selected",
+        )
 
-    @QtCore.Slot()
-    def stitch_pending(self) -> None:
+    @QtCore.Slot(object)
+    def stitch_pending(self, normalization_factor: object = 1.0) -> None:
         """Merge every ready sample that has no merged text file in ``output_dir``."""
         workflow = self._require_workflow()
+        factor = self._validate_normalization_factor(normalization_factor)
         from scarlet.workflow.pipeline import StichingPipeline
 
         pipeline = StichingPipeline(workflow)
@@ -452,7 +471,23 @@ class WorkflowController(QtCore.QObject):
         if not samples:
             self.activity.emit("INFO", "No ready sample is waiting for stitching.")
             return
-        self._start_stitching(workflow, samples, None, kind="stitch_pending")
+        self._start_stitching(
+            workflow,
+            samples,
+            None,
+            factor,
+            kind="stitch_pending",
+        )
+
+    @staticmethod
+    def _validate_normalization_factor(value: object) -> float:
+        try:
+            factor = float(value)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("normalization_factor must be a number") from exc
+        if not math.isfinite(factor) or factor <= 0.0:
+            raise ValueError("normalization_factor must be finite and strictly positive")
+        return factor
 
     def stitching_options(self) -> StitchingOptions:
         """Return the persisted greedy-stitching options of the open workflow."""
@@ -483,6 +518,7 @@ class WorkflowController(QtCore.QObject):
         workflow: WorkflowContext,
         sample_names: tuple[str, ...],
         reference: str | None,
+        normalization_factor: float,
         *,
         kind: str,
     ) -> None:
@@ -536,6 +572,7 @@ class WorkflowController(QtCore.QObject):
                     data = pipeline.run_for_sample(
                         sample_name,
                         scale_on=reference,
+                        normalization_factor=normalization_factor,
                         options=options,
                     )
                     point_count = len(data)
@@ -555,6 +592,7 @@ class WorkflowController(QtCore.QObject):
                     where="WorkflowController.stitch_selected",
                     sample_name=sample_name,
                     reference_config=reference,
+                    normalization_factor=normalization_factor,
                     point_count=point_count,
                 )
             workflow.info(
@@ -563,6 +601,7 @@ class WorkflowController(QtCore.QObject):
                 attempted_count=len(sample_names),
                 stitched_count=stitched_count,
                 failed_count=failed_count,
+                normalization_factor=normalization_factor,
             )
             return stitched_count, failed_count
 
