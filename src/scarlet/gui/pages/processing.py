@@ -3,6 +3,10 @@ from __future__ import annotations
 from PySide6 import QtCore, QtWidgets
 
 from scarlet.workflow import RunKey, WorkflowContext
+from scarlet.workflow.pipeline import (
+    DEFAULT_AZIMUTHAL_N_BINS,
+    DEFAULT_AZIMUTHAL_Q_SCALE,
+)
 
 from ..models import ProcessingRunsModel, ReferenceTransmissionsModel
 from ..readiness import assess_workflow_readiness
@@ -70,6 +74,24 @@ class ProcessingPage(QtWidgets.QWidget):
         reference_title = QtWidgets.QLabel("Reference transmissions")
         reference_title.setObjectName("sectionTitle")
 
+        self.integration_group = QtWidgets.QGroupBox("Azimuthal integration")
+        integration_layout = QtWidgets.QFormLayout(self.integration_group)
+        self.n_bins_widget = QtWidgets.QWidget()
+        self.n_bins_layout = QtWidgets.QFormLayout(self.n_bins_widget)
+        self.n_bins_layout.setContentsMargins(0, 0, 0, 0)
+        self.n_bins_spinboxes: dict[int, QtWidgets.QSpinBox] = {}
+        self._set_detector_numbers((0,))
+        integration_layout.addRow(self.n_bins_widget)
+
+        self.q_scale_combo = QtWidgets.QComboBox()
+        self.q_scale_combo.setObjectName("azimuthalQScale")
+        self.q_scale_combo.addItem("Linear", "linear")
+        self.q_scale_combo.addItem("Logarithmic", "log")
+        default_scale_index = self.q_scale_combo.findData(DEFAULT_AZIMUTHAL_Q_SCALE)
+        self.q_scale_combo.setCurrentIndex(default_scale_index)
+        self.q_scale_combo.setToolTip("Spacing of the radial q-bin boundaries.")
+        integration_layout.addRow("Q scale", self.q_scale_combo)
+
         self.selection_label = QtWidgets.QLabel("No acquisition selected")
         self.process_selected_button = QtWidgets.QPushButton("Process selected")
         self.process_pending_button = QtWidgets.QPushButton("Process pending")
@@ -91,12 +113,50 @@ class ProcessingPage(QtWidgets.QWidget):
         layout.addWidget(self.table, 1)
         layout.addWidget(reference_title)
         layout.addWidget(self.reference_transmissions_table)
+        layout.addWidget(self.integration_group)
         layout.addLayout(actions)
 
         self.process_selected_button.clicked.connect(self._request_selected_processing)
         self.process_pending_button.clicked.connect(self.process_pending_requested)
 
+    def _set_detector_numbers(self, detector_numbers: tuple[int, ...]) -> None:
+        previous_values = {
+            detector_number: spinbox.value()
+            for detector_number, spinbox in self.n_bins_spinboxes.items()
+        }
+        while self.n_bins_layout.rowCount() > 0:
+            self.n_bins_layout.removeRow(0)
+        self.n_bins_spinboxes.clear()
+
+        for detector_number in detector_numbers:
+            spinbox = QtWidgets.QSpinBox()
+            spinbox.setObjectName(f"nBinsDetector{detector_number}")
+            spinbox.setRange(1, 10000)
+            spinbox.setValue(
+                previous_values.get(
+                    detector_number,
+                    DEFAULT_AZIMUTHAL_N_BINS.get(detector_number, 30),
+                )
+            )
+            spinbox.setToolTip(
+                f"Number of radial q bins used for detector{detector_number}."
+            )
+            self.n_bins_spinboxes[detector_number] = spinbox
+            self.n_bins_layout.addRow(f"Detector {detector_number} bins", spinbox)
+
+    @staticmethod
+    def _workflow_detector_numbers(workflow: WorkflowContext | None) -> tuple[int, ...]:
+        if workflow is None:
+            return (0,)
+        detector_counts = []
+        for configuration in workflow.configurations.values():
+            distance = configuration.sample_detector_distance
+            detector_counts.append(len(distance) if isinstance(distance, list) else 1)
+        detector_count = max(detector_counts, default=1)
+        return tuple(range(detector_count))
+
     def set_workflow(self, workflow: WorkflowContext | None) -> None:
+        self._set_detector_numbers(self._workflow_detector_numbers(workflow))
         self.model.set_workflow(workflow)
         self.reference_transmissions_model.set_workflow(workflow)
         if workflow is None:
@@ -143,7 +203,17 @@ class ProcessingPage(QtWidgets.QWidget):
         self._busy = bool(busy)
         self.table.setDisabled(busy)
         self.reference_transmissions_table.setDisabled(busy)
+        self.integration_group.setDisabled(busy)
         self._update_action_controls()
+
+    def reduction_options(self) -> tuple[dict[int, int], str]:
+        """Return the azimuthal-integration options selected in the page."""
+        n_bins = {
+            detector_number: spinbox.value()
+            for detector_number, spinbox in self.n_bins_spinboxes.items()
+        }
+        q_scale = str(self.q_scale_combo.currentData())
+        return n_bins, q_scale
 
     def selected_run_keys(self) -> list[RunKey]:
         selected: list[RunKey] = []

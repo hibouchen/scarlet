@@ -222,13 +222,12 @@ def _inspect_sam(path: Path) -> RawRunMetadata:
             ),
         )
 
-        measurement_type = _dataset_text(handle, f"{instrument}/MeasurementType/typeOfMeasure")
-        if measurement_type and "transmission" in measurement_type.lower():
-            mode: MeasurementMode = "transmission"
-        elif measurement_type and "scattering" in measurement_type.lower():
-            mode = "scattering"
-        else:
-            mode = _guess_from_image(_sam_read_detector_counts(handle, entry, []))
+        # SAM acquisition files can expose a stale ``typeOfMeasure`` value
+        # (observed as ``Transmission`` for complete transmission/scattering
+        # series).  Infer the mode from detector morphology instead.  The
+        # attenuator is deliberately not used as a mode discriminator: it is
+        # calibration metadata, not a definition of the acquisition mode.
+        mode = _guess_from_image(_sam_read_detector_counts(handle, entry, []))
 
         return RawRunMetadata(
             sample_name=_sam_sample_name(handle, entry),

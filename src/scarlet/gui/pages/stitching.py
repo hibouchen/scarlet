@@ -119,25 +119,32 @@ class StitchingPage(QtWidgets.QWidget):
 
     def _populate_reference_configurations(self, selected_samples: list[str]) -> None:
         current_reference = self.reference_combo.currentData()
-        configurations: list[str] = []
-        if self._workflow is not None and len(selected_samples) == 1:
-            sample_name = selected_samples[0]
-            configurations = sorted(
-                {
-                    run_key.config_id
-                    for run_key in self._workflow.runs
-                    if run_key.entity == "sample"
-                    and run_key.mode == "scattering"
-                    and run_key.sample_name == sample_name
-                    and self._workflow.is_run_processed(run_key)
-                }
-            )
+        configurations_by_sample: list[set[str]] = []
+        if self._workflow is not None:
+            for sample_name in selected_samples:
+                configurations_by_sample.append(
+                    {
+                        run_key.config_id
+                        for run_key in self._workflow.runs
+                        if run_key.entity == "sample"
+                        and run_key.mode == "scattering"
+                        and run_key.sample_name == sample_name
+                        and self._workflow.is_run_processed(run_key)
+                    }
+                )
+        configurations = sorted(
+            set.intersection(*configurations_by_sample)
+            if configurations_by_sample
+            else set()
+        )
         blocker = QtCore.QSignalBlocker(self.reference_combo)
         self.reference_combo.clear()
         self.reference_combo.addItem("Automatic (lowest q)", None)
         for config_id in configurations:
             self.reference_combo.addItem(config_id, config_id)
-        self.reference_combo.setCurrentIndex(max(0, self.reference_combo.findData(current_reference)))
+        self.reference_combo.setCurrentIndex(
+            max(0, self.reference_combo.findData(current_reference))
+        )
         del blocker
 
     def _update_controls(self) -> None:
@@ -154,7 +161,7 @@ class StitchingPage(QtWidgets.QWidget):
         )
         can_stitch_selected = bool(selected) and selected_ready and not self._busy
         can_stitch_pending = self.model.status_count("ready") > 0 and not self._busy
-        self.reference_combo.setEnabled(len(selected) == 1 and not self._busy)
+        self.reference_combo.setEnabled(bool(selected) and not self._busy)
         self.stitch_selected_button.setEnabled(can_stitch_selected)
         self.stitch_pending_button.setEnabled(can_stitch_pending)
         tooltip = "" if can_stitch_selected else "Select only samples ready for stitching."
@@ -164,5 +171,5 @@ class StitchingPage(QtWidgets.QWidget):
     def _request_selected_stitching(self) -> None:
         samples = self.selected_sample_names()
         if samples:
-            reference = self.reference_combo.currentData() if len(samples) == 1 else None
+            reference = self.reference_combo.currentData()
             self.stitch_selected_requested.emit(samples, reference)

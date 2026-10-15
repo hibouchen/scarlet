@@ -172,9 +172,11 @@ class ScarletMainWindow(QtWidgets.QMainWindow):
         self.acquisitions_page.import_csv_requested.connect(self._import_runs_csv)
         self.acquisitions_page.export_csv_requested.connect(self._export_runs_csv)
         self.processing_page.process_selected_requested.connect(
-            self.controller.process_selected
+            self._process_selected
         )
-        self.processing_page.process_pending_requested.connect(self.controller.process_pending)
+        self.processing_page.process_pending_requested.connect(
+            self._process_pending
+        )
         self.stitching_page.stitch_selected_requested.connect(
             self.controller.stitch_selected
         )
@@ -398,6 +400,23 @@ class ScarletMainWindow(QtWidgets.QMainWindow):
         workflow = self.controller.workflow
         self.acquisitions_page.refresh_readiness(workflow)
         self.settings_page.set_workflow(workflow)
+
+    @QtCore.Slot(object)
+    def _process_selected(self, run_keys: object) -> None:
+        n_bins, q_scale = self.processing_page.reduction_options()
+        self.controller.process_selected(
+            run_keys,
+            n_bins=n_bins,
+            q_scale=q_scale,
+        )
+
+    @QtCore.Slot()
+    def _process_pending(self) -> None:
+        n_bins, q_scale = self.processing_page.reduction_options()
+        self.controller.process_pending(
+            n_bins=n_bins,
+            q_scale=q_scale,
+        )
 
     @QtCore.Slot()
     def _refresh_processing_state(self) -> None:

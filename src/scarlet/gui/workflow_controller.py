@@ -358,7 +358,13 @@ class WorkflowController(QtCore.QObject):
         )
 
     @QtCore.Slot(object)
-    def process_selected(self, run_keys: object) -> None:
+    def process_selected(
+        self,
+        run_keys: object,
+        *,
+        n_bins: object = None,
+        q_scale: str = "linear",
+    ) -> None:
         """Reduce the exact sample-scattering runs selected in the GUI."""
         workflow = self._require_workflow()
         if not isinstance(run_keys, (list, tuple)) or not all(
@@ -368,10 +374,21 @@ class WorkflowController(QtCore.QObject):
         selected = tuple(dict.fromkeys(run_keys))
         if not selected:
             return
-        self._start_reduction(workflow, selected, kind="reduce_selected")
+        self._start_reduction(
+            workflow,
+            selected,
+            kind="reduce_selected",
+            n_bins=n_bins,
+            q_scale=q_scale,
+        )
 
     @QtCore.Slot()
-    def process_pending(self) -> None:
+    def process_pending(
+        self,
+        *,
+        n_bins: object = None,
+        q_scale: str = "linear",
+    ) -> None:
         """Reduce every currently pending sample-scattering run."""
         workflow = self._require_workflow()
         pending = tuple(
@@ -384,7 +401,13 @@ class WorkflowController(QtCore.QObject):
         if not pending:
             self.activity.emit("INFO", "No pending sample acquisition to process.")
             return
-        self._start_reduction(workflow, pending, kind="reduce_pending")
+        self._start_reduction(
+            workflow,
+            pending,
+            kind="reduce_pending",
+            n_bins=n_bins,
+            q_scale=q_scale,
+        )
 
     @QtCore.Slot(str, object)
     def stitch_sample(self, sample_name: str, scale_on: object) -> None:
@@ -403,8 +426,6 @@ class WorkflowController(QtCore.QObject):
         if not samples or any(not sample_name for sample_name in samples):
             raise ValueError("At least one non-empty sample name is required")
         reference = None if scale_on is None else str(scale_on).strip() or None
-        if len(samples) != 1:
-            reference = None
         self._start_stitching(workflow, samples, reference, kind="stitch_selected")
 
     @QtCore.Slot()
@@ -486,18 +507,22 @@ class WorkflowController(QtCore.QObject):
             return
 
         if reference is not None:
-            sample_name = sample_names[0]
-            processed_configurations = {
-                run_key.config_id
-                for run_key in workflow.runs
-                if run_key.entity == "sample"
-                and run_key.mode == "scattering"
-                and run_key.sample_name == sample_name
-                and workflow.is_run_processed(run_key)
-            }
-            if reference not in processed_configurations:
+            missing_reference = []
+            for sample_name in sample_names:
+                processed_configurations = {
+                    run_key.config_id
+                    for run_key in workflow.runs
+                    if run_key.entity == "sample"
+                    and run_key.mode == "scattering"
+                    and run_key.sample_name == sample_name
+                    and workflow.is_run_processed(run_key)
+                }
+                if reference not in processed_configurations:
+                    missing_reference.append(sample_name)
+            if missing_reference:
                 message = (
-                    f"Reference configuration is not processed for {sample_name}: {reference}."
+                    "Reference configuration is not processed for "
+                    f"{', '.join(missing_reference)}: {reference}."
                 )
                 self.activity.emit("ERROR", message)
                 self.failed.emit(message, "")
@@ -549,6 +574,8 @@ class WorkflowController(QtCore.QObject):
         run_keys: tuple[RunKey, ...],
         *,
         kind: str,
+        n_bins: object = None,
+        q_scale: str = "linear",
     ) -> None:
         from .readiness import assess_workflow_readiness
 
@@ -575,7 +602,11 @@ class WorkflowController(QtCore.QObject):
         def reduce() -> tuple[int, int]:
             from scarlet.workflow.pipeline import ReductionPipeline
 
-            pipeline = ReductionPipeline.default(workflow)
+            pipeline = ReductionPipeline.default(
+                workflow,
+                n_bins=n_bins,
+                q_scale=q_scale,
+            )
             processed_count = 0
             failed_count = 0
             for run_key in run_keys:
@@ -598,6 +629,8 @@ class WorkflowController(QtCore.QObject):
                 attempted_count=len(run_keys),
                 processed_count=processed_count,
                 failed_count=failed_count,
+                n_bins=pipeline.n_bins,
+                q_scale=pipeline.q_scale,
             )
             return processed_count, failed_count
 

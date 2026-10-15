@@ -28,6 +28,8 @@ StepFunction = Callable[["ReductionState"], "ReductionState"]
 _F = TypeVar("_F", bound=StepFunction)
 AzimuthalNBins = int | Mapping[int, int]
 AzimuthalQScale = Literal["linear", "log"]
+DEFAULT_AZIMUTHAL_N_BINS = {0: 120, 1: 30, 2: 30}
+DEFAULT_AZIMUTHAL_Q_SCALE: AzimuthalQScale = "linear"
 
 @dataclass
 class ReductionState:
@@ -1050,9 +1052,10 @@ class ReductionPipeline:
         cls,
         workflow: WorkflowContext,
         *,
-        n_bins: AzimuthalNBins = {0:120,1:30,2:30},
-        q_scale: AzimuthalQScale = "linear",
+        n_bins: AzimuthalNBins | None = None,
+        q_scale: AzimuthalQScale = DEFAULT_AZIMUTHAL_Q_SCALE,
     ) -> "ReductionPipeline":
+        selected_n_bins = DEFAULT_AZIMUTHAL_N_BINS if n_bins is None else n_bins
         return cls(
             workflow=workflow,
             steps=(
@@ -1064,7 +1067,7 @@ class ReductionPipeline:
                 as_reduction_step(save_processed_detectors_step),
                 as_reduction_step(save_azimuthal_text_step),
             ),
-            n_bins=n_bins,
+            n_bins=selected_n_bins,
             q_scale=q_scale,
         )
 

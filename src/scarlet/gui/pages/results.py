@@ -30,8 +30,21 @@ class ResultsPage(QtWidgets.QWidget):
         self.error_label.setStyleSheet("color: #b71c1c;")
 
         self.model = ResultCurvesModel(parent=self)
+        self.sort_model = QtCore.QSortFilterProxyModel(self)
+        self.sort_model.setSourceModel(self.model)
+        self.sort_model.setDynamicSortFilter(True)
+        self.sort_model.setFilterCaseSensitivity(
+            QtCore.Qt.CaseSensitivity.CaseInsensitive
+        )
+        self.sort_model.setFilterKeyColumn(-1)
+
+        self.search_edit = QtWidgets.QLineEdit()
+        self.search_edit.setPlaceholderText("Search result files…")
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.textChanged.connect(self.sort_model.setFilterFixedString)
+
         self.table = QtWidgets.QTableView()
-        self.table.setModel(self.model)
+        self.table.setModel(self.sort_model)
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -88,6 +101,7 @@ class ResultsPage(QtWidgets.QWidget):
         layout.addWidget(intro)
         layout.addWidget(self.summary_label)
         layout.addWidget(self.error_label)
+        layout.addWidget(self.search_edit)
         layout.addWidget(splitter, 1)
         layout.addLayout(controls)
 
@@ -96,8 +110,11 @@ class ResultsPage(QtWidgets.QWidget):
         self._workflow_context = workflow
         self.model.set_workflow(workflow)
         self.table.clearSelection()
-        for row in range(self.model.rowCount()):
-            if self.model.path_at(row) in selected_paths:
+        for row in range(self.sort_model.rowCount()):
+            source_row = self.sort_model.mapToSource(
+                self.sort_model.index(row, 0)
+            ).row()
+            if self.model.path_at(source_row) in selected_paths:
                 self.table.selectRow(row)
         if workflow is None:
             self.summary_label.setText("No workflow loaded")
@@ -109,6 +126,7 @@ class ResultsPage(QtWidgets.QWidget):
 
     def set_busy(self, busy: bool) -> None:
         self.refresh_button.setDisabled(busy)
+        self.search_edit.setDisabled(busy)
         self.table.setDisabled(busy)
 
     def selected_paths(self) -> list[Path]:
@@ -117,7 +135,12 @@ class ResultsPage(QtWidgets.QWidget):
             for index in sorted(
                 self.table.selectionModel().selectedRows(), key=lambda item: item.row()
             )
-            if (path := self.model.path_at(index.row())) is not None
+            if (
+                path := self.model.path_at(
+                    self.sort_model.mapToSource(index).row()
+                )
+            )
+            is not None
         ]
 
     @QtCore.Slot()

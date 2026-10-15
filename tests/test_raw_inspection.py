@@ -46,6 +46,33 @@ def _write_sansllb_run(
                 dataset.attrs["units"] = np.bytes_("mm")
 
 
+def _write_sam_run(
+    path: Path,
+    *,
+    image: np.ndarray,
+    measurement_type: str,
+    attenuator_state: str,
+) -> None:
+    with h5py.File(path, "w") as handle:
+        entry = handle.create_group("entry0")
+        entry.attrs["NX_class"] = np.bytes_("NXentry")
+        entry.create_dataset("experiment_identifier", data=np.bytes_("sample_a"))
+
+        data = entry.create_group("data1")
+        data.create_dataset("detector_data", data=image)
+
+        instrument = entry.create_group("SAM")
+        instrument.attrs["NX_class"] = np.bytes_("NXinstrument")
+        instrument.create_group("Selector").create_dataset("wavelength", data=6.0)
+        instrument.create_group("det_y").create_dataset("value", data=250.0)
+        instrument.create_group("collimation").create_dataset("position", data=1.0)
+
+        measurement = instrument.create_group("MeasurementType")
+        measurement.create_dataset("typeOfMeasure", data=np.bytes_(measurement_type))
+        attenuator = instrument.create_group("attenuator")
+        attenuator.create_dataset("state", data=np.bytes_(attenuator_state))
+
+
 class TestSansllbRawInspection(unittest.TestCase):
     def test_parked_beam_stop_identifies_transmission_despite_scattering_like_image(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -95,6 +122,59 @@ class TestSansllbRawInspection(unittest.TestCase):
             metadata = inspect_raw_run("sansllb", path)
 
             self.assertEqual(metadata.mode, "transmission")
+
+
+class TestSamRawInspection(unittest.TestCase):
+    def test_scattering_image_overrides_stale_transmission_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "sam_scattering.nxs"
+            image = np.full((31, 31), 10.0, dtype=np.float64)
+            image[14:17, 14:17] = 0.0
+            image[15, 20] = 100.0
+            _write_sam_run(
+                path,
+                image=image,
+                measurement_type="Transmission",
+                attenuator_state="4 (30)",
+            )
+
+            metadata = inspect_raw_run("sam", path)
+
+            self.assertEqual(metadata.mode, "scattering")
+
+    def test_transmission_image_overrides_stale_scattering_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "sam_transmission.nxs"
+            image = np.ones((31, 31), dtype=np.float64)
+            image[14:17, 14:17] = 100.0
+            _write_sam_run(
+                path,
+                image=image,
+                measurement_type="Scattering",
+                attenuator_state="0 (1)",
+            )
+
+            metadata = inspect_raw_run("sam", path)
+
+            self.assertEqual(metadata.mode, "transmission")
+
+    def test_attenuator_does_not_determine_sam_mode(self) -> None:
+        image = np.full((31, 31), 10.0, dtype=np.float64)
+        image[14:17, 14:17] = 0.0
+        image[15, 20] = 100.0
+        with tempfile.TemporaryDirectory() as td:
+            modes = []
+            for index, attenuator_state in enumerate(("0 (1)", "4 (30)")):
+                path = Path(td) / f"sam_{index}.nxs"
+                _write_sam_run(
+                    path,
+                    image=image,
+                    measurement_type="Transmission",
+                    attenuator_state=attenuator_state,
+                )
+                modes.append(inspect_raw_run("sam", path).mode)
+
+            self.assertEqual(modes, ["scattering", "scattering"])
 
 
 if __name__ == "__main__":

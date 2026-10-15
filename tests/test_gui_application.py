@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -495,6 +496,53 @@ class TestRunsTableModel(unittest.TestCase):
 
 
 class TestProcessingPage(unittest.TestCase):
+    def test_page_adapts_azimuthal_bins_to_the_instrument_detectors(self) -> None:
+        _application()
+        page = ProcessingPage()
+
+        self.assertEqual(
+            page.reduction_options(),
+            ({0: 120}, "linear"),
+        )
+
+        page.n_bins_spinboxes[0].setValue(40)
+        sansllb_workflow = WorkflowContext(instrument_name="SANS-LLB")
+        sansllb_workflow.configurations["config_1"] = Configuration(
+            wavelength=6.0,
+            sample_detector_distance=[4.0, 1.5, 1.5],
+            config_id="config_1",
+        )
+        page.set_workflow(sansllb_workflow)
+
+        self.assertEqual(tuple(page.n_bins_spinboxes), (0, 1, 2))
+        self.assertEqual(
+            page.reduction_options(),
+            ({0: 40, 1: 30, 2: 30}, "linear"),
+        )
+
+        page.n_bins_spinboxes[1].setValue(25)
+        page.n_bins_spinboxes[2].setValue(20)
+        page.q_scale_combo.setCurrentIndex(page.q_scale_combo.findData("log"))
+
+        self.assertEqual(
+            page.reduction_options(),
+            ({0: 40, 1: 25, 2: 20}, "log"),
+        )
+
+        sam_workflow = WorkflowContext(instrument_name="SAM")
+        sam_workflow.configurations["config_1"] = Configuration(
+            wavelength=6.0,
+            sample_detector_distance=4.0,
+            config_id="config_1",
+        )
+        page.set_workflow(sam_workflow)
+
+        self.assertEqual(tuple(page.n_bins_spinboxes), (0,))
+        self.assertEqual(page.reduction_options(), ({0: 40}, "log"))
+        page.set_busy(True)
+        self.assertFalse(page.integration_group.isEnabled())
+        page.close()
+
     def test_reference_transmissions_model_reports_water_and_empty_cell(self) -> None:
         workflow = WorkflowContext()
         workflow.add_run(
@@ -607,7 +655,7 @@ class TestProcessingPage(unittest.TestCase):
                     RunKey(config_id, "sample", "scattering", "sample-a"), path
                 )
             workflow.add_run(
-                RunKey("config_3", "sample", "scattering", "sample-b"),
+                RunKey("config_1", "sample", "scattering", "sample-b"),
                 root / "config_1.nxs",
             )
 
@@ -639,9 +687,14 @@ class TestProcessingPage(unittest.TestCase):
                 QtCore.QItemSelectionModel.SelectionFlag.Select
                 | QtCore.QItemSelectionModel.SelectionFlag.Rows,
             )
-            self.assertFalse(page.reference_combo.isEnabled())
+            self.assertTrue(page.reference_combo.isEnabled())
+            self.assertEqual(page.reference_combo.count(), 2)
+            self.assertEqual(page.reference_combo.itemData(1), "config_1")
+            page.reference_combo.setCurrentIndex(
+                page.reference_combo.findData("config_1")
+            )
             page.stitch_selected_button.click()
-            self.assertEqual(requests[-1], (["sample-a", "sample-b"], None))
+            self.assertEqual(requests[-1], (["sample-a", "sample-b"], "config_1"))
             output_path = workflow.output_dir / "sample-a_merged.txt"
             output_path.parent.mkdir(parents=True)
             output_path.write_text("merged", encoding="utf-8")
@@ -683,8 +736,8 @@ class TestResultsPage(unittest.TestCase):
                 QtCore.QItemSelectionModel.SelectionFlag.Select
                 | QtCore.QItemSelectionModel.SelectionFlag.Rows
             )
-            selection.select(page.model.index(0, 0), flags)
-            selection.select(page.model.index(1, 0), flags)
+            selection.select(page.sort_model.index(0, 0), flags)
+            selection.select(page.sort_model.index(1, 0), flags)
             app.processEvents()
 
             self.assertEqual(len(page.plot.getAllCurves()), 2)
@@ -696,6 +749,43 @@ class TestResultsPage(unittest.TestCase):
                 "#202124",
             )
             self.assertEqual(page.error_label.text(), "")
+            page.close()
+
+    def test_search_filters_result_files_by_name_and_type(self) -> None:
+        app = _application()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output_dir = root / "output"
+            output_dir.mkdir()
+            for name in ("alpha_config_1.txt", "beta_merged.txt"):
+                np.savetxt(
+                    output_dir / name,
+                    np.asarray([[0.01, 1.0, 0.1, 0.001]]),
+                    header="q I I_error q_error",
+                )
+            workflow = WorkflowContext(root_dir=root, output_dir=output_dir)
+            page = ResultsPage()
+            page.set_workflow(workflow)
+            page.show()
+            app.processEvents()
+
+            self.assertEqual(page.sort_model.rowCount(), 2)
+            page.search_edit.setText("BETA")
+            self.assertEqual(page.sort_model.rowCount(), 1)
+            self.assertEqual(
+                page.sort_model.data(page.sort_model.index(0, 0)),
+                "beta_merged.txt",
+            )
+
+            page.search_edit.setText("reduced")
+            self.assertEqual(page.sort_model.rowCount(), 1)
+            self.assertEqual(
+                page.sort_model.data(page.sort_model.index(0, 0)),
+                "alpha_config_1.txt",
+            )
+
+            page.search_edit.clear()
+            self.assertEqual(page.sort_model.rowCount(), 2)
             page.close()
 
 
@@ -1033,6 +1123,43 @@ class TestJobController(unittest.TestCase):
 
 
 class TestWorkflowController(unittest.TestCase):
+    def test_stitching_reference_is_forwarded_for_multiple_samples(self) -> None:
+        controller = WorkflowController()
+        workflow = WorkflowContext()
+        controller._workflow = workflow
+
+        with mock.patch.object(controller, "_start_stitching") as start_stitching:
+            controller.stitch_selected(["sample-a", "sample-b"], "config_1")
+
+        start_stitching.assert_called_once_with(
+            workflow,
+            ("sample-a", "sample-b"),
+            "config_1",
+            kind="stitch_selected",
+        )
+
+    def test_processing_options_are_forwarded_to_reduction(self) -> None:
+        controller = WorkflowController()
+        workflow = WorkflowContext()
+        run_key = RunKey("config_1", "sample", "scattering", "sample-a")
+        workflow.add_run(run_key, Path("/tmp/sample-a.nxs"))
+        controller._workflow = workflow
+
+        with mock.patch.object(controller, "_start_reduction") as start_reduction:
+            controller.process_selected(
+                [run_key],
+                n_bins={0: 40, 1: 25, 2: 20},
+                q_scale="log",
+            )
+
+        start_reduction.assert_called_once_with(
+            workflow,
+            (run_key,),
+            kind="reduce_selected",
+            n_bins={0: 40, 1: 25, 2: 20},
+            q_scale="log",
+        )
+
     def test_stitching_options_are_persisted_in_the_workflow(self) -> None:
         controller = WorkflowController()
         controller._workflow = WorkflowContext()
