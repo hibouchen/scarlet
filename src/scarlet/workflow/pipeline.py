@@ -1062,7 +1062,7 @@ class ReductionPipeline:
                 as_reduction_step(subtract_references_step),
                 as_reduction_step(normalization_step),
                 as_reduction_step(normalize_by_thickness),
-                as_reduction_step(absolute_normalization_step),
+                #as_reduction_step(absolute_normalization_step),
                 as_reduction_step(azimuthal_averaging_step),
                 as_reduction_step(save_processed_detectors_step),
                 as_reduction_step(save_azimuthal_text_step),
