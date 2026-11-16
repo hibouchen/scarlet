@@ -5,7 +5,7 @@ import unittest
 
 import numpy as np
 
-from scarlet.reduction import azimuthal_average
+from scarlet.reduction import Sector, azimuthal_average, sector_average
 
 
 class TestIntegration(unittest.TestCase):
@@ -58,6 +58,88 @@ class TestIntegration(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "No valid pixels available"):
             azimuthal_average(image, q_map, n_bins=2, q_scale="log")
+
+    def test_sector_average_selects_requested_direction_and_opposite(self) -> None:
+        image = np.array([[1.0, 2.0, 3.0, 4.0]], dtype=np.float64)
+        q_map = np.ones_like(image)
+        chi_map = np.array([[0.0, np.pi / 2.0, np.pi, -np.pi / 2.0]])
+
+        single = sector_average(
+            image,
+            q_map,
+            chi_map,
+            sector=Sector("parallel", center_deg=0.0, width_deg=20.0),
+            n_bins=1,
+        )
+        paired = sector_average(
+            image,
+            q_map,
+            chi_map,
+            sector=Sector(
+                "parallel",
+                center_deg=0.0,
+                width_deg=20.0,
+                include_opposite=True,
+            ),
+            n_bins=1,
+        )
+
+        np.testing.assert_allclose(single.intensity, np.array([1.0]))
+        np.testing.assert_array_equal(single.counts, np.array([1]))
+        np.testing.assert_allclose(paired.intensity, np.array([2.0]))
+        np.testing.assert_array_equal(paired.counts, np.array([2]))
+
+    def test_sector_average_wraps_at_minus_180_degrees(self) -> None:
+        image = np.array([[2.0, 4.0, 100.0]], dtype=np.float64)
+        q_map = np.ones_like(image)
+        chi_map = np.deg2rad(np.array([[179.0, -179.0, 0.0]]))
+
+        result = sector_average(
+            image,
+            q_map,
+            chi_map,
+            sector=Sector("seam", center_deg=180.0, width_deg=4.0),
+            n_bins=1,
+        )
+
+        np.testing.assert_allclose(result.intensity, np.array([3.0]))
+        np.testing.assert_array_equal(result.counts, np.array([2]))
+
+    def test_sector_average_propagates_errors_and_applies_mask(self) -> None:
+        image = np.array([[2.0, 4.0, 6.0]], dtype=np.float64)
+        q_map = np.array([[0.1, 0.1, 0.1]], dtype=np.float64)
+        chi_map = np.zeros_like(image)
+        intensity_error = np.array([[1.0, 2.0, 3.0]], dtype=np.float64)
+        q_error = np.array([[0.01, 0.02, 0.03]], dtype=np.float64)
+        mask = np.array([[False, True, False]])
+
+        result = sector_average(
+            image,
+            q_map,
+            chi_map,
+            sector=Sector("horizontal", center_deg=0.0, width_deg=30.0),
+            mask=mask,
+            intensity_error=intensity_error,
+            q_error=q_error,
+            n_bins=1,
+        )
+
+        np.testing.assert_allclose(result.intensity, np.array([4.0]))
+        np.testing.assert_allclose(result.intensity_error, np.array([np.sqrt(10.0) / 2.0]))
+        np.testing.assert_allclose(result.q_error, np.array([np.sqrt(0.001) / 2.0]))
+        np.testing.assert_array_equal(result.counts, np.array([2]))
+
+    def test_sector_validates_angular_width(self) -> None:
+        with self.assertRaisesRegex(ValueError, "width_deg"):
+            Sector("invalid", center_deg=0.0, width_deg=0.0)
+
+        with self.assertRaisesRegex(TypeError, "include_opposite"):
+            Sector(
+                "invalid",
+                center_deg=0.0,
+                width_deg=20.0,
+                include_opposite="yes",  # type: ignore[arg-type]
+            )
 
 
 @unittest.skipIf(importlib.util.find_spec("scipp") is None, "scipp is required for DataArray integration tests")
@@ -113,6 +195,39 @@ class TestIntegrationWithScippDataArray(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "has no 'q' coord"):
             azimuthal_average(image, n_bins=2)
+
+    def test_sector_average_uses_q_and_chi_coords(self) -> None:
+        import scipp as sc
+
+        image = sc.DataArray(
+            data=sc.array(
+                dims=["y", "x"],
+                values=np.array([[2.0, 4.0]], dtype=np.float64),
+                variances=np.array([[1.0, 9.0]], dtype=np.float64),
+            ),
+            coords={
+                "q": sc.array(
+                    dims=["y", "x"],
+                    values=np.array([[0.1, 0.1]], dtype=np.float64),
+                    unit="1/angstrom",
+                ),
+                "chi": sc.array(
+                    dims=["y", "x"],
+                    values=np.array([[0.0, np.pi / 2.0]], dtype=np.float64),
+                    unit="rad",
+                ),
+            },
+        )
+
+        result = sector_average(
+            image,
+            sector=Sector("horizontal", center_deg=0.0, width_deg=20.0),
+            n_bins=1,
+        )
+
+        np.testing.assert_allclose(result.intensity, np.array([2.0]))
+        np.testing.assert_allclose(result.intensity_error, np.array([1.0]))
+        self.assertEqual(result.q_unit, "1/Å")
 
 
 if __name__ == "__main__":

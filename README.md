@@ -49,11 +49,10 @@ pipeline = ReductionPipeline.default(
 states = pipeline.run_new()
 ```
 
-The default pipeline produces absolute intensities in `cm^-1`. Its water
-flatfield must contain the attenuation-corrected direct flux and one
-`normalisation_factor` per detector. Flatfields built by the current workflow
-store this calibration metadata automatically. `n_bins` may be a single
-integer or a detector-number mapping; `q_scale` accepts `"linear"` or `"log"`.
+The default pipeline applies the water flatfield and thickness normalization,
+but does not apply the experimental absolute-intensity calibration. `n_bins`
+may be a single integer or a detector-number mapping; `q_scale` accepts
+`"linear"` or `"log"`.
 
 One failing run is recorded in `workflow.logs` without interrupting the other
 runs. `run_new()` does not refresh or change the workflow run registry. Call
@@ -184,7 +183,13 @@ more rows to reduce them, or use **Process pending** to reduce all currently
 pending sample acquisitions. Reductions run in the background and the table is
 updated when the job finishes. The page exposes a separate radial-bin count
 for every detector present on the instrument and linear or logarithmic q-bin
-spacing. The separate **Stitching** page merges every
+spacing. Optional sector integration provides either parallel/perpendicular
+curves or one directional curve. The user selects the main detector angle,
+the full angular width, and whether the opposite direction is combined. The
+selected acquisition is displayed beside the table with the sectors outlined
+around its stored beam center; the overlay follows angle, width, preset, and
+opposite-direction changes immediately. The isotropic curve is always retained.
+The separate **Stitching** page merges every
 processed configuration of a selected sample. Its control table identifies
 already stitched samples from the presence of `<sample>_merged.txt` in the
 output folder. Select one or more ready samples to stitch them; a reference
@@ -194,7 +199,7 @@ it does not change q or its uncertainty.
 Use **Settings → Stitching options…** to adjust and save the greedy-stitching
 algorithm parameters used for the workflow.
 
-The **Results** page discovers reduced and stitched I(Q) text files in the
+The **Results** page discovers isotropic, sector, and stitched I(Q) text files in the
 workflow output folder. Its search field filters by filename or result type,
 and column headers sort the visible files. Select multiple rows to overlay
 their curves in the silx plot, including their available intensity

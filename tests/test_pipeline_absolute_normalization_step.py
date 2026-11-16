@@ -120,19 +120,22 @@ class TestAbsoluteNormalizationStep(unittest.TestCase):
             ):
                 absolute_normalization_step(state)
 
-    def test_default_pipelines_apply_absolute_normalization_before_azimuthal_average(self) -> None:
-        for pipeline in (
-            ReductionPipeline.default(WorkflowContext()),
-            ReductionPipeline.with_azimuthal_text_output(WorkflowContext()),
-        ):
-            self.assertLess(
-                pipeline.step_names.index("absolute normalization"),
-                pipeline.step_names.index("azimuthal averaging"),
-            )
-            self.assertEqual(
-                pipeline.step_names[pipeline.step_names.index("absolute normalization") - 1],
-                "normalize by thickness",
-            )
+    def test_default_pipeline_skips_absolute_normalization(self) -> None:
+        pipeline = ReductionPipeline.default(WorkflowContext())
+
+        self.assertNotIn("absolute normalization", pipeline.step_names)
+
+    def test_explicit_text_pipeline_applies_absolute_normalization_before_integration(self) -> None:
+        pipeline = ReductionPipeline.with_azimuthal_text_output(WorkflowContext())
+
+        self.assertLess(
+            pipeline.step_names.index("absolute normalization"),
+            pipeline.step_names.index("azimuthal averaging"),
+        )
+        self.assertEqual(
+            pipeline.step_names[pipeline.step_names.index("absolute normalization") - 1],
+            "normalize by thickness",
+        )
 
 
 if __name__ == "__main__":

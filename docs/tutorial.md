@@ -100,9 +100,10 @@ pipeline = ReductionPipeline.default(
 states = pipeline.run_new()
 ```
 
-The default pipeline writes absolute intensities in `cm^-1`. Use one `n_bins`
-value per detector, or pass a single integer for all detectors. Set `q_scale`
-to `"log"` for logarithmic q-bin boundaries.
+The default pipeline writes water-flatfield- and thickness-normalized relative
+intensities; it does not apply the experimental absolute-intensity calibration.
+Use one `n_bins` value per detector, or pass a single integer for all detectors.
+Set `q_scale` to `"log"` for logarithmic q-bin boundaries.
 
 The method does not refresh the workflow. Call `workflow.refresh_runs()` first
 when required. Failures are logged per run and do not stop the remaining

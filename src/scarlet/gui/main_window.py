@@ -174,6 +174,9 @@ class ScarletMainWindow(QtWidgets.QMainWindow):
         self.processing_page.process_selected_requested.connect(
             self._process_selected
         )
+        self.processing_page.preview_requested.connect(
+            self.controller.load_acquisition_preview
+        )
         self.processing_page.process_pending_requested.connect(
             self._process_pending
         )
@@ -217,6 +220,7 @@ class ScarletMainWindow(QtWidgets.QMainWindow):
         self.controller.failed.connect(self._show_error)
         self.controller.settings_image_loaded.connect(self.settings_page.set_image)
         self.controller.acquisition_preview_loaded.connect(self.acquisitions_page.set_preview)
+        self.controller.acquisition_preview_loaded.connect(self.processing_page.set_preview)
         self.controller.masks_changed.connect(self._refresh_preparation_state)
         self.controller.flatfield_changed.connect(self._refresh_preparation_state)
         self.controller.transmission_source_changed.connect(self._refresh_preparation_state)
@@ -403,19 +407,21 @@ class ScarletMainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(object)
     def _process_selected(self, run_keys: object) -> None:
-        n_bins, q_scale = self.processing_page.reduction_options()
+        options = self.processing_page.reduction_options()
         self.controller.process_selected(
             run_keys,
-            n_bins=n_bins,
-            q_scale=q_scale,
+            n_bins=options.n_bins,
+            q_scale=options.q_scale,
+            sectors=options.sectors,
         )
 
     @QtCore.Slot()
     def _process_pending(self) -> None:
-        n_bins, q_scale = self.processing_page.reduction_options()
+        options = self.processing_page.reduction_options()
         self.controller.process_pending(
-            n_bins=n_bins,
-            q_scale=q_scale,
+            n_bins=options.n_bins,
+            q_scale=options.q_scale,
+            sectors=options.sectors,
         )
 
     @QtCore.Slot()
@@ -469,7 +475,7 @@ class ScarletMainWindow(QtWidgets.QMainWindow):
         self.experiment_page.set_busy(busy)
         self.acquisitions_page.set_busy(busy, message)
         self.settings_page.set_busy(busy)
-        self.processing_page.set_busy(busy)
+        self.processing_page.set_busy(busy, message)
         self.stitching_page.set_busy(busy)
         self.results_page.set_busy(busy)
         self.open_action.setDisabled(busy)

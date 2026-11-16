@@ -8,6 +8,7 @@ from typing import Any, cast
 
 from PySide6 import QtCore
 
+from scarlet.reduction import Sector
 from scarlet.workflow import RunKey, WorkflowContext, initialize_workflow_context_from_raw_directory
 from scarlet.workflow.context import Entity, Mode
 from scarlet.workflow.pipeline import StitchingOptions
@@ -199,7 +200,7 @@ class WorkflowController(QtCore.QObject):
             return
 
         def load() -> AcquisitionPreviewPayload:
-            from scarlet.io import read_count_time_value
+            from scarlet.io import nexus_reader, read_count_time_value
 
             raw_path = workflow.get_run_path(run_key)
             if raw_path is None:
@@ -222,16 +223,26 @@ class WorkflowController(QtCore.QObject):
                     },
                 )
                 display_count_time = float(count_time)
+            beam_centers: dict[int, tuple[float, float]] = {}
+            for detector_number in source.detector_data:
+                center = workflow.get_beam_center(
+                    run_key.config_id,
+                    detector_number,
+                )
+                if center is None:
+                    try:
+                        center = nexus_reader.read_detector_beam_center(
+                            prepared_path,
+                            detector_number,
+                        )
+                    except (OSError, ValueError):
+                        continue
+                beam_centers[detector_number] = center
             return AcquisitionPreviewPayload(
                 run_key=run_key,
                 source=source,
                 masks=workflow.get_masks(run_key.config_id),
-                beam_centers={
-                    detector_number: center
-                    for detector_number in source.detector_data
-                    if (center := workflow.get_beam_center(run_key.config_id, detector_number))
-                    is not None
-                },
+                beam_centers=beam_centers,
                 converted_for_preview=prepared_path.resolve() != raw_path.resolve(),
                 display_count_time=display_count_time,
             )
@@ -365,6 +376,7 @@ class WorkflowController(QtCore.QObject):
         *,
         n_bins: object = None,
         q_scale: str = "linear",
+        sectors: tuple[Sector, ...] = (),
     ) -> None:
         """Reduce the exact sample-scattering runs selected in the GUI."""
         workflow = self._require_workflow()
@@ -381,6 +393,7 @@ class WorkflowController(QtCore.QObject):
             kind="reduce_selected",
             n_bins=n_bins,
             q_scale=q_scale,
+            sectors=sectors,
         )
 
     @QtCore.Slot()
@@ -389,6 +402,7 @@ class WorkflowController(QtCore.QObject):
         *,
         n_bins: object = None,
         q_scale: str = "linear",
+        sectors: tuple[Sector, ...] = (),
     ) -> None:
         """Reduce every currently pending sample-scattering run."""
         workflow = self._require_workflow()
@@ -408,6 +422,7 @@ class WorkflowController(QtCore.QObject):
             kind="reduce_pending",
             n_bins=n_bins,
             q_scale=q_scale,
+            sectors=sectors,
         )
 
     @QtCore.Slot(str, object, object)
@@ -615,6 +630,7 @@ class WorkflowController(QtCore.QObject):
         kind: str,
         n_bins: object = None,
         q_scale: str = "linear",
+        sectors: tuple[Sector, ...] = (),
     ) -> None:
         from .readiness import assess_workflow_readiness
 
@@ -645,6 +661,7 @@ class WorkflowController(QtCore.QObject):
                 workflow,
                 n_bins=n_bins,
                 q_scale=q_scale,
+                sectors=sectors,
             )
             processed_count = 0
             failed_count = 0
@@ -670,6 +687,7 @@ class WorkflowController(QtCore.QObject):
                 failed_count=failed_count,
                 n_bins=pipeline.n_bins,
                 q_scale=pipeline.q_scale,
+                sectors=[sector.name for sector in pipeline.sectors],
             )
             return processed_count, failed_count
 

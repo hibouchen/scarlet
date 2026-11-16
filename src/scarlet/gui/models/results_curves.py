@@ -21,10 +21,18 @@ def result_curve_rows(workflow: WorkflowContext) -> list[ResultCurveRow]:
     """Discover reduced and stitched I(Q) text outputs in the output directory."""
     if not workflow.output_dir.is_dir():
         return []
+
+    def result_kind(path: Path) -> str:
+        if path.name.endswith("_merged.txt"):
+            return "stitched"
+        if "_sector_" in path.stem:
+            return "sector"
+        return "reduced"
+
     rows = [
         ResultCurveRow(
             path=path.resolve(),
-            kind="stitched" if path.name.endswith("_merged.txt") else "reduced",
+            kind=result_kind(path),
         )
         for path in workflow.output_dir.glob("*.txt")
         if path.is_file()
@@ -69,7 +77,12 @@ class ResultCurvesModel(QtCore.QAbstractTableModel):
         if role == QtCore.Qt.ItemDataRole.ToolTipRole and field == "path":
             return str(row.path)
         if role == QtCore.Qt.ItemDataRole.ForegroundRole and field == "kind":
-            return QtGui.QColor("#2e7d32" if row.kind == "stitched" else "#245a92")
+            colors = {
+                "stitched": "#2e7d32",
+                "sector": "#7b1fa2",
+                "reduced": "#245a92",
+            }
+            return QtGui.QColor(colors.get(row.kind, "#202124"))
         return None
 
     def headerData(

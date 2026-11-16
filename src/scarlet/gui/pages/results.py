@@ -21,7 +21,8 @@ class ResultsPage(QtWidgets.QWidget):
         title = QtWidgets.QLabel("Results")
         title.setObjectName("pageTitle")
         intro = QtWidgets.QLabel(
-            "Select one or more reduced or stitched curves to display them together."
+            "Select one or more isotropic, sector, or stitched curves to display "
+            "them together."
         )
         intro.setWordWrap(True)
         self.summary_label = QtWidgets.QLabel("No workflow loaded")

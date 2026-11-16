@@ -13,7 +13,7 @@ from .geometry import (
     compute_qy_vector,
     compute_theta_map,
 )
-from .integration import AzimuthalAverageResult, azimuthal_average
+from .integration import AzimuthalAverageResult, Sector, azimuthal_average, sector_average
 from .stitching import (
     CurveSegment,
     MultiStitchResult,
@@ -44,8 +44,10 @@ from .utils import apply_prefactor, concatenate_curves, crop_curve
 __all__ = [
     "correct_detector_dead_time",
     "AzimuthalAverageResult",
+    "Sector",
     "apply_prefactor",
     "azimuthal_average",
+    "sector_average",
     "concatenate_curves",
     "compute_chi_map",
     "compute_beam_divergence",

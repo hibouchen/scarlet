@@ -533,13 +533,10 @@ class AcquisitionsPage(QtWidgets.QWidget):
         masks = getattr(payload, "masks", None)
         beam_centers = getattr(payload, "beam_centers", {})
         display_count_time = getattr(payload, "display_count_time", None)
-        if source is None or run_key is None:
-            self.clear_preview()
+        if run_key != self._requested_preview_run_key:
             return
-        if (
-            self._requested_preview_run_key is not None
-            and run_key != self._requested_preview_run_key
-        ):
+        if source is None:
+            self.clear_preview()
             return
         self._preview_run_key = run_key
         self.mask_editor.set_source(
