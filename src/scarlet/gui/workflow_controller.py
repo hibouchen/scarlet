@@ -8,6 +8,7 @@ from typing import Any, cast
 
 from PySide6 import QtCore
 
+from scarlet.reduction import Sector
 from scarlet.workflow import RunKey, WorkflowContext, initialize_workflow_context_from_raw_directory
 from scarlet.workflow.context import Entity, Mode
 from scarlet.workflow.pipeline import StitchingOptions
@@ -199,7 +200,7 @@ class WorkflowController(QtCore.QObject):
             return
 
         def load() -> AcquisitionPreviewPayload:
-            from scarlet.io import read_count_time_value
+            from scarlet.io import nexus_reader, read_count_time_value
 
             raw_path = workflow.get_run_path(run_key)
             if raw_path is None:
@@ -222,16 +223,26 @@ class WorkflowController(QtCore.QObject):
                     },
                 )
                 display_count_time = float(count_time)
+            beam_centers: dict[int, tuple[float, float]] = {}
+            for detector_number in source.detector_data:
+                center = workflow.get_beam_center(
+                    run_key.config_id,
+                    detector_number,
+                )
+                if center is None:
+                    try:
+                        center = nexus_reader.read_detector_beam_center(
+                            prepared_path,
+                            detector_number,
+                        )
+                    except (OSError, ValueError):
+                        continue
+                beam_centers[detector_number] = center
             return AcquisitionPreviewPayload(
                 run_key=run_key,
                 source=source,
                 masks=workflow.get_masks(run_key.config_id),
-                beam_centers={
-                    detector_number: center
-                    for detector_number in source.detector_data
-                    if (center := workflow.get_beam_center(run_key.config_id, detector_number))
-                    is not None
-                },
+                beam_centers=beam_centers,
                 converted_for_preview=prepared_path.resolve() != raw_path.resolve(),
                 display_count_time=display_count_time,
             )
@@ -365,6 +376,7 @@ class WorkflowController(QtCore.QObject):
         *,
         n_bins: object = None,
         q_scale: str = "linear",
+        sectors: tuple[Sector, ...] = (),
     ) -> None:
         """Reduce the exact sample-scattering runs selected in the GUI."""
         workflow = self._require_workflow()
@@ -381,6 +393,7 @@ class WorkflowController(QtCore.QObject):
             kind="reduce_selected",
             n_bins=n_bins,
             q_scale=q_scale,
+            sectors=sectors,
         )
 
     @QtCore.Slot()
@@ -389,6 +402,7 @@ class WorkflowController(QtCore.QObject):
         *,
         n_bins: object = None,
         q_scale: str = "linear",
+        sectors: tuple[Sector, ...] = (),
     ) -> None:
         """Reduce every currently pending sample-scattering run."""
         workflow = self._require_workflow()
@@ -408,6 +422,7 @@ class WorkflowController(QtCore.QObject):
             kind="reduce_pending",
             n_bins=n_bins,
             q_scale=q_scale,
+            sectors=sectors,
         )
 
     @QtCore.Slot(str, object, object)
@@ -420,12 +435,13 @@ class WorkflowController(QtCore.QObject):
         """Backward-compatible entry point for stitching one sample."""
         self.stitch_selected([sample_name], scale_on, normalization_factor)
 
-    @QtCore.Slot(object, object, object)
+    @QtCore.Slot(object, object, object, object)
     def stitch_selected(
         self,
         sample_names: object,
         scale_on: object,
         normalization_factor: object = 1.0,
+        curve_group: object = None,
     ) -> None:
         """Merge the selected ready sample groups into I(Q) text curves."""
         workflow = self._require_workflow()
@@ -438,22 +454,48 @@ class WorkflowController(QtCore.QObject):
             raise ValueError("At least one non-empty sample name is required")
         reference = None if scale_on is None else str(scale_on).strip() or None
         factor = self._validate_normalization_factor(normalization_factor)
+        selected_curve_group = self._normalize_stitching_curve_group(curve_group)
         self._start_stitching(
             workflow,
             samples,
             reference,
             factor,
+            selected_curve_group,
             kind="stitch_selected",
         )
 
-    @QtCore.Slot(object)
-    def stitch_pending(self, normalization_factor: object = 1.0) -> None:
+    @QtCore.Slot(object, object)
+    def stitch_pending(
+        self,
+        normalization_factor: object = 1.0,
+        curve_group: object = None,
+    ) -> None:
         """Merge every ready sample that has no merged text file in ``output_dir``."""
         workflow = self._require_workflow()
         factor = self._validate_normalization_factor(normalization_factor)
         from scarlet.workflow.pipeline import StichingPipeline
 
         pipeline = StichingPipeline(workflow)
+        selected_curve_group = self._normalize_stitching_curve_group(curve_group)
+
+        def is_waiting(sample_name: str) -> bool:
+            if selected_curve_group == "*":
+                sector_names = pipeline.available_sector_names(sample_name)
+                return (
+                    bool(sector_names)
+                    and all(
+                        pipeline.is_sample_ready(sample_name, sector_name)
+                        for sector_name in sector_names
+                    )
+                    and any(
+                        not pipeline.is_sample_stitched(sample_name, sector_name)
+                        for sector_name in sector_names
+                    )
+                )
+            return pipeline.is_sample_ready(sample_name, selected_curve_group) and not (
+                pipeline.is_sample_stitched(sample_name, selected_curve_group)
+            )
+
         samples = tuple(
             sample_name
             for sample_name in sorted(
@@ -465,8 +507,7 @@ class WorkflowController(QtCore.QObject):
                     and run_key.sample_name is not None
                 }
             )
-            if pipeline.is_sample_ready(sample_name)
-            and not (workflow.output_dir / f"{sample_name}_merged.txt").is_file()
+            if is_waiting(sample_name)
         )
         if not samples:
             self.activity.emit("INFO", "No ready sample is waiting for stitching.")
@@ -476,8 +517,18 @@ class WorkflowController(QtCore.QObject):
             samples,
             None,
             factor,
+            selected_curve_group,
             kind="stitch_pending",
         )
+
+    @staticmethod
+    def _normalize_stitching_curve_group(value: object) -> str | None:
+        if value is None:
+            return None
+        normalized = str(value).strip()
+        if not normalized:
+            return None
+        return normalized
 
     @staticmethod
     def _validate_normalization_factor(value: object) -> float:
@@ -519,6 +570,7 @@ class WorkflowController(QtCore.QObject):
         sample_names: tuple[str, ...],
         reference: str | None,
         normalization_factor: float,
+        curve_group: str | None,
         *,
         kind: str,
     ) -> None:
@@ -528,15 +580,29 @@ class WorkflowController(QtCore.QObject):
 
         pipeline = StichingPipeline(workflow)
         options = self.stitching_options()
+        def sample_is_ready(sample_name: str) -> bool:
+            if curve_group == "*":
+                sector_names = pipeline.available_sector_names(sample_name)
+                return bool(sector_names) and all(
+                    pipeline.is_sample_ready(sample_name, sector_name)
+                    for sector_name in sector_names
+                )
+            return pipeline.is_sample_ready(sample_name, curve_group)
+
         not_ready = [
-            sample_name
-            for sample_name in sample_names
-            if not pipeline.is_sample_ready(sample_name)
+            sample_name for sample_name in sample_names if not sample_is_ready(sample_name)
         ]
         if not_ready:
+            group_text = (
+                "common sectors"
+                if curve_group == "*"
+                else "isotropic curves"
+                if curve_group is None
+                else f"sector {curve_group!r}"
+            )
             message = (
-                "Stitching is blocked: every configuration must be processed first "
-                f"for {', '.join(not_ready)}."
+                f"Stitching {group_text} is blocked: every configuration must "
+                f"contain compatible processed curves for {', '.join(not_ready)}."
             )
             self.activity.emit("ERROR", message)
             self.failed.emit(message, "")
@@ -569,13 +635,21 @@ class WorkflowController(QtCore.QObject):
             failed_count = 0
             for sample_name in sample_names:
                 try:
-                    data = pipeline.run_for_sample(
-                        sample_name,
-                        scale_on=reference,
-                        normalization_factor=normalization_factor,
-                        options=options,
-                    )
-                    point_count = len(data)
+                    sector_names: tuple[str | None, ...]
+                    if curve_group == "*":
+                        sector_names = pipeline.available_sector_names(sample_name)
+                    else:
+                        sector_names = (curve_group,)
+                    point_count = 0
+                    for sector_name in sector_names:
+                        data = pipeline.run_for_sample(
+                            sample_name,
+                            scale_on=reference,
+                            normalization_factor=normalization_factor,
+                            options=options,
+                            sector_name=sector_name,
+                        )
+                        point_count += len(data)
                     stitched_count += 1
                 except Exception as exc:
                     failed_count += 1
@@ -593,6 +667,7 @@ class WorkflowController(QtCore.QObject):
                     sample_name=sample_name,
                     reference_config=reference,
                     normalization_factor=normalization_factor,
+                    curve_group=curve_group,
                     point_count=point_count,
                 )
             workflow.info(
@@ -602,6 +677,7 @@ class WorkflowController(QtCore.QObject):
                 stitched_count=stitched_count,
                 failed_count=failed_count,
                 normalization_factor=normalization_factor,
+                curve_group=curve_group,
             )
             return stitched_count, failed_count
 
@@ -615,6 +691,7 @@ class WorkflowController(QtCore.QObject):
         kind: str,
         n_bins: object = None,
         q_scale: str = "linear",
+        sectors: tuple[Sector, ...] = (),
     ) -> None:
         from .readiness import assess_workflow_readiness
 
@@ -645,6 +722,7 @@ class WorkflowController(QtCore.QObject):
                 workflow,
                 n_bins=n_bins,
                 q_scale=q_scale,
+                sectors=sectors,
             )
             processed_count = 0
             failed_count = 0
@@ -670,6 +748,7 @@ class WorkflowController(QtCore.QObject):
                 failed_count=failed_count,
                 n_bins=pipeline.n_bins,
                 q_scale=pipeline.q_scale,
+                sectors=[sector.name for sector in pipeline.sectors],
             )
             return processed_count, failed_count
 

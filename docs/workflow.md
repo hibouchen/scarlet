@@ -189,17 +189,80 @@ from detector number to bin count. `q_scale` accepts `"linear"` or `"log"`.
 When omitted, the default mapping is `{0: 120, 1: 30, 2: 30}`; only detector
 numbers present in the data are used.
 
-After reference subtraction, water-flatfield correction, and thickness
-normalization, the absolute-normalization step multiplies detector `N` by:
+### Anisotropic sector integration
+
+Pass one or more `Sector` objects to produce directional `I(q)` curves in
+addition to the full azimuthal average:
+
+```python
+from scarlet.reduction import Sector
+from scarlet.workflow.pipeline import ReductionPipeline
+
+pipeline = ReductionPipeline.default(
+    workflow,
+    n_bins={0: 120, 1: 30, 2: 30},
+    q_scale="log",
+    sectors=(
+        Sector(
+            "parallel",
+            center_deg=0.0,
+            width_deg=20.0,
+            include_opposite=True,
+        ),
+        Sector(
+            "perpendicular",
+            center_deg=90.0,
+            width_deg=20.0,
+            include_opposite=True,
+        ),
+    ),
+)
+```
+
+The angular convention is the detector-plane angle returned by `atan2(y, x)`:
+zero degrees lies on positive detector X and positive angles turn towards
+positive detector Y. `width_deg` is the full sector width. With
+`include_opposite=True`, the sector centred 180 degrees away is included in the
+same average.
+
+Sector integration applies the same detector masks, q binning, intensity-error
+propagation, and q-resolution propagation as the isotropic integration. The
+pipeline keeps all derived representations in `state.products`:
+
+```text
+state.products["corrected_2d"][detector_number]
+state.products["radial"][detector_number]
+state.products["sectors"][sector_name][detector_number]
+```
+
+For backward compatibility, `state.detectors` still contains the final radial
+curves. The NeXus writer stores the additional representations below
+`/processed/products`, and each sector is also exported as a four-column text
+file containing `q`, `I`, `I_error`, and `q_error`.
+
+The graphical Processing page exposes the same feature through **Enable sector
+integration**. Its simple preset creates parallel and perpendicular sectors,
+or a single direction, from the selected main angle and angular width. The
+selected acquisition is previewed beside the processing table, with these
+sectors outlined on every detector around its beam center. The overlay updates
+as the integration controls change. The isotropic output is still produced
+when sector integration is enabled.
+
+The default pipeline, including the pipeline launched by the GUI, stops after
+water-flatfield correction and thickness normalization. It does not apply the
+experimental absolute-intensity calibration.
+
+When `absolute_normalization_step` is selected explicitly, it multiplies
+detector `N` by:
 
 ```text
 p_N * F_flat / F_config
 ```
 
 where `F_config` is recomputed from the effective configuration's direct beam
-with its own attenuator transmission. The resulting detector arrays and
-azimuthal curves have intensity units of `cm^-1`. Flatfields created before
-the absolute-calibration metadata was introduced must be rebuilt.
+with its own attenuator transmission. That explicit step produces detector
+arrays and azimuthal curves in `cm^-1`. Flatfields created before the
+absolute-calibration metadata was introduced must be rebuilt before using it.
 
 The context is an attribute of the pipeline. It therefore does not need to be
 passed again to `run_for_sample()` or `run_all()`.
@@ -282,6 +345,9 @@ merged = stitching.run_new(
     scale_on="config_1",
     normalization_factor=1.0,
 )
+
+# Stitch the same named sector across configurations and detectors.
+parallel = stitching.run_new(sector_name="parallel")
 ```
 
 `scale_on` rebases each stitched curve to the requested processed
@@ -290,11 +356,19 @@ configuration. `normalization_factor` then multiplies the final `I` and
 offered for a multi-sample selection only when that configuration is processed
 for every selected sample.
 
+Sector stitching reads `/processed/products/sectors/<name>` from each processed
+NeXus file. A sector is eligible only when it is present in every configuration
+of the sample and its center angle, full width, and opposite-direction flag are
+compatible. Each sector is stitched independently and written to
+`<sample_name>_sector_<name>_merged.txt`; different sector names are never mixed.
+The graphical Stitching page can process the isotropic curve, all common
+sectors, or one named sector.
+
 `run_new()` does not refresh the workflow and never converts raw acquisitions.
 An eligible sample must have `/processed` in every registered scattering run.
-The method skips a sample when its `<sample_name>_merged.txt` output is newer
-than all its processed NeXus inputs. It runs the stitching again when a
-processed input is newer than the existing merged output.
+The method skips a sample when the selected isotropic or sector-specific merged
+output is newer than all its processed NeXus inputs. It runs the stitching
+again when a processed input is newer than the existing merged output.
 
 As with `ReductionPipeline.run_new()`, samples are handled independently. A
 stitching failure is stored in the workflow log, and processing continues with

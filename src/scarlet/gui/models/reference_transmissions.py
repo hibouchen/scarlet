@@ -62,13 +62,18 @@ def _format_transmission(value: float | None) -> str:
 
 
 class ReferenceTransmissionsModel(QtCore.QAbstractTableModel):
-    """Read-only processing-page table of reference transmissions."""
+    """Read-only Settings-page table of reference transmissions."""
 
     _COLUMNS: tuple[tuple[str, str], ...] = (
         ("config_id", "Configuration"),
-        ("water_transmission", "Water transmission"),
-        ("empty_cell_transmission", "Empty-cell transmission"),
+        ("water_transmission", "Water"),
+        ("empty_cell_transmission", "Empty cell"),
     )
+
+    _HEADER_TOOLTIPS = {
+        "water_transmission": "Effective water transmission",
+        "empty_cell_transmission": "Effective empty-cell transmission",
+    }
 
     def __init__(
         self,
@@ -112,4 +117,10 @@ class ReferenceTransmissionsModel(QtCore.QAbstractTableModel):
             and 0 <= section < len(self._COLUMNS)
         ):
             return self._COLUMNS[section][1]
+        if (
+            role == QtCore.Qt.ItemDataRole.ToolTipRole
+            and orientation == QtCore.Qt.Orientation.Horizontal
+            and 0 <= section < len(self._COLUMNS)
+        ):
+            return self._HEADER_TOOLTIPS.get(self._COLUMNS[section][0])
         return super().headerData(section, orientation, role)

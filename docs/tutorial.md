@@ -100,9 +100,10 @@ pipeline = ReductionPipeline.default(
 states = pipeline.run_new()
 ```
 
-The default pipeline writes absolute intensities in `cm^-1`. Use one `n_bins`
-value per detector, or pass a single integer for all detectors. Set `q_scale`
-to `"log"` for logarithmic q-bin boundaries.
+The default pipeline writes water-flatfield- and thickness-normalized relative
+intensities; it does not apply the experimental absolute-intensity calibration.
+Use one `n_bins` value per detector, or pass a single integer for all detectors.
+Set `q_scale` to `"log"` for logarithmic q-bin boundaries.
 
 The method does not refresh the workflow. Call `workflow.refresh_runs()` first
 when required. Failures are logged per run and do not stop the remaining
@@ -119,10 +120,15 @@ merged = stitching.run_new(
     scale_on="config_1",
     normalization_factor=1.0,
 )
+
+# Optional: stitch one sector without mixing it with the other directions.
+parallel = stitching.run_new(sector_name="parallel")
 ```
 
 The optional normalization factor multiplies the stitched `I` and `I_error`
 values. It does not alter q or `q_error`.
+Sector stitching requires the same named sector, angle, width, and
+opposite-direction setting in every processed configuration.
 
 See [Workflow context](workflow.md) for CSV filtering, exclusion history,
 on-demand conversion, processing status, and context persistence.

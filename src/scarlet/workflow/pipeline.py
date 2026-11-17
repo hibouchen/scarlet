@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 import re
@@ -12,8 +12,8 @@ import numpy as np
 from scarlet.io import nexus_reader
 from scarlet.io.nexus_reader import read_configuration, resolve_entry_path
 from scarlet.reduction.correction import normalize_by_solid_angle, subtract_scattering_references
-from scarlet.reduction.geometry import compute_q_norm_map
-from scarlet.reduction.integration import azimuthal_average
+from scarlet.reduction.geometry import compute_chi_map, compute_q_norm_map
+from scarlet.reduction.integration import Sector, azimuthal_average, sector_average
 from scarlet.reduction.resolution import compute_beam_divergence, compute_q_resolution_circular, compute_q_resolution_rectangular
 from scarlet.reduction.transmission import compute_direct_flux
 from scarlet.workflow.configuration import Configuration
@@ -28,6 +28,7 @@ StepFunction = Callable[["ReductionState"], "ReductionState"]
 _F = TypeVar("_F", bound=StepFunction)
 AzimuthalNBins = int | Mapping[int, int]
 AzimuthalQScale = Literal["linear", "log"]
+AnisotropicSectors = tuple[Sector, ...]
 DEFAULT_AZIMUTHAL_N_BINS = {0: 120, 1: 30, 2: 30}
 DEFAULT_AZIMUTHAL_Q_SCALE: AzimuthalQScale = "linear"
 
@@ -39,7 +40,9 @@ class ReductionState:
     transmission: float = field(default_factory=float)
     azimuthal_n_bins: AzimuthalNBins = 200
     azimuthal_q_scale: AzimuthalQScale = "linear"
+    anisotropic_sectors: AnisotropicSectors = field(default_factory=tuple)
     detectors: dict[int, Any] = field(default_factory=dict)
+    products: dict[str, Any] = field(default_factory=dict)
     reductions_steps: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     file_path: str = field(default_factory=str)
@@ -150,6 +153,23 @@ def _normalize_azimuthal_q_scale(value: str) -> AzimuthalQScale:
     if normalized not in {"linear", "log"}:
         raise ValueError(f"q_scale must be 'linear' or 'log', got {value!r}")
     return cast(AzimuthalQScale, normalized)
+
+
+def _normalize_anisotropic_sectors(value: Iterable[Sector] | None) -> AnisotropicSectors:
+    if value is None:
+        return ()
+    if isinstance(value, (str, bytes)):
+        raise TypeError("sectors must be an iterable of Sector objects")
+
+    sectors = tuple(value)
+    names: set[str] = set()
+    for sector in sectors:
+        if not isinstance(sector, Sector):
+            raise TypeError(f"sectors must contain Sector objects, got {type(sector).__name__}")
+        if sector.name in names:
+            raise ValueError(f"sector names must be unique, got duplicate {sector.name!r}")
+        names.add(sector.name)
+    return sectors
 
 
 def _read_state_configuration(state: ReductionState) -> Configuration:
@@ -426,6 +446,7 @@ def write_azimuthal_text_file(
     config_id: str,
     transmission: float | None,
     source_nexus_file: str | Path | None = None,
+    metadata: Mapping[str, Any] | None = None,
 ) -> Path:
     """Write one azimuthal average curve to a 4-column text file."""
     output_path = Path(file_path).resolve()
@@ -452,15 +473,16 @@ def write_azimuthal_text_file(
     matrix = np.column_stack((q_values, intensity_values, intensity_error_values, q_error_values))
     transmission_text = "nan" if transmission is None else f"{float(transmission):.6g}"
     source_nexus_file_text = "unknown" if source_nexus_file is None else Path(source_nexus_file).name
-    header = "\n".join(
-        (
-            f"sample_name: {sample_name}",
-            f"config_id: {config_id}",
-            f"transmission: {transmission_text}",
-            f"source_nexus_file: {source_nexus_file_text}",
-            "q I I_error q_error",
-        )
-    )
+    header_lines = [
+        f"sample_name: {sample_name}",
+        f"config_id: {config_id}",
+        f"transmission: {transmission_text}",
+        f"source_nexus_file: {source_nexus_file_text}",
+    ]
+    if metadata is not None:
+        header_lines.extend(f"{key}: {value}" for key, value in metadata.items())
+    header_lines.append("q I I_error q_error")
+    header = "\n".join(header_lines)
     np.savetxt(output_path, matrix, header=header)
     return output_path
 
@@ -509,6 +531,90 @@ def write_azimuthal_average_text_outputs(
     return output_paths
 
 
+def write_sector_average_text_outputs(
+    state: "ReductionState",
+    *,
+    output_dir: str | Path | None = None,
+) -> list[Path]:
+    """Write one four-column text file per configured sector and detector."""
+    target_dir = state.workflow.output_dir if output_dir is None else Path(output_dir).resolve()
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    raw_sector_products = state.products.get("sectors")
+    if not isinstance(raw_sector_products, Mapping) or not raw_sector_products:
+        raise ValueError("No sector-average products available for text output")
+
+    configured_sectors = {
+        sector.name: sector
+        for sector in _normalize_anisotropic_sectors(state.anisotropic_sectors)
+    }
+    output_paths: list[Path] = []
+    for sector_name, raw_detector_products in raw_sector_products.items():
+        if sector_name not in configured_sectors:
+            raise ValueError(f"Missing configuration for sector {sector_name!r}")
+        if not isinstance(raw_detector_products, Mapping) or not raw_detector_products:
+            raise ValueError(f"No detector products available for sector {sector_name!r}")
+
+        sector = configured_sectors[sector_name]
+        detector_numbers = sorted(int(number) for number in raw_detector_products)
+        multiple_detectors = len(detector_numbers) > 1
+        for detector_number in detector_numbers:
+            detector = _require_dataarray(
+                raw_detector_products[detector_number],
+                name=f"sector {sector_name!r} detector{detector_number}",
+                ndim=1,
+            )
+            if "q" not in detector.coords:
+                raise ValueError(
+                    f"Missing q coordinate for sector {sector_name!r} detector{detector_number}"
+                )
+            q_coord = detector.coords["q"]
+            q_error_coord = detector.coords.get("q_error")
+            q_error = (
+                None
+                if q_error_coord is None
+                else np.asarray(q_error_coord.values, dtype=np.float64)
+            )
+            stem = _build_azimuthal_text_output_path(
+                output_dir=target_dir,
+                sample_name=state.sample_name,
+                config_id=state.config_id,
+                detector_number=detector_number if multiple_detectors else None,
+                suffix="",
+            )
+            file_path = stem.with_name(
+                f"{stem.name}_sector_{_sanitize_output_token(sector_name)}.txt"
+            )
+            output_paths.append(
+                write_azimuthal_text_file(
+                    file_path,
+                    q=q_coord.values,
+                    intensity=detector.data.values,
+                    intensity_error=(
+                        None
+                        if detector.data.variances is None
+                        else np.sqrt(
+                            np.asarray(detector.data.variances, dtype=np.float64)
+                        )
+                    ),
+                    q_error=q_error,
+                    sample_name=state.sample_name,
+                    config_id=state.config_id,
+                    transmission=state.transmission,
+                    source_nexus_file=state.file_path,
+                    metadata={
+                        "sector_name": sector.name,
+                        "sector_center_deg": f"{sector.center_deg:.12g}",
+                        "sector_width_deg": f"{sector.width_deg:.12g}",
+                        "sector_include_opposite": str(
+                            sector.include_opposite
+                        ).lower(),
+                    },
+                )
+            )
+    return output_paths
+
+
 def _write_dataarray_dataset(parent: h5py.Group, name: str, detector: Any) -> None:
     data_array = _require_dataarray(detector, name=name)
     group = _replace_group(parent, name, nx_class="NXdata")
@@ -539,6 +645,38 @@ def _write_dataarray_dataset(parent: h5py.Group, name: str, detector: Any) -> No
         masks_group.attrs["convention"] = np.bytes_("1=masked, 0=valid")
         for mask_name, mask_value in data_array.masks.items():
             masks_group.create_dataset(mask_name, data=np.asarray(mask_value.values, dtype=np.uint8))
+
+
+def _write_product_tree(parent: h5py.Group, products: Mapping[Any, Any]) -> None:
+    """Persist nested product mappings, with detector-number mappings as leaves."""
+    used_group_names: set[str] = set()
+    for raw_name, value in products.items():
+        group_name = _sanitize_output_token(str(raw_name))
+        if group_name in used_group_names:
+            raise ValueError(
+                f"Product names below {parent.name} map to duplicate group {group_name!r}"
+            )
+        used_group_names.add(group_name)
+
+        if not isinstance(value, Mapping):
+            raise TypeError(
+                f"Product {raw_name!r} below {parent.name} must be a mapping, "
+                f"got {type(value).__name__}"
+            )
+        group = _replace_group(parent, group_name, nx_class="NXcollection")
+        group.attrs["label"] = np.bytes_(str(raw_name))
+        if value and all(isinstance(key, (int, np.integer)) for key in value):
+            for raw_detector_number, detector in sorted(
+                value.items(), key=lambda item: int(item[0])
+            ):
+                detector_number = int(raw_detector_number)
+                _write_dataarray_dataset(
+                    group,
+                    f"detector{detector_number}",
+                    detector,
+                )
+        else:
+            _write_product_tree(group, value)
 
 
 def _write_nxdata_view(
@@ -607,6 +745,10 @@ def write_processed_detectors(
                 default_view_name = f"data{detector_number}"
         if default_view_name is not None:
             entry.attrs["default"] = np.bytes_(default_view_name)
+
+        if state.products:
+            products_group = _replace_group(entry, "products", nx_class="NXcollection")
+            _write_product_tree(products_group, state.products)
 
     return source_path
 
@@ -881,11 +1023,40 @@ def absolute_normalization_step(state: ReductionState) -> ReductionState:
     return state
 
 
-@reduction_step("azimuthal averaging")
-def azimuthal_averaging_step(state: ReductionState) -> ReductionState:
-    configuration = _read_state_configuration(state)
+def _detector_integration_maps(
+    state: ReductionState,
+    configuration: Configuration,
+    *,
+    detector_number: int,
+    detector: "sc.DataArray",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    """Build the q, chi, and optional q-resolution maps for one detector."""
     wavelength = _get_wavelength(configuration)
-    wavelength_uncertainty = 0.0 if not state.file_path else _read_wavelength_uncertainty(state.file_path, wavelength=wavelength)
+    wavelength_uncertainty = (
+        0.0
+        if not state.file_path
+        else _read_wavelength_uncertainty(state.file_path, wavelength=wavelength)
+    )
+    beam_center = _get_beam_center(state, detector_number=detector_number)
+    detector_distance = _get_detector_distance(
+        configuration,
+        detector_number=detector_number,
+    )
+    pixel_size = _get_detector_pixel_size(state, detector_number=detector_number)
+    detector_values = np.asarray(detector.data.values, dtype=np.float64)
+    q_map = compute_q_norm_map(
+        detector_values,
+        beam_center=beam_center,
+        detector_distance=detector_distance,
+        pixel_size=pixel_size,
+        wavelength=wavelength,
+    )
+    chi_map = compute_chi_map(
+        detector_values,
+        beam_center=beam_center,
+        pixel_size=pixel_size,
+    )
+
     aperture_type = None
     aperture1_opening = None
     aperture2_opening = None
@@ -895,66 +1066,87 @@ def azimuthal_averaging_step(state: ReductionState) -> ReductionState:
         aperture2_opening = _aperture_opening(configuration.collimation.aperture2)
         aperture1_opening = _aperture_opening(configuration.collimation.aperture1)
         collimation_distance = configuration.collimation.collimation_distance
+
+    q_error = None
+    if (
+        aperture_type == "pinhole"
+        and aperture1_opening is not None
+        and aperture2_opening is not None
+        and collimation_distance is not None
+    ):
+        q_error = compute_q_resolution_circular(
+            q_map,
+            r1=aperture1_opening[0] / 2,
+            r2=aperture2_opening[0] / 2,
+            collimation_distance=collimation_distance,
+            distance=detector_distance,
+            wavelength_spread=wavelength_uncertainty,
+            wavelength=wavelength,
+            pixel_size=pixel_size,
+        )
+    elif (
+        aperture_type == "slit"
+        and aperture1_opening is not None
+        and aperture2_opening is not None
+        and collimation_distance is not None
+    ):
+        q_error = compute_q_resolution_rectangular(
+            q_map,
+            x1=aperture1_opening[0],
+            y1=aperture1_opening[1],
+            x2=aperture2_opening[0],
+            y2=aperture2_opening[1],
+            collimation_distance=collimation_distance,
+            distance=detector_distance,
+            wavelength_spread=wavelength_uncertainty,
+            wavelength=wavelength,
+            pixel_size=pixel_size,
+        )
+    return q_map, chi_map, q_error
+
+
+def _workflow_mask_for_detector(
+    state: ReductionState,
+    *,
+    detector_number: int,
+    expected_shape: tuple[int, ...],
+) -> np.ndarray | None:
+    mask = state.workflow.get_mask(state.config_id, detector_number)
+    if mask is not None and mask.shape != expected_shape:
+        raise ValueError(
+            f"Workflow mask shape mismatch for detector{detector_number}: "
+            f"expected {expected_shape}, got {mask.shape}"
+        )
+    return mask
+
+
+@reduction_step("azimuthal averaging")
+def azimuthal_averaging_step(state: ReductionState) -> ReductionState:
+    configuration = _read_state_configuration(state)
+    corrected_detectors = dict(state.detectors)
     integrated: dict[int, Any] = {}
     used_n_bins: dict[int, int] = {}
-    for detector_number, detector in state.detectors.items():
+    for detector_number, detector in corrected_detectors.items():
         detector_n_bins = _n_bins_for_detector(
             state.azimuthal_n_bins,
             detector_number,
         )
-        detector_array = _require_dataarray(detector, name=f"detector{detector_number}", ndim=2)
-        beam_center = _get_beam_center(state, detector_number=detector_number)
-        detector_distance = _get_detector_distance(configuration, detector_number=detector_number)
-        pixel_size = _get_detector_pixel_size(state, detector_number=detector_number)
-        q_map = compute_q_norm_map(
-            np.asarray(detector_array.data.values, dtype=np.float64),
-            beam_center=beam_center,
-            detector_distance=detector_distance,
-            pixel_size=pixel_size,
-            wavelength=wavelength,
+        detector_array = _require_dataarray(
+            detector,
+            name=f"detector{detector_number}",
+            ndim=2,
         )
-        q_error = None
-        if (
-            aperture_type == "pinhole"
-            and aperture1_opening is not None
-            and aperture2_opening is not None
-            and collimation_distance is not None
-        ):
-            q_error = compute_q_resolution_circular(
-                q_map,
-                r1=aperture1_opening[0]/2,
-                r2=aperture2_opening[0]/2,
-                collimation_distance=collimation_distance,
-                distance=detector_distance,
-                wavelength_spread=wavelength_uncertainty,
-                wavelength=wavelength,
-                pixel_size=pixel_size,
-            )
-        elif (
-            aperture_type == "slit"
-            and aperture1_opening is not None
-            and aperture2_opening is not None
-            and collimation_distance is not None
-        ):
-            q_error = compute_q_resolution_rectangular(
-                q_map,
-                x1=aperture1_opening[0],
-                y1=aperture1_opening[1],
-                x2=aperture2_opening[0],
-                y2=aperture2_opening[1],
-                collimation_distance=collimation_distance,
-                distance=detector_distance,     
-                wavelength_spread=wavelength_uncertainty,
-                wavelength=wavelength,
-                pixel_size=pixel_size,
-            )
-
-        mask = state.workflow.get_mask(state.config_id, detector_number)
-        if mask is not None and mask.shape != detector_array.shape:
-            raise ValueError(
-                f"Workflow mask shape mismatch for detector{detector_number}: "
-                f"expected {detector_array.shape}, got {mask.shape}"
-            )
+        q_map, _chi_map, q_error = _detector_integration_maps(
+            state,
+            configuration,
+            detector_number=detector_number,
+            detector=detector_array,
+        )
+        mask = _workflow_mask_for_detector(
+            state,
+            detector_number=detector_number,
+            expected_shape=detector_array.shape,
+        )
 
         result = azimuthal_average(
             detector_array,
@@ -967,6 +1159,8 @@ def azimuthal_averaging_step(state: ReductionState) -> ReductionState:
         integrated[detector_number] = result.to_data_array()
         used_n_bins[detector_number] = detector_n_bins
 
+    state.products["corrected_2d"] = corrected_detectors
+    state.products["radial"] = integrated
     state.detectors = integrated
     bins_text = ", ".join(
         f"detector{detector_number}={n_bins}"
@@ -974,6 +1168,85 @@ def azimuthal_averaging_step(state: ReductionState) -> ReductionState:
     )
     state.notes.append(
         f"Computed azimuthal average with {bins_text} bins ({state.azimuthal_q_scale})"
+    )
+    return state
+
+
+@reduction_step("sector averaging")
+def sector_averaging_step(state: ReductionState) -> ReductionState:
+    """Compute one radial curve per configured angular sector and detector."""
+    sectors = _normalize_anisotropic_sectors(state.anisotropic_sectors)
+    if not sectors:
+        return state
+
+    corrected_detectors = state.products.get("corrected_2d")
+    if corrected_detectors is None:
+        corrected_detectors = dict(state.detectors)
+        for detector_number, detector in corrected_detectors.items():
+            _require_dataarray(
+                detector,
+                name=f"detector{detector_number}",
+                ndim=2,
+            )
+        state.products["corrected_2d"] = corrected_detectors
+    if not isinstance(corrected_detectors, Mapping):
+        raise TypeError("state.products['corrected_2d'] must be a detector mapping")
+
+    configuration = _read_state_configuration(state)
+    sector_products: dict[str, dict[int, Any]] = {
+        sector.name: {} for sector in sectors
+    }
+    sc = _require_scipp()
+    for raw_detector_number, detector in corrected_detectors.items():
+        detector_number = int(raw_detector_number)
+        detector_array = _require_dataarray(
+            detector,
+            name=f"detector{detector_number}",
+            ndim=2,
+        )
+        detector_n_bins = _n_bins_for_detector(
+            state.azimuthal_n_bins,
+            detector_number,
+        )
+        q_map, chi_map, q_error = _detector_integration_maps(
+            state,
+            configuration,
+            detector_number=detector_number,
+            detector=detector_array,
+        )
+        mask = _workflow_mask_for_detector(
+            state,
+            detector_number=detector_number,
+            expected_shape=detector_array.shape,
+        )
+
+        for sector in sectors:
+            result = sector_average(
+                detector_array,
+                q_map,
+                chi_map,
+                sector=sector,
+                mask=mask,
+                q_error=q_error,
+                n_bins=detector_n_bins,
+                q_scale=state.azimuthal_q_scale,
+            )
+            curve = result.to_data_array()
+            curve.coords["sector_center"] = sc.scalar(sector.center_deg, unit="deg")
+            curve.coords["sector_width"] = sc.scalar(sector.width_deg, unit="deg")
+            curve.coords["sector_include_opposite"] = sc.scalar(
+                sector.include_opposite
+            )
+            sector_products[sector.name][detector_number] = curve
+
+    state.products["sectors"] = sector_products
+    state.notes.append(
+        "Computed sector averages for "
+        + ", ".join(
+            f"{sector.name} ({sector.center_deg:g} deg, width {sector.width_deg:g} deg"
+            + (", opposite)" if sector.include_opposite else ")")
+            for sector in sectors
+        )
     )
     return state
 
@@ -996,12 +1269,25 @@ def save_azimuthal_text_step(state: ReductionState) -> ReductionState:
     )
     return state
 
+
+@reduction_step("save sector text")
+def save_sector_text_step(state: ReductionState) -> ReductionState:
+    output_paths = write_sector_average_text_outputs(state)
+    for output_path in output_paths:
+        state.workflow.add_artifact(output_path.name, output_path, kind="txt")
+    state.notes.append(
+        "Saved sector average text output to "
+        + ", ".join(path.name for path in output_paths)
+    )
+    return state
+
 @dataclass(frozen=True)
 class ReductionPipeline:
     workflow: WorkflowContext
     steps: tuple[ReductionStep, ...] = field(default_factory=tuple)
     n_bins: AzimuthalNBins | None = None
     q_scale: AzimuthalQScale | None = None
+    sectors: AnisotropicSectors = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         if self.n_bins is not None:
@@ -1012,6 +1298,11 @@ class ReductionPipeline:
                 "q_scale",
                 _normalize_azimuthal_q_scale(self.q_scale),
             )
+        object.__setattr__(
+            self,
+            "sectors",
+            _normalize_anisotropic_sectors(self.sectors),
+        )
 
     @classmethod
     def with_processed_output(cls, workflow: WorkflowContext) -> "ReductionPipeline":
@@ -1031,7 +1322,9 @@ class ReductionPipeline:
         *,
         n_bins: AzimuthalNBins = 200,
         q_scale: AzimuthalQScale = "linear",
+        sectors: Iterable[Sector] = (),
     ) -> "ReductionPipeline":
+        normalized_sectors = _normalize_anisotropic_sectors(sectors)
         return cls(
             workflow=workflow,
             steps=(
@@ -1040,11 +1333,24 @@ class ReductionPipeline:
                 as_reduction_step(normalize_by_thickness),
                 as_reduction_step(absolute_normalization_step),
                 as_reduction_step(azimuthal_averaging_step),
+            )
+            + (
+                (as_reduction_step(sector_averaging_step),)
+                if normalized_sectors
+                else ()
+            )
+            + (
                 as_reduction_step(save_processed_detectors_step),
                 as_reduction_step(save_azimuthal_text_step),
+            )
+            + (
+                (as_reduction_step(save_sector_text_step),)
+                if normalized_sectors
+                else ()
             ),
             n_bins=n_bins,
             q_scale=q_scale,
+            sectors=normalized_sectors,
         )
 
     @classmethod
@@ -1054,21 +1360,35 @@ class ReductionPipeline:
         *,
         n_bins: AzimuthalNBins | None = None,
         q_scale: AzimuthalQScale = DEFAULT_AZIMUTHAL_Q_SCALE,
+        sectors: Iterable[Sector] = (),
     ) -> "ReductionPipeline":
         selected_n_bins = DEFAULT_AZIMUTHAL_N_BINS if n_bins is None else n_bins
+        normalized_sectors = _normalize_anisotropic_sectors(sectors)
         return cls(
             workflow=workflow,
             steps=(
                 as_reduction_step(subtract_references_step),
                 as_reduction_step(normalization_step),
                 as_reduction_step(normalize_by_thickness),
-                #as_reduction_step(absolute_normalization_step),
                 as_reduction_step(azimuthal_averaging_step),
+            )
+            + (
+                (as_reduction_step(sector_averaging_step),)
+                if normalized_sectors
+                else ()
+            )
+            + (
                 as_reduction_step(save_processed_detectors_step),
                 as_reduction_step(save_azimuthal_text_step),
+            )
+            + (
+                (as_reduction_step(save_sector_text_step),)
+                if normalized_sectors
+                else ()
             ),
             n_bins=selected_n_bins,
             q_scale=q_scale,
+            sectors=normalized_sectors,
         )
 
     @classmethod
@@ -1078,18 +1398,33 @@ class ReductionPipeline:
         *,
         n_bins: AzimuthalNBins = 200,
         q_scale: AzimuthalQScale = "linear",
+        sectors: Iterable[Sector] = (),
     ) -> "ReductionPipeline":
+        normalized_sectors = _normalize_anisotropic_sectors(sectors)
         return cls(
             workflow=workflow,
             steps=(
                 as_reduction_step(subtract_references_step),
                 as_reduction_step(normalize_by_thickness),
                 as_reduction_step(azimuthal_averaging_step),
+            )
+            + (
+                (as_reduction_step(sector_averaging_step),)
+                if normalized_sectors
+                else ()
+            )
+            + (
                 as_reduction_step(save_processed_detectors_step),
                 as_reduction_step(save_azimuthal_text_step),
+            )
+            + (
+                (as_reduction_step(save_sector_text_step),)
+                if normalized_sectors
+                else ()
             ),
             n_bins=n_bins,
             q_scale=q_scale,
+            sectors=normalized_sectors,
         )
 
     @property
@@ -1103,6 +1438,7 @@ class ReductionPipeline:
             )
         if self.q_scale is not None:
             state.azimuthal_q_scale = self.q_scale
+        state.anisotropic_sectors = self.sectors
         for step in self.steps:
             state = step.fn(state)
             state.reductions_steps.append(step.name)
@@ -1302,21 +1638,96 @@ class StichingPipeline:
             and run_key.sample_name == sample_name
         ]
 
-    def _output_path(self, sample_name: str) -> Path:
-        """Return the deterministic merged-text output path for one sample."""
-        return (self.workflow.output_dir / f"{sample_name}_merged.txt").resolve()
+    def output_path(self, sample_name: str, sector_name: str | None = None) -> Path:
+        """Return the deterministic merged-text output path for one curve group."""
+        # Preserve the historical isotropic output name for existing workflows.
+        sample_token = sample_name
+        if sector_name is None:
+            file_name = f"{sample_token}_merged.txt"
+        else:
+            sector_token = _sanitize_output_token(sector_name)
+            file_name = f"{sample_token}_sector_{sector_token}_merged.txt"
+        return (self.workflow.output_dir / file_name).resolve()
 
-    def is_sample_ready(self, sample_name: str) -> bool:
-        """Return whether every registered scattering run for a sample is processed."""
+    def _output_path(self, sample_name: str, sector_name: str | None = None) -> Path:
+        """Backward-compatible private alias for :meth:`output_path`."""
+        return self.output_path(sample_name, sector_name)
+
+    @staticmethod
+    def _compatible_sector_definitions(
+        first: tuple[float, float, bool],
+        second: tuple[float, float, bool],
+    ) -> bool:
+        angle_delta = ((first[0] - second[0] + 180.0) % 360.0) - 180.0
+        return (
+            np.isclose(angle_delta, 0.0)
+            and np.isclose(first[1], second[1])
+            and first[2] == second[2]
+        )
+
+    def available_sector_names(self, sample_name: str) -> tuple[str, ...]:
+        """Return sectors present with compatible definitions in every processed run."""
+        run_keys = [
+            run_key
+            for run_key in self._sample_run_keys(sample_name)
+            if self.workflow.is_run_processed(run_key)
+        ]
+        if not run_keys:
+            return ()
+
+        names_by_run: list[set[str]] = []
+        definitions: dict[str, list[tuple[float, float, bool]]] = {}
+        for run_key in run_keys:
+            file_path = self.workflow.get_run_nexus_path(run_key)
+            if file_path is None:
+                return ()
+            sectors = nexus_reader.read_processed_sectors(file_path)
+            names_by_run.append(set(sectors))
+            for name, sector in sectors.items():
+                definitions.setdefault(name, []).append(sector.definition)
+
+        common_names = set.intersection(*names_by_run) if names_by_run else set()
+        return tuple(
+            sorted(
+                name
+                for name in common_names
+                if definitions.get(name)
+                and all(
+                    self._compatible_sector_definitions(
+                        definitions[name][0],
+                        definition,
+                    )
+                    for definition in definitions[name][1:]
+                )
+            )
+        )
+
+    def is_sample_ready(
+        self,
+        sample_name: str,
+        sector_name: str | None = None,
+    ) -> bool:
+        """Return whether all runs and the requested curve group can be stitched."""
         run_keys = self._sample_run_keys(sample_name)
-        return bool(run_keys) and all(self.workflow.is_run_processed(run_key) for run_key in run_keys)
+        processed = bool(run_keys) and all(
+            self.workflow.is_run_processed(run_key) for run_key in run_keys
+        )
+        if not processed or sector_name is None:
+            return processed
+        return sector_name in self.available_sector_names(sample_name)
 
-    def is_sample_stitched(self, sample_name: str) -> bool:
+    def is_sample_stitched(
+        self,
+        sample_name: str,
+        sector_name: str | None = None,
+    ) -> bool:
         """Return whether the merged output is present and newer than its processed inputs."""
         run_keys = self._sample_run_keys(sample_name)
         if not run_keys or not all(self.workflow.is_run_processed(run_key) for run_key in run_keys):
             return False
-        output_path = self._output_path(sample_name)
+        if sector_name is not None and not self.is_sample_ready(sample_name, sector_name):
+            return False
+        output_path = self.output_path(sample_name, sector_name)
         if not output_path.exists():
             return False
         input_paths = [self.workflow.get_run_nexus_path(run_key) for run_key in run_keys]
@@ -1335,22 +1746,54 @@ class StichingPipeline:
         scale_on: str | None = None,
         normalization_factor: float = 1.0,
         options: StitchingOptions | None = None,
+        sector_name: str | None = None,
     ) -> np.ndarray:
-        """Stitch the processed scattering runs currently available for one sample."""
+        """Stitch one isotropic or named-sector curve group for a sample."""
         options = options or StitchingOptions()
+        normalized_sector = None if sector_name is None else str(sector_name).strip()
+        if sector_name is not None and not normalized_sector:
+            raise ValueError("sector_name must not be empty")
         run_keys = self._sample_run_keys(sample_name)
         if not run_keys:
             raise ValueError(f"No sample scattering runs registered for {sample_name!r}")
 
         segments = []
         processed_config_ids: set[str] = set()
+        sector_definition: tuple[float, float, bool] | None = None
         for run_key in run_keys:
             if not self.workflow.is_run_processed(run_key):
                 continue
             file_path = self.workflow.get_run_nexus_path(run_key)
             if file_path is None:
                 continue
-            segments += st.load_segment_from_nexus(file_path, config_id=run_key.config_id)
+            if normalized_sector is None:
+                segments += st.load_segment_from_nexus(
+                    file_path,
+                    config_id=run_key.config_id,
+                )
+            else:
+                sectors = nexus_reader.read_processed_sectors(file_path)
+                sector = sectors.get(normalized_sector)
+                if sector is None:
+                    raise ValueError(
+                        f"Sector {normalized_sector!r} is missing for "
+                        f"{sample_name!r} in {run_key.config_id}."
+                    )
+                if sector_definition is None:
+                    sector_definition = sector.definition
+                elif not self._compatible_sector_definitions(
+                    sector_definition,
+                    sector.definition,
+                ):
+                    raise ValueError(
+                        f"Sector {normalized_sector!r} has incompatible definitions "
+                        f"between configurations of {sample_name!r}."
+                    )
+                segments += st.load_sector_segment_from_nexus(
+                    file_path,
+                    normalized_sector,
+                    config_id=run_key.config_id,
+                )
             processed_config_ids.add(run_key.config_id)
 
         if not segments:
@@ -1376,12 +1819,25 @@ class StichingPipeline:
                 result.origin_segment_id,
             ]
         )
-        header = "q I I_error q_error origin_segment_id\n" + "\n".join(
-            f"origin_segment_id {idx}: {name}" for idx, name in result.origin_map.items()
+        header_lines = []
+        if normalized_sector is not None and sector_definition is not None:
+            header_lines.extend(
+                (
+                    f"sector_name: {normalized_sector}",
+                    f"sector_center_deg: {sector_definition[0]:.12g}",
+                    f"sector_width_deg: {sector_definition[1]:.12g}",
+                    "sector_include_opposite: "
+                    + str(sector_definition[2]).lower(),
+                )
+            )
+        header_lines.append("q I I_error q_error origin_segment_id")
+        header_lines.extend(
+            f"origin_segment_id {idx}: {name}"
+            for idx, name in result.origin_map.items()
         )
-        output_path = self._output_path(sample_name)
+        output_path = self.output_path(sample_name, normalized_sector)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savetxt(output_path, final_data, header=header)
+        np.savetxt(output_path, final_data, header="\n".join(header_lines))
         return final_data
 
     def _sample_names(self) -> list[str]:
@@ -1401,6 +1857,7 @@ class StichingPipeline:
         scale_on: str | None = None,
         normalization_factor: float = 1.0,
         options: StitchingOptions | None = None,
+        sector_name: str | None = None,
     ) -> dict[str, np.ndarray]:
         """Stitch every registered sample, raising on the first failure."""
         kwargs: dict[str, Any] = {
@@ -1409,6 +1866,8 @@ class StichingPipeline:
         }
         if options is not None:
             kwargs["options"] = options
+        if sector_name is not None:
+            kwargs["sector_name"] = sector_name
         return {
             sample_name: self.run_for_sample(sample_name, **kwargs)
             for sample_name in self._sample_names()
@@ -1419,12 +1878,14 @@ class StichingPipeline:
         scale_on: str | None = None,
         normalization_factor: float = 1.0,
         options: StitchingOptions | None = None,
+        sector_name: str | None = None,
     ) -> dict[str, np.ndarray]:
         """Stitch ready samples without current merged outputs, logging failures."""
         pending_samples = [
             sample_name
             for sample_name in self._sample_names()
-            if self.is_sample_ready(sample_name) and not self.is_sample_stitched(sample_name)
+            if self.is_sample_ready(sample_name, sector_name)
+            and not self.is_sample_stitched(sample_name, sector_name)
         ]
         results: dict[str, np.ndarray] = {}
         failed_count = 0
@@ -1434,6 +1895,8 @@ class StichingPipeline:
         }
         if options is not None:
             kwargs["options"] = options
+        if sector_name is not None:
+            kwargs["sector_name"] = sector_name
         for sample_name in pending_samples:
             try:
                 results[sample_name] = self.run_for_sample(sample_name, **kwargs)

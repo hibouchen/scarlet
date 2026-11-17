@@ -28,6 +28,21 @@ class NexusRawData:
         return sorted(self.detectors)
 
 
+@dataclass(frozen=True)
+class ProcessedSectorData:
+    """One named sector product read from a processed NeXus entry."""
+
+    name: str
+    center_deg: float
+    width_deg: float
+    include_opposite: bool
+    detectors: list[np.ndarray | None]
+
+    @property
+    def definition(self) -> tuple[float, float, bool]:
+        return (self.center_deg, self.width_deg, self.include_opposite)
+
+
 def resolve_entry_path(file_path: Path | str) -> str:
     """Return the first supported NXentry path found in a SCARLET-compatible file."""
     file_path = Path(file_path).resolve()
@@ -281,6 +296,104 @@ def read_processed_data(
         return processed_data
 
 
+def read_processed_sectors(
+    file_path: Path | str,
+    *,
+    entry_name: str = "processed",
+) -> dict[str, ProcessedSectorData]:
+    """Read named sector curves stored below ``products/sectors``.
+
+    Each detector curve is returned as a four-column ``(q, I, dI, dQ)``
+    array. Files produced without sector integration return an empty mapping.
+    """
+    file_path = Path(file_path).resolve()
+    with h5py.File(file_path, "r") as handle:
+        entry_path = _normalize_top_level_entry_name(entry_name)
+        sector_root_path = f"{entry_path}/products/sectors"
+        if sector_root_path not in handle:
+            return {}
+        sector_root = handle[sector_root_path]
+        if not isinstance(sector_root, h5py.Group):
+            raise ValueError(
+                f"Sector product root must be a group in {file_path}: {sector_root_path}"
+            )
+
+        sectors: dict[str, ProcessedSectorData] = {}
+        for group_name, raw_sector_group in sector_root.items():
+            if not isinstance(raw_sector_group, h5py.Group):
+                continue
+            raw_label = raw_sector_group.attrs.get("label", group_name)
+            if isinstance(raw_label, (bytes, np.bytes_)):
+                raw_label = raw_label.decode(errors="replace")
+            sector_name = str(raw_label).strip()
+            if not sector_name:
+                raise ValueError(f"Empty sector label in {file_path}: {raw_sector_group.name}")
+            if sector_name in sectors:
+                raise ValueError(f"Duplicate sector label {sector_name!r} in {file_path}")
+
+            detector_groups: list[tuple[int, h5py.Group]] = []
+            definitions: list[tuple[float, float, bool]] = []
+            for detector_name, raw_detector_group in raw_sector_group.items():
+                if not isinstance(raw_detector_group, h5py.Group):
+                    continue
+                match = re.fullmatch(r"detector(\d+)", detector_name)
+                if match is None:
+                    continue
+                detector_number = int(match.group(1))
+                detector_groups.append((detector_number, raw_detector_group))
+                try:
+                    definitions.append(
+                        (
+                            float(np.asarray(raw_detector_group["sector_center"][()]).reshape(())),
+                            float(np.asarray(raw_detector_group["sector_width"][()]).reshape(())),
+                            bool(
+                                np.asarray(
+                                    raw_detector_group["sector_include_opposite"][()]
+                                ).reshape(())
+                            ),
+                        )
+                    )
+                except KeyError as exc:
+                    raise ValueError(
+                        f"Missing sector definition in {file_path}: {raw_detector_group.name}"
+                    ) from exc
+
+            if not detector_groups:
+                raise ValueError(
+                    f"No detector sector curves found in {file_path}: {raw_sector_group.name}"
+                )
+            reference_definition = definitions[0]
+            if any(
+                not (
+                    np.isclose(definition[0], reference_definition[0])
+                    and np.isclose(definition[1], reference_definition[1])
+                    and definition[2] == reference_definition[2]
+                )
+                for definition in definitions[1:]
+            ):
+                raise ValueError(
+                    f"Inconsistent detector definitions for sector {sector_name!r} "
+                    f"in {file_path}"
+                )
+
+            detector_data: list[np.ndarray | None] = [
+                None
+            ] * (max(number for number, _group in detector_groups) + 1)
+            for detector_number, detector_group in detector_groups:
+                detector_data[detector_number] = _read_processed_curve_group(
+                    detector_group,
+                    file_path=file_path,
+                )
+            sectors[sector_name] = ProcessedSectorData(
+                name=sector_name,
+                center_deg=reference_definition[0],
+                width_deg=reference_definition[1],
+                include_opposite=reference_definition[2],
+                detectors=detector_data,
+            )
+        return sectors
+
+
 
 
 def read_configuration(file_path: Path | str) -> tuple[Configuration, list[str]]:
@@ -494,7 +607,16 @@ def _read_processed_detector_data(
     if group_path not in handle or not isinstance(handle[group_path], h5py.Group):
         raise ValueError(f"Missing processed detector group in {file_path}: {group_path}")
 
-    group = handle[group_path]
+    return _read_processed_curve_group(handle[group_path], file_path=file_path)
+
+
+def _read_processed_curve_group(
+    group: h5py.Group,
+    *,
+    file_path: Path,
+) -> np.ndarray:
+    """Read one processed NXdata-like curve group as a ``(n, 4)`` array."""
+    group_path = group.name
     if "data" in group:
         raw_data = np.asarray(group["data"][()], dtype=np.float64)
         if raw_data.ndim == 2 and raw_data.shape[1] == 4 and "q" not in group and "Q" not in group:

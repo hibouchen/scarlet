@@ -6,7 +6,11 @@ from PySide6 import QtCore, QtWidgets
 
 from scarlet.workflow import WorkflowContext
 
-from ..models import ConfigurationSettingsModel, ConfigurationSettingsRow
+from ..models import (
+    ConfigurationSettingsModel,
+    ConfigurationSettingsRow,
+    ReferenceTransmissionsModel,
+)
 from ..settings_data import SettingsImagePayload
 from ..widgets import SettingsImageView
 
@@ -55,6 +59,31 @@ class SettingsPage(QtWidgets.QWidget):
         header.setDefaultSectionSize(130)
         header.setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Interactive)
         self.table.selectionModel().selectionChanged.connect(self._selection_changed)
+
+        self.reference_transmissions_model = ReferenceTransmissionsModel(parent=self)
+        self.reference_transmissions_table = QtWidgets.QTableView()
+        self.reference_transmissions_table.setModel(self.reference_transmissions_model)
+        self.reference_transmissions_table.setAlternatingRowColors(True)
+        self.reference_transmissions_table.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.reference_transmissions_table.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.NoSelection
+        )
+        self.reference_transmissions_table.verticalHeader().setVisible(False)
+        self.reference_transmissions_table.setMaximumHeight(150)
+        reference_header = self.reference_transmissions_table.horizontalHeader()
+        reference_header.setStretchLastSection(True)
+        reference_header.setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
+        reference_title = QtWidgets.QLabel("Reference transmissions")
+        reference_title.setObjectName("sectionTitle")
+
+        configuration_panel = QtWidgets.QWidget()
+        configuration_layout = QtWidgets.QVBoxLayout(configuration_panel)
+        configuration_layout.setContentsMargins(0, 0, 0, 0)
+        configuration_layout.addWidget(self.table, 1)
+        configuration_layout.addWidget(reference_title)
+        configuration_layout.addWidget(self.reference_transmissions_table)
 
         details = QtWidgets.QGroupBox("Selected configuration")
         details_form = QtWidgets.QFormLayout(details)
@@ -206,10 +235,11 @@ class SettingsPage(QtWidgets.QWidget):
         editor_layout.addWidget(self.settings_tabs, 1)
 
         splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
-        splitter.addWidget(self.table)
+        splitter.addWidget(configuration_panel)
         splitter.addWidget(editor)
-        splitter.setStretchFactor(0, 2)
-        splitter.setStretchFactor(1, 3)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 4)
+        splitter.setSizes([520, 650])
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.addWidget(title)
@@ -248,6 +278,7 @@ class SettingsPage(QtWidgets.QWidget):
         selected_config = self._selected_config_id()
         self._workflow = workflow
         self.model.set_workflow(workflow)
+        self.reference_transmissions_model.set_workflow(workflow)
         if workflow is None:
             self.summary_label.setText("No workflow loaded")
             self._show_row(None)
@@ -272,6 +303,7 @@ class SettingsPage(QtWidgets.QWidget):
 
     def set_busy(self, busy: bool) -> None:
         self.table.setDisabled(busy)
+        self.reference_transmissions_table.setDisabled(busy)
         for widget in (
             self.purpose_combo,
             self.detector_combo,

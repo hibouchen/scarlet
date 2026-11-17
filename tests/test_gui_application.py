@@ -26,6 +26,7 @@ from scarlet.gui.models import (
 from scarlet.gui.pages import (
     AcquisitionsPage,
     ProcessingPage,
+    ReductionOptions,
     ResultsPage,
     SettingsPage,
     StitchingPage,
@@ -39,6 +40,7 @@ from scarlet.gui.settings_data import (
 )
 from scarlet.gui.widgets import SettingsImageView, StitchingOptionsDialog
 from scarlet.gui.workflow_controller import WorkflowController
+from scarlet.reduction import Sector
 from scarlet.workflow import RunKey, WorkflowContext
 from scarlet.workflow.configuration import Configuration
 from scarlet.workflow.pipeline import StitchingOptions
@@ -65,6 +67,26 @@ def _write_settings_image_file(path: Path, image: np.ndarray) -> None:
         detector.create_dataset("deadtime_corrected", data=True)
         detector.create_dataset("beam_center_x", data=2.25)
         detector.create_dataset("beam_center_y", data=1.75)
+
+
+def _write_sector_product(
+    processed: h5py.Group,
+    name: str,
+    *,
+    center_deg: float,
+) -> None:
+    products = processed.require_group("products")
+    sectors = products.require_group("sectors")
+    sector = sectors.create_group(name)
+    sector.attrs["label"] = np.bytes_(name)
+    detector = sector.create_group("detector0")
+    detector.create_dataset("q", data=np.asarray([0.01, 0.02, 0.03]))
+    detector.create_dataset("data", data=np.asarray([10.0, 5.0, 3.0]))
+    detector.create_dataset("errors", data=np.asarray([0.5, 0.3, 0.2]))
+    detector.create_dataset("q_error", data=np.asarray([0.001, 0.001, 0.002]))
+    detector.create_dataset("sector_center", data=center_deg)
+    detector.create_dataset("sector_width", data=20.0)
+    detector.create_dataset("sector_include_opposite", data=True)
 
 
 class TestRunsTableModel(unittest.TestCase):
@@ -430,6 +452,7 @@ class TestRunsTableModel(unittest.TestCase):
             page.set_workflow(workflow)
             page.show()
             app.processEvents()
+            page.table.selectRow(0)
 
             page.set_preview(
                 SimpleNamespace(
@@ -440,7 +463,9 @@ class TestRunsTableModel(unittest.TestCase):
                 )
             )
             self.assertEqual(page.mask_editor._detector_tabs[0].beam_center, (2.0, 1.5))
+            page.set_busy(True, "Loading acquisition detector image…")
             page.table.clearSelection()  # Happens after raw-file conversion rebuilds the model.
+            page.set_busy(False)
             emitted: list[tuple[str, MaskEditorSource, dict[int, np.ndarray]]] = []
             page.mask_save_requested.connect(
                 lambda config_id, saved_source, masks: emitted.append(
@@ -500,9 +525,11 @@ class TestProcessingPage(unittest.TestCase):
         _application()
         page = ProcessingPage()
 
+        self.assertFalse(hasattr(page, "reference_transmissions_table"))
+
         self.assertEqual(
             page.reduction_options(),
-            ({0: 120}, "linear"),
+            ReductionOptions(n_bins={0: 120}, q_scale="linear"),
         )
 
         page.n_bins_spinboxes[0].setValue(40)
@@ -517,7 +544,10 @@ class TestProcessingPage(unittest.TestCase):
         self.assertEqual(tuple(page.n_bins_spinboxes), (0, 1, 2))
         self.assertEqual(
             page.reduction_options(),
-            ({0: 40, 1: 30, 2: 30}, "linear"),
+            ReductionOptions(
+                n_bins={0: 40, 1: 30, 2: 30},
+                q_scale="linear",
+            ),
         )
 
         page.n_bins_spinboxes[1].setValue(25)
@@ -526,7 +556,10 @@ class TestProcessingPage(unittest.TestCase):
 
         self.assertEqual(
             page.reduction_options(),
-            ({0: 40, 1: 25, 2: 20}, "log"),
+            ReductionOptions(
+                n_bins={0: 40, 1: 25, 2: 20},
+                q_scale="log",
+            ),
         )
 
         sam_workflow = WorkflowContext(instrument_name="SAM")
@@ -538,10 +571,118 @@ class TestProcessingPage(unittest.TestCase):
         page.set_workflow(sam_workflow)
 
         self.assertEqual(tuple(page.n_bins_spinboxes), (0,))
-        self.assertEqual(page.reduction_options(), ({0: 40}, "log"))
+        self.assertEqual(
+            page.reduction_options(),
+            ReductionOptions(n_bins={0: 40}, q_scale="log"),
+        )
         page.set_busy(True)
         self.assertFalse(page.integration_group.isEnabled())
         page.close()
+
+    def test_page_builds_simple_sector_presets(self) -> None:
+        _application()
+        page = ProcessingPage()
+
+        self.assertFalse(page.anisotropic_check.isChecked())
+        self.assertFalse(page.sector_controls_widget.isEnabled())
+        self.assertEqual(page.reduction_options().sectors, ())
+        self.assertEqual(page.sector_summary_label.text(), "Isotropic I(q) only.")
+
+        page.anisotropic_check.setChecked(True)
+        options = page.reduction_options()
+        self.assertTrue(page.sector_controls_widget.isEnabled())
+        self.assertEqual(
+            options.sectors,
+            (
+                Sector("parallel", 0.0, 20.0, include_opposite=True),
+                Sector("perpendicular", 90.0, 20.0, include_opposite=True),
+            ),
+        )
+        self.assertIn("parallel", page.sector_summary_label.text())
+        self.assertIn("perpendicular", page.sector_summary_label.text())
+
+        page.sector_direction_spin.setValue(-30.0)
+        page.sector_width_spin.setValue(40.0)
+        page.sector_opposite_check.setChecked(False)
+        page.sector_preset_combo.setCurrentIndex(
+            page.sector_preset_combo.findData("single")
+        )
+
+        self.assertEqual(
+            page.reduction_options().sectors,
+            (Sector("direction", -30.0, 40.0),),
+        )
+        self.assertEqual(
+            page.sector_summary_label.text(),
+            "direction: -30° ± 20°.",
+        )
+        page.close()
+        page.deleteLater()
+        QtWidgets.QApplication.processEvents()
+
+    def test_selected_acquisition_displays_live_sector_overlays(self) -> None:
+        app = _application()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            raw_path = root / "sample.hdf"
+            raw_path.write_bytes(b"raw")
+            workflow = WorkflowContext(root_dir=root, output_dir=root / "processed")
+            key = RunKey("config_1", "sample", "scattering", "sample-a")
+            workflow.add_run(key, raw_path)
+            source = MaskEditorSource(
+                file_path=raw_path,
+                entry_path="/raw_data",
+                detector_data={
+                    0: np.arange(30, dtype=np.float64).reshape(5, 6),
+                    1: np.arange(20, dtype=np.float64).reshape(4, 5),
+                },
+                configuration=Configuration(
+                    wavelength=6.0,
+                    sample_detector_distance=[4.0, 1.5],
+                ),
+                configuration_issues=[],
+            )
+            page = ProcessingPage()
+            page.set_workflow(workflow)
+            preview_requests: list[RunKey] = []
+            page.preview_requested.connect(preview_requests.append)
+            page.show()
+            page.table.selectRow(0)
+            app.processEvents()
+
+            self.assertEqual(preview_requests, [key])
+            self.assertIn("Loading", page.sector_preview.source_label.text())
+            page.set_preview(
+                SimpleNamespace(
+                    run_key=key,
+                    source=source,
+                    beam_centers={0: (2.5, 2.0), 1: (2.0, 1.5)},
+                    display_count_time=10.0,
+                )
+            )
+
+            self.assertTrue(page.sector_preview.has_source)
+            self.assertEqual(page.sector_preview.tabs.count(), 2)
+            self.assertIn("sample.hdf", page.sector_preview.source_label.text())
+            self.assertEqual(page.sector_preview.sector_item_count(0), 0)
+
+            page.anisotropic_check.setChecked(True)
+            self.assertEqual(page.sector_preview.sector_item_count(0), 4)
+            self.assertEqual(page.sector_preview.sector_item_count(1), 4)
+
+            page.sector_opposite_check.setChecked(False)
+            page.sector_preset_combo.setCurrentIndex(
+                page.sector_preset_combo.findData("single")
+            )
+            self.assertEqual(page.sector_preview.sector_item_count(0), 1)
+            self.assertEqual(page.sector_preview.sector_item_count(1), 1)
+
+            page.set_workflow(workflow)
+            self.assertEqual(page.selected_run_keys(), [key])
+            self.assertTrue(page.sector_preview.has_source)
+            page.close()
+            page.deleteLater()
+            app.processEvents()
 
     def test_reference_transmissions_model_reports_water_and_empty_cell(self) -> None:
         workflow = WorkflowContext()
@@ -650,7 +791,13 @@ class TestProcessingPage(unittest.TestCase):
                     entry.create_group("instrument").create_group("detector0").create_dataset(
                         "data", data=np.ones((2, 2), dtype=np.float64)
                     )
-                    handle.create_group("processed")
+                    processed = handle.create_group("processed")
+                    _write_sector_product(processed, "parallel", center_deg=0.0)
+                    _write_sector_product(
+                        processed,
+                        "perpendicular",
+                        center_deg=90.0,
+                    )
                 workflow.add_run(
                     RunKey(config_id, "sample", "scattering", "sample-a"), path
                 )
@@ -672,19 +819,49 @@ class TestProcessingPage(unittest.TestCase):
             page.table.selectRow(0)
             self.assertTrue(page.stitch_selected_button.isEnabled())
             self.assertEqual(page.reference_combo.count(), 3)
+            self.assertEqual(
+                {
+                    page.curve_group_combo.itemData(index)
+                    for index in range(page.curve_group_combo.count())
+                },
+                {None, "*", "parallel", "perpendicular"},
+            )
+            page.curve_group_combo.setCurrentIndex(
+                page.curve_group_combo.findData("*")
+            )
+            self.assertEqual(
+                page.model.data(
+                    page.model.index(
+                        0,
+                        page.model.column_index("output_path"),
+                    )
+                ),
+                "2 sector output(s)",
+            )
+            page.curve_group_combo.setCurrentIndex(
+                page.curve_group_combo.findData(None)
+            )
             page.reference_combo.setCurrentIndex(
                 page.reference_combo.findData("config_2")
             )
             page.normalization_factor_spin.setValue(2.5)
-            requests: list[tuple[list[str], object, float]] = []
+            requests: list[tuple[list[str], object, float, object]] = []
             page.stitch_selected_requested.connect(
-                lambda sample_names, reference, factor: requests.append(
-                    (sample_names, reference, factor)
+                lambda sample_names, reference, factor, curve_group: requests.append(
+                    (sample_names, reference, factor, curve_group)
                 )
             )
             page.stitch_selected_button.click()
 
-            self.assertEqual(requests, [(["sample-a"], "config_2", 2.5)])
+            self.assertEqual(requests, [(["sample-a"], "config_2", 2.5, None)])
+            page.curve_group_combo.setCurrentIndex(
+                page.curve_group_combo.findData("parallel")
+            )
+            page.stitch_selected_button.click()
+            self.assertEqual(
+                requests[-1],
+                (["sample-a"], "config_2", 2.5, "parallel"),
+            )
             page.table.selectionModel().select(
                 page.model.index(1, 0),
                 QtCore.QItemSelectionModel.SelectionFlag.Select
@@ -699,21 +876,30 @@ class TestProcessingPage(unittest.TestCase):
             page.stitch_selected_button.click()
             self.assertEqual(
                 requests[-1],
-                (["sample-a", "sample-b"], "config_1", 2.5),
+                (["sample-a", "sample-b"], "config_1", 2.5, "parallel"),
             )
-            pending_requests: list[float] = []
-            page.stitch_pending_requested.connect(pending_requests.append)
+            pending_requests: list[tuple[float, object]] = []
+            page.stitch_pending_requested.connect(
+                lambda factor, curve_group: pending_requests.append(
+                    (factor, curve_group)
+                )
+            )
             page.stitch_pending_button.click()
-            self.assertEqual(pending_requests, [2.5])
+            self.assertEqual(pending_requests, [(2.5, "parallel")])
             output_path = workflow.output_dir / "sample-a_merged.txt"
             output_path.parent.mkdir(parents=True)
             output_path.write_text("merged", encoding="utf-8")
+            page.curve_group_combo.setCurrentIndex(
+                page.curve_group_combo.findData(None)
+            )
             page.set_workflow(workflow)
             self.assertEqual(
                 page.model.data(page.model.index(0, page.model.column_index("status"))),
                 "stitched",
             )
             page.close()
+            page.deleteLater()
+            app.processEvents()
 
 
 class TestResultsPage(unittest.TestCase):
@@ -725,7 +911,9 @@ class TestResultsPage(unittest.TestCase):
             output_dir.mkdir()
             for name, multiplier in (
                 ("sample-a_config_config_1.txt", 1.0),
+                ("sample-a_config_config_1_sector_parallel.txt", 1.5),
                 ("sample-a_merged.txt", 2.0),
+                ("sample-a_sector_parallel_merged.txt", 2.5),
             ):
                 np.savetxt(
                     output_dir / name,
@@ -740,7 +928,14 @@ class TestResultsPage(unittest.TestCase):
             page.show()
             app.processEvents()
 
-            self.assertEqual(page.model.rowCount(), 2)
+            self.assertEqual(page.model.rowCount(), 4)
+            self.assertEqual(
+                {
+                    page.model.data(page.model.index(row, 1))
+                    for row in range(page.model.rowCount())
+                },
+                {"reduced", "sector", "stitched", "sector stitched"},
+            )
             selection = page.table.selectionModel()
             flags = (
                 QtCore.QItemSelectionModel.SelectionFlag.Select
@@ -964,6 +1159,14 @@ class TestSettingsPage(unittest.TestCase):
                 RunKey("config_1", "sample", "scattering", "sample-a"),
                 path,
             )
+            water_path = root / "water.hdf"
+            water_path.write_bytes(b"raw")
+            workflow.add_run(
+                RunKey("config_1", "water", "scattering", "H2O"),
+                water_path,
+            )
+            workflow.set_transmission("H2O", "config_1", 0.94)
+            workflow.set_empty_cell_transmission("config_1", 0.97)
             workflow.configurations["config_1"] = Configuration(
                 wavelength=6.0,
                 sample_detector_distance=[4.0, 1.5],
@@ -987,6 +1190,23 @@ class TestSettingsPage(unittest.TestCase):
             self.assertIn("detector0", page.centers_label.text())
             self.assertEqual(page.roi_label.text(), "x=1:4, y=2:5")
             self.assertIn("1 configuration(s)", page.summary_label.text())
+            self.assertEqual(page.reference_transmissions_model.rowCount(), 1)
+            self.assertEqual(
+                page.reference_transmissions_model.data(
+                    page.reference_transmissions_model.index(0, 1)
+                ),
+                "0.94",
+            )
+            self.assertEqual(
+                page.reference_transmissions_model.data(
+                    page.reference_transmissions_model.index(0, 2)
+                ),
+                "0.97",
+            )
+            self.assertGreater(
+                page.reference_transmissions_table.y(),
+                page.table.y(),
+            )
             self.assertEqual(
                 [page.settings_tabs.tabText(index) for index in range(page.settings_tabs.count())],
                 ["Beam center and ROI", "Transmission", "Mask", "Flatfield"],
@@ -1143,6 +1363,7 @@ class TestWorkflowController(unittest.TestCase):
                 ["sample-a", "sample-b"],
                 "config_1",
                 2.5,
+                "parallel",
             )
 
         start_stitching.assert_called_once_with(
@@ -1150,6 +1371,7 @@ class TestWorkflowController(unittest.TestCase):
             ("sample-a", "sample-b"),
             "config_1",
             2.5,
+            "parallel",
             kind="stitch_selected",
         )
 
@@ -1160,11 +1382,16 @@ class TestWorkflowController(unittest.TestCase):
         workflow.add_run(run_key, Path("/tmp/sample-a.nxs"))
         controller._workflow = workflow
 
+        sectors = (
+            Sector("parallel", 0.0, 20.0, include_opposite=True),
+            Sector("perpendicular", 90.0, 20.0, include_opposite=True),
+        )
         with mock.patch.object(controller, "_start_reduction") as start_reduction:
             controller.process_selected(
                 [run_key],
                 n_bins={0: 40, 1: 25, 2: 20},
                 q_scale="log",
+                sectors=sectors,
             )
 
         start_reduction.assert_called_once_with(
@@ -1173,6 +1400,7 @@ class TestWorkflowController(unittest.TestCase):
             kind="reduce_selected",
             n_bins={0: 40, 1: 25, 2: 20},
             q_scale="log",
+            sectors=sectors,
         )
 
     def test_stitching_options_are_persisted_in_the_workflow(self) -> None:
@@ -1400,6 +1628,34 @@ class TestScarletMainWindow(unittest.TestCase):
 
             self.assertEqual(window.navigation.currentRow(), 2)
             window.close()
+
+    def test_window_forwards_sector_options_to_controller(self) -> None:
+        _application()
+        controller = WorkflowController()
+        window = ScarletMainWindow(controller=controller)
+        window.processing_page.n_bins_spinboxes[0].setValue(48)
+        window.processing_page.q_scale_combo.setCurrentIndex(
+            window.processing_page.q_scale_combo.findData("log")
+        )
+        window.processing_page.anisotropic_check.setChecked(True)
+        window.processing_page.sector_direction_spin.setValue(15.0)
+        window.processing_page.sector_width_spin.setValue(30.0)
+        expected_sectors = (
+            Sector("parallel", 15.0, 30.0, include_opposite=True),
+            Sector("perpendicular", 105.0, 30.0, include_opposite=True),
+        )
+        run_key = RunKey("config_1", "sample", "scattering", "sample-a")
+
+        with mock.patch.object(controller, "process_selected") as process_selected:
+            window._process_selected([run_key])
+
+        process_selected.assert_called_once_with(
+            [run_key],
+            n_bins={0: 48},
+            q_scale="log",
+            sectors=expected_sectors,
+        )
+        window.close()
 
 
 if __name__ == "__main__":

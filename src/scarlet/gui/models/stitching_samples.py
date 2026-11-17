@@ -18,9 +18,14 @@ class StitchingSampleRow:
     configuration_count: int
     status: str
     output_path: Path
+    output_label: str
+    output_tooltip: str
 
 
-def stitching_sample_rows(workflow: WorkflowContext) -> list[StitchingSampleRow]:
+def stitching_sample_rows(
+    workflow: WorkflowContext,
+    curve_group: str | None = None,
+) -> list[StitchingSampleRow]:
     """Return sample-scattering groups with output status from ``output_dir``."""
     configurations_by_sample: dict[str, set[str]] = {}
     for run_key in workflow.runs:
@@ -34,12 +39,36 @@ def stitching_sample_rows(workflow: WorkflowContext) -> list[StitchingSampleRow]
     pipeline = StichingPipeline(workflow)
     rows: list[StitchingSampleRow] = []
     for sample_name, configurations in sorted(configurations_by_sample.items()):
-        output_path = (workflow.output_dir / f"{sample_name}_merged.txt").resolve()
+        if curve_group == "*":
+            sector_names = pipeline.available_sector_names(sample_name)
+            output_paths = tuple(
+                pipeline.output_path(sample_name, sector_name)
+                for sector_name in sector_names
+            )
+            output_path = output_paths[0] if output_paths else workflow.output_dir.resolve()
+            output_label = (
+                f"{len(output_paths)} sector output(s)"
+                if output_paths
+                else "No common sector"
+            )
+            output_tooltip = "\n".join(str(path) for path in output_paths)
+            ready = bool(sector_names) and all(
+                pipeline.is_sample_ready(sample_name, sector_name)
+                for sector_name in sector_names
+            )
+            stitched = ready and all(path.is_file() for path in output_paths)
+        else:
+            sector_name = curve_group or None
+            output_path = pipeline.output_path(sample_name, sector_name)
+            output_label = output_path.name
+            output_tooltip = str(output_path)
+            ready = pipeline.is_sample_ready(sample_name, sector_name)
+            stitched = output_path.is_file()
         # The control table intentionally uses presence rather than timestamps:
         # it is the direct, visible record requested by the operator.
-        if output_path.is_file():
+        if stitched:
             status = "stitched"
-        elif pipeline.is_sample_ready(sample_name):
+        elif ready:
             status = "ready"
         else:
             status = "waiting"
@@ -49,6 +78,8 @@ def stitching_sample_rows(workflow: WorkflowContext) -> list[StitchingSampleRow]
                 configuration_count=len(configurations),
                 status=status,
                 output_path=output_path,
+                output_label=output_label,
+                output_tooltip=output_tooltip,
             )
         )
     return rows
@@ -71,10 +102,27 @@ class StitchingSamplesModel(QtCore.QAbstractTableModel):
     ) -> None:
         super().__init__(parent)
         self._rows = list(rows)
+        self._workflow: WorkflowContext | None = None
+        self._curve_group: str | None = None
 
     def set_workflow(self, workflow: WorkflowContext | None) -> None:
+        self._workflow = workflow
+        self._rebuild()
+
+    def set_curve_group(self, curve_group: str | None) -> None:
+        normalized = None if curve_group in {None, ""} else str(curve_group)
+        if normalized == self._curve_group:
+            return
+        self._curve_group = normalized
+        self._rebuild()
+
+    def _rebuild(self) -> None:
         self.beginResetModel()
-        self._rows = [] if workflow is None else stitching_sample_rows(workflow)
+        self._rows = (
+            []
+            if self._workflow is None
+            else stitching_sample_rows(self._workflow, self._curve_group)
+        )
         self.endResetModel()
 
     @classmethod
@@ -102,9 +150,9 @@ class StitchingSamplesModel(QtCore.QAbstractTableModel):
         field, _label = self._COLUMNS[index.column()]
         value = getattr(self._rows[index.row()], field)
         if role in {QtCore.Qt.ItemDataRole.DisplayRole, QtCore.Qt.ItemDataRole.EditRole}:
-            return value.name if field == "output_path" else str(value)
+            return self._rows[index.row()].output_label if field == "output_path" else str(value)
         if role == QtCore.Qt.ItemDataRole.ToolTipRole and field == "output_path":
-            return str(value)
+            return self._rows[index.row()].output_tooltip
         if role == QtCore.Qt.ItemDataRole.ForegroundRole and field == "status":
             return {
                 "stitched": QtGui.QColor("#2e7d32"),
