@@ -54,8 +54,8 @@ One main window contains six pages and a persistent activity area:
 - **Processing** starts reduction, configures detector-specific azimuthal bins,
   q spacing, and optional simple sector integration, and reports progress.
 - **Stitching** lists the merged text outputs found in the output directory
-  and merges selected ready samples with a common reference configuration and
-  a multiplicative normalization factor.
+  and merges selected ready samples with a common reference configuration, a
+  multiplicative normalization factor, and an isotropic or sector curve group.
 - **Results** overlays selected isotropic, sector, or stitched I(Q) text curves using
   silx and provides filename/type search and table sorting. Detector-image
   review is a later extension.
@@ -148,6 +148,9 @@ or reusing a flatfield from another configuration; and **Transmission** for
 declaring that the selected configuration reuses transmissions (and the
 transmission ROI) from another active configuration. Changing the
 transmission source invalidates the selected configuration's flatfield.
+The effective water and empty-cell reference transmissions are shown below the
+configuration overview, keeping all configuration-level preparation values on
+the Settings page.
 
 ### Processing, stitching, and results pages
 
@@ -157,9 +160,9 @@ transmission source invalidates the selected configuration's flatfield.
 |                                |                                         |
 | Sample runs table | detector  | Ready sample groups table               |
 |                   | + sectors |                                         |
-| detector0 bins [120]           | Reference [automatic v]                 |
+| detector0 bins [120]           | Curves [isotropic / sectors v]          |
 | detector1 bins [ 30]           | Normalization factor [1.0]              |
-| q scale        [linear v]      |                                         |
+| q scale        [linear v]      | Reference [automatic v]                 |
 | [x] sector integration         |                                         |
 | preset [parallel/perpendicular]|                                         |
 | direction [0 deg] width [20]   |                                         |

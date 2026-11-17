@@ -1,5 +1,6 @@
 from .nexus_reader import (
     NexusRawData,
+    ProcessedSectorData,
     get_roi,
     list_detector_numbers,
     load_nxsas_raw,
@@ -15,11 +16,13 @@ from .nexus_reader import (
     read_detector_pixel_size,
     read_monitor_value,
     read_processed_data,
+    read_processed_sectors,
     resolve_entry_path,
 )
 
 __all__ = [
     "NexusRawData",
+    "ProcessedSectorData",
     "get_roi",
     "list_detector_numbers",
     "load_nxsas_raw",
@@ -35,5 +38,6 @@ __all__ = [
     "read_detector_pixel_size",
     "read_monitor_value",
     "read_processed_data",
+    "read_processed_sectors",
     "resolve_entry_path",
 ]

@@ -23,6 +23,8 @@ def result_curve_rows(workflow: WorkflowContext) -> list[ResultCurveRow]:
         return []
 
     def result_kind(path: Path) -> str:
+        if path.name.endswith("_merged.txt") and "_sector_" in path.stem:
+            return "sector stitched"
         if path.name.endswith("_merged.txt"):
             return "stitched"
         if "_sector_" in path.stem:
@@ -79,6 +81,7 @@ class ResultCurvesModel(QtCore.QAbstractTableModel):
         if role == QtCore.Qt.ItemDataRole.ForegroundRole and field == "kind":
             colors = {
                 "stitched": "#2e7d32",
+                "sector stitched": "#00695c",
                 "sector": "#7b1fa2",
                 "reduced": "#245a92",
             }

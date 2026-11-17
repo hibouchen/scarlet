@@ -345,6 +345,9 @@ merged = stitching.run_new(
     scale_on="config_1",
     normalization_factor=1.0,
 )
+
+# Stitch the same named sector across configurations and detectors.
+parallel = stitching.run_new(sector_name="parallel")
 ```
 
 `scale_on` rebases each stitched curve to the requested processed
@@ -353,11 +356,19 @@ configuration. `normalization_factor` then multiplies the final `I` and
 offered for a multi-sample selection only when that configuration is processed
 for every selected sample.
 
+Sector stitching reads `/processed/products/sectors/<name>` from each processed
+NeXus file. A sector is eligible only when it is present in every configuration
+of the sample and its center angle, full width, and opposite-direction flag are
+compatible. Each sector is stitched independently and written to
+`<sample_name>_sector_<name>_merged.txt`; different sector names are never mixed.
+The graphical Stitching page can process the isotropic curve, all common
+sectors, or one named sector.
+
 `run_new()` does not refresh the workflow and never converts raw acquisitions.
 An eligible sample must have `/processed` in every registered scattering run.
-The method skips a sample when its `<sample_name>_merged.txt` output is newer
-than all its processed NeXus inputs. It runs the stitching again when a
-processed input is newer than the existing merged output.
+The method skips a sample when the selected isotropic or sector-specific merged
+output is newer than all its processed NeXus inputs. It runs the stitching
+again when a processed input is newer than the existing merged output.
 
 As with `ReductionPipeline.run_new()`, samples are handled independently. A
 stitching failure is stored in the workflow log, and processing continues with

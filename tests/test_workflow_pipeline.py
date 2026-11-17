@@ -65,6 +65,34 @@ def _write_detector_file(
         detector.create_dataset("beam_center_y", data=0.5)
 
 
+def _write_processed_sector(
+    path: Path,
+    *,
+    name: str,
+    center_deg: float,
+    width_deg: float = 20.0,
+    include_opposite: bool = True,
+    intensity_scale: float = 1.0,
+) -> None:
+    with h5py.File(path, "a") as handle:
+        processed = handle.require_group("processed")
+        products = processed.require_group("products")
+        sectors = products.require_group("sectors")
+        sector = sectors.create_group(name)
+        sector.attrs["label"] = np.bytes_(name)
+        detector = sector.create_group("detector0")
+        detector.create_dataset("q", data=np.asarray([0.01, 0.02, 0.03]))
+        detector.create_dataset(
+            "data",
+            data=intensity_scale * np.asarray([10.0, 5.0, 3.0]),
+        )
+        detector.create_dataset("errors", data=np.asarray([0.5, 0.3, 0.2]))
+        detector.create_dataset("q_error", data=np.asarray([0.001, 0.001, 0.002]))
+        detector.create_dataset("sector_center", data=center_deg)
+        detector.create_dataset("sector_width", data=width_deg)
+        detector.create_dataset("sector_include_opposite", data=include_opposite)
+
+
 def _write_mask_bundle(path: Path, masks: dict[int, np.ndarray]) -> None:
     with h5py.File(path, "w") as handle:
         entry = handle.create_group("entry")
@@ -347,6 +375,94 @@ class TestStichingPipeline(unittest.TestCase):
                     for log in workflow.logs
                 )
             )
+
+    def test_run_for_sample_stitches_matching_sector_products(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            workflow = WorkflowContext(root_dir=root, output_dir=root / "out")
+            for index, config_id in enumerate(("config_1", "config_2")):
+                path = root / f"{config_id}.nxs"
+                _write_detector_file(
+                    path,
+                    sample_name="sample_a",
+                    data=np.ones((2, 2), dtype=np.float64),
+                )
+                _write_processed_sector(
+                    path,
+                    name="parallel",
+                    center_deg=0.0,
+                    intensity_scale=1.0 + index,
+                )
+                workflow.add_run(
+                    RunKey(config_id, "sample", "scattering", "sample_a"),
+                    path,
+                )
+
+            pipeline = StichingPipeline(workflow)
+            self.assertEqual(pipeline.available_sector_names("sample_a"), ("parallel",))
+            self.assertTrue(pipeline.is_sample_ready("sample_a", "parallel"))
+            result = SimpleNamespace(
+                final_curve=SimpleNamespace(
+                    q=np.asarray([0.01, 0.02]),
+                    i=np.asarray([10.0, 5.0]),
+                    di=np.asarray([0.5, 0.3]),
+                    dq=np.asarray([0.001, 0.001]),
+                ),
+                origin_segment_id=np.asarray([0, 1]),
+                origin_map={0: "config_1/detector0", 1: "config_2/detector0"},
+            )
+
+            with mock.patch.object(
+                st,
+                "stitch_segments_greedy",
+                return_value=result,
+            ) as stitch:
+                final_data = pipeline.run_for_sample(
+                    "sample_a",
+                    sector_name="parallel",
+                )
+
+            self.assertEqual(len(stitch.call_args.args[0]), 2)
+            self.assertTrue(
+                all("parallel" in segment.name for segment in stitch.call_args.args[0])
+            )
+            np.testing.assert_allclose(
+                final_data[:, :4],
+                np.asarray(
+                    [
+                        [0.01, 10.0, 0.5, 0.001],
+                        [0.02, 5.0, 0.3, 0.001],
+                    ]
+                ),
+            )
+            output_path = root / "out" / "sample_a_sector_parallel_merged.txt"
+            self.assertTrue(output_path.exists())
+            header = output_path.read_text(encoding="utf-8")
+            self.assertIn("sector_name: parallel", header)
+            self.assertIn("sector_width_deg: 20", header)
+
+    def test_incompatible_sector_definitions_are_not_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            workflow = WorkflowContext(root_dir=root, output_dir=root / "out")
+            for config_id, center in (("config_1", 0.0), ("config_2", 15.0)):
+                path = root / f"{config_id}.nxs"
+                _write_detector_file(
+                    path,
+                    sample_name="sample_a",
+                    data=np.ones((2, 2), dtype=np.float64),
+                )
+                _write_processed_sector(path, name="parallel", center_deg=center)
+                workflow.add_run(
+                    RunKey(config_id, "sample", "scattering", "sample_a"),
+                    path,
+                )
+
+            pipeline = StichingPipeline(workflow)
+            self.assertEqual(pipeline.available_sector_names("sample_a"), ())
+            self.assertFalse(pipeline.is_sample_ready("sample_a", "parallel"))
+            with self.assertRaisesRegex(ValueError, "incompatible definitions"):
+                pipeline.run_for_sample("sample_a", sector_name="parallel")
 
 
 class TestAzimuthalTextWriter(unittest.TestCase):

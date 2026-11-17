@@ -81,7 +81,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from scarlet.io.nexus_reader import read_processed_data
+from scarlet.io.nexus_reader import read_processed_data, read_processed_sectors
 
 try:
     from scipy.interpolate import PchipInterpolator
@@ -346,6 +346,63 @@ def load_segment_from_nexus(
             detector_data,
             name=segment_name,
             source=f"{path}:{entry_name}/data{detector_index}",
+        )
+        segments.append(
+            CurveSegment(
+                name=segment_name,
+                curve=curve,
+                config_id=normalized_config_id,
+                detector_id=detector_id,
+                path=str(path),
+            )
+        )
+
+    return sorted(segments, key=lambda s: (s.q_min, s.q_center))
+
+
+def load_sector_segment_from_nexus(
+    path: str | Path,
+    sector_name: str,
+    *,
+    names: list[str] | None = None,
+    config_id: str = "unknown",
+    entry_name: str = "processed",
+) -> list[CurveSegment]:
+    """Load the detector curves belonging to one named sector product."""
+    path = Path(path)
+    sector_key = str(sector_name).strip()
+    if not sector_key:
+        raise ValueError("sector_name must not be empty")
+    sectors = read_processed_sectors(path, entry_name=entry_name)
+    sector = sectors.get(sector_key)
+    if sector is None:
+        return []
+
+    available = [
+        (detector_index, data)
+        for detector_index, data in enumerate(sector.detectors)
+        if data is not None
+    ]
+    if names is not None and len(names) != len(available):
+        raise ValueError("--names doit contenir autant d'entrées que de détecteurs disponibles")
+
+    normalized_config_id = str(config_id).strip() or "unknown"
+    segments: list[CurveSegment] = []
+    for idx, (detector_index, detector_data) in enumerate(available):
+        detector_id = f"detector{detector_index}"
+        if names is None:
+            if normalized_config_id.startswith("config_"):
+                base_name = f"{normalized_config_id.replace('config_', 'c')}d{detector_index}"
+            else:
+                base_name = f"{normalized_config_id}_{detector_id}"
+            segment_name = f"{base_name}_{sector_key}"
+        else:
+            segment_name = names[idx]
+
+        curve = SASCurve.from_array(
+            detector_data,
+            name=segment_name,
+            source=f"{path}:{entry_name}/products/sectors/{sector_key}/{detector_id}",
         )
         segments.append(
             CurveSegment(

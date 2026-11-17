@@ -69,6 +69,26 @@ def _write_settings_image_file(path: Path, image: np.ndarray) -> None:
         detector.create_dataset("beam_center_y", data=1.75)
 
 
+def _write_sector_product(
+    processed: h5py.Group,
+    name: str,
+    *,
+    center_deg: float,
+) -> None:
+    products = processed.require_group("products")
+    sectors = products.require_group("sectors")
+    sector = sectors.create_group(name)
+    sector.attrs["label"] = np.bytes_(name)
+    detector = sector.create_group("detector0")
+    detector.create_dataset("q", data=np.asarray([0.01, 0.02, 0.03]))
+    detector.create_dataset("data", data=np.asarray([10.0, 5.0, 3.0]))
+    detector.create_dataset("errors", data=np.asarray([0.5, 0.3, 0.2]))
+    detector.create_dataset("q_error", data=np.asarray([0.001, 0.001, 0.002]))
+    detector.create_dataset("sector_center", data=center_deg)
+    detector.create_dataset("sector_width", data=20.0)
+    detector.create_dataset("sector_include_opposite", data=True)
+
+
 class TestRunsTableModel(unittest.TestCase):
     def test_model_exposes_workflow_runs_as_read_only_rows(self) -> None:
         _application()
@@ -505,6 +525,8 @@ class TestProcessingPage(unittest.TestCase):
         _application()
         page = ProcessingPage()
 
+        self.assertFalse(hasattr(page, "reference_transmissions_table"))
+
         self.assertEqual(
             page.reduction_options(),
             ReductionOptions(n_bins={0: 120}, q_scale="linear"),
@@ -769,7 +791,13 @@ class TestProcessingPage(unittest.TestCase):
                     entry.create_group("instrument").create_group("detector0").create_dataset(
                         "data", data=np.ones((2, 2), dtype=np.float64)
                     )
-                    handle.create_group("processed")
+                    processed = handle.create_group("processed")
+                    _write_sector_product(processed, "parallel", center_deg=0.0)
+                    _write_sector_product(
+                        processed,
+                        "perpendicular",
+                        center_deg=90.0,
+                    )
                 workflow.add_run(
                     RunKey(config_id, "sample", "scattering", "sample-a"), path
                 )
@@ -791,19 +819,49 @@ class TestProcessingPage(unittest.TestCase):
             page.table.selectRow(0)
             self.assertTrue(page.stitch_selected_button.isEnabled())
             self.assertEqual(page.reference_combo.count(), 3)
+            self.assertEqual(
+                {
+                    page.curve_group_combo.itemData(index)
+                    for index in range(page.curve_group_combo.count())
+                },
+                {None, "*", "parallel", "perpendicular"},
+            )
+            page.curve_group_combo.setCurrentIndex(
+                page.curve_group_combo.findData("*")
+            )
+            self.assertEqual(
+                page.model.data(
+                    page.model.index(
+                        0,
+                        page.model.column_index("output_path"),
+                    )
+                ),
+                "2 sector output(s)",
+            )
+            page.curve_group_combo.setCurrentIndex(
+                page.curve_group_combo.findData(None)
+            )
             page.reference_combo.setCurrentIndex(
                 page.reference_combo.findData("config_2")
             )
             page.normalization_factor_spin.setValue(2.5)
-            requests: list[tuple[list[str], object, float]] = []
+            requests: list[tuple[list[str], object, float, object]] = []
             page.stitch_selected_requested.connect(
-                lambda sample_names, reference, factor: requests.append(
-                    (sample_names, reference, factor)
+                lambda sample_names, reference, factor, curve_group: requests.append(
+                    (sample_names, reference, factor, curve_group)
                 )
             )
             page.stitch_selected_button.click()
 
-            self.assertEqual(requests, [(["sample-a"], "config_2", 2.5)])
+            self.assertEqual(requests, [(["sample-a"], "config_2", 2.5, None)])
+            page.curve_group_combo.setCurrentIndex(
+                page.curve_group_combo.findData("parallel")
+            )
+            page.stitch_selected_button.click()
+            self.assertEqual(
+                requests[-1],
+                (["sample-a"], "config_2", 2.5, "parallel"),
+            )
             page.table.selectionModel().select(
                 page.model.index(1, 0),
                 QtCore.QItemSelectionModel.SelectionFlag.Select
@@ -818,21 +876,30 @@ class TestProcessingPage(unittest.TestCase):
             page.stitch_selected_button.click()
             self.assertEqual(
                 requests[-1],
-                (["sample-a", "sample-b"], "config_1", 2.5),
+                (["sample-a", "sample-b"], "config_1", 2.5, "parallel"),
             )
-            pending_requests: list[float] = []
-            page.stitch_pending_requested.connect(pending_requests.append)
+            pending_requests: list[tuple[float, object]] = []
+            page.stitch_pending_requested.connect(
+                lambda factor, curve_group: pending_requests.append(
+                    (factor, curve_group)
+                )
+            )
             page.stitch_pending_button.click()
-            self.assertEqual(pending_requests, [2.5])
+            self.assertEqual(pending_requests, [(2.5, "parallel")])
             output_path = workflow.output_dir / "sample-a_merged.txt"
             output_path.parent.mkdir(parents=True)
             output_path.write_text("merged", encoding="utf-8")
+            page.curve_group_combo.setCurrentIndex(
+                page.curve_group_combo.findData(None)
+            )
             page.set_workflow(workflow)
             self.assertEqual(
                 page.model.data(page.model.index(0, page.model.column_index("status"))),
                 "stitched",
             )
             page.close()
+            page.deleteLater()
+            app.processEvents()
 
 
 class TestResultsPage(unittest.TestCase):
@@ -846,6 +913,7 @@ class TestResultsPage(unittest.TestCase):
                 ("sample-a_config_config_1.txt", 1.0),
                 ("sample-a_config_config_1_sector_parallel.txt", 1.5),
                 ("sample-a_merged.txt", 2.0),
+                ("sample-a_sector_parallel_merged.txt", 2.5),
             ):
                 np.savetxt(
                     output_dir / name,
@@ -860,13 +928,13 @@ class TestResultsPage(unittest.TestCase):
             page.show()
             app.processEvents()
 
-            self.assertEqual(page.model.rowCount(), 3)
+            self.assertEqual(page.model.rowCount(), 4)
             self.assertEqual(
                 {
                     page.model.data(page.model.index(row, 1))
                     for row in range(page.model.rowCount())
                 },
-                {"reduced", "sector", "stitched"},
+                {"reduced", "sector", "stitched", "sector stitched"},
             )
             selection = page.table.selectionModel()
             flags = (
@@ -1091,6 +1159,14 @@ class TestSettingsPage(unittest.TestCase):
                 RunKey("config_1", "sample", "scattering", "sample-a"),
                 path,
             )
+            water_path = root / "water.hdf"
+            water_path.write_bytes(b"raw")
+            workflow.add_run(
+                RunKey("config_1", "water", "scattering", "H2O"),
+                water_path,
+            )
+            workflow.set_transmission("H2O", "config_1", 0.94)
+            workflow.set_empty_cell_transmission("config_1", 0.97)
             workflow.configurations["config_1"] = Configuration(
                 wavelength=6.0,
                 sample_detector_distance=[4.0, 1.5],
@@ -1114,6 +1190,23 @@ class TestSettingsPage(unittest.TestCase):
             self.assertIn("detector0", page.centers_label.text())
             self.assertEqual(page.roi_label.text(), "x=1:4, y=2:5")
             self.assertIn("1 configuration(s)", page.summary_label.text())
+            self.assertEqual(page.reference_transmissions_model.rowCount(), 1)
+            self.assertEqual(
+                page.reference_transmissions_model.data(
+                    page.reference_transmissions_model.index(0, 1)
+                ),
+                "0.94",
+            )
+            self.assertEqual(
+                page.reference_transmissions_model.data(
+                    page.reference_transmissions_model.index(0, 2)
+                ),
+                "0.97",
+            )
+            self.assertGreater(
+                page.reference_transmissions_table.y(),
+                page.table.y(),
+            )
             self.assertEqual(
                 [page.settings_tabs.tabText(index) for index in range(page.settings_tabs.count())],
                 ["Beam center and ROI", "Transmission", "Mask", "Flatfield"],
@@ -1270,6 +1363,7 @@ class TestWorkflowController(unittest.TestCase):
                 ["sample-a", "sample-b"],
                 "config_1",
                 2.5,
+                "parallel",
             )
 
         start_stitching.assert_called_once_with(
@@ -1277,6 +1371,7 @@ class TestWorkflowController(unittest.TestCase):
             ("sample-a", "sample-b"),
             "config_1",
             2.5,
+            "parallel",
             kind="stitch_selected",
         )
 

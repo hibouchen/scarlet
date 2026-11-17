@@ -70,11 +70,16 @@ merged = stitching.run_new(
     scale_on="config_1",
     normalization_factor=1.0,
 )
+
+# Or stitch one compatible sector independently.
+parallel = stitching.run_new(sector_name="parallel")
 ```
 
 Only samples whose registered scattering runs are all processed are eligible.
 Existing merged outputs are reused until one of their processed NeXus inputs
 becomes newer.
+Sector outputs are written as `<sample>_sector_<name>_merged.txt`; definitions
+must match across every processed configuration.
 
 The detailed workflow, including editable CSV filtering and persistence, is
 documented in the [Workflow context guide](https://hibouchen.github.io/scarlet/workflow/).
@@ -158,7 +163,8 @@ inspection and mask editing.
 
 The **Settings** step sits between acquisition review and processing. It
 groups beam-center and transmission-ROI verification, mask assignment, and
-flatfield preparation by configuration.
+flatfield preparation by configuration. The effective water and empty-cell
+reference transmissions are displayed directly below the configuration table.
 Its configuration overview already reports defined, missing, invalid, stale,
 or unavailable inputs and shows their detailed values when a row is selected.
 The beam-center editor uses the empty-beam transmission image, while the ROI
@@ -192,18 +198,21 @@ opposite-direction changes immediately. The isotropic curve is always retained.
 The separate **Stitching** page merges every
 processed configuration of a selected sample. Its control table identifies
 already stitched samples from the presence of `<sample>_merged.txt` in the
-output folder. Select one or more ready samples to stitch them; a reference
-configuration common to every selection can be chosen. The per-run
+output folder. The **Curves** selector stitches the isotropic curve, all common
+sectors, or one named sector. Sectors are always handled independently and
+must have matching angle, width, and opposite-direction settings. Select one
+or more ready samples to stitch them; a reference configuration common to
+every selection can be chosen. The per-run
 **Normalization factor** multiplies the stitched intensity and its uncertainty;
 it does not change q or its uncertainty.
 Use **Settings → Stitching options…** to adjust and save the greedy-stitching
 algorithm parameters used for the workflow.
 
-The **Results** page discovers isotropic, sector, and stitched I(Q) text files in the
-workflow output folder. Its search field filters by filename or result type,
-and column headers sort the visible files. Select multiple rows to overlay
-their curves in the silx plot, including their available intensity
-uncertainties.
+The **Results** page discovers isotropic, sector, stitched, and sector-stitched
+I(Q) text files in the workflow output folder. Its search field filters by
+filename or result type, and column headers sort the visible files. Select
+multiple rows to overlay their curves in the silx plot, including their
+available intensity uncertainties.
 
 ### Notebook
 

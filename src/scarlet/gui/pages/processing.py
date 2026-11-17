@@ -11,7 +11,7 @@ from scarlet.workflow.pipeline import (
     DEFAULT_AZIMUTHAL_Q_SCALE,
 )
 
-from ..models import ProcessingRunsModel, ReferenceTransmissionsModel
+from ..models import ProcessingRunsModel
 from ..readiness import assess_workflow_readiness
 from ..widgets import SectorPreviewWidget
 
@@ -69,24 +69,6 @@ class ProcessingPage(QtWidgets.QWidget):
             QtWidgets.QHeaderView.ResizeMode.Stretch,
         )
         self.table.selectionModel().selectionChanged.connect(self._selection_changed)
-
-        self.reference_transmissions_model = ReferenceTransmissionsModel(parent=self)
-        self.reference_transmissions_table = QtWidgets.QTableView()
-        self.reference_transmissions_table.setModel(self.reference_transmissions_model)
-        self.reference_transmissions_table.setAlternatingRowColors(True)
-        self.reference_transmissions_table.setEditTriggers(
-            QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers
-        )
-        self.reference_transmissions_table.setSelectionMode(
-            QtWidgets.QAbstractItemView.SelectionMode.NoSelection
-        )
-        self.reference_transmissions_table.verticalHeader().setVisible(False)
-        self.reference_transmissions_table.setMaximumHeight(130)
-        reference_header = self.reference_transmissions_table.horizontalHeader()
-        reference_header.setStretchLastSection(True)
-        reference_header.setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
-        reference_title = QtWidgets.QLabel("Reference transmissions")
-        reference_title.setObjectName("sectionTitle")
 
         self.integration_group = QtWidgets.QGroupBox("Azimuthal integration")
         integration_layout = QtWidgets.QFormLayout(self.integration_group)
@@ -223,8 +205,6 @@ class ProcessingPage(QtWidgets.QWidget):
         layout.addWidget(self.summary_label)
         layout.addWidget(self.readiness_label)
         layout.addWidget(self.content_splitter, 1)
-        layout.addWidget(reference_title)
-        layout.addWidget(self.reference_transmissions_table)
         layout.addWidget(self.integration_group)
         layout.addLayout(actions)
 
@@ -275,7 +255,6 @@ class ProcessingPage(QtWidgets.QWidget):
         self.model.set_workflow(workflow)
         self._restore_selected_run_keys(selected_run_keys)
         del blocker
-        self.reference_transmissions_model.set_workflow(workflow)
         if workflow is None:
             self._workflow_ready = False
             self._has_pending = False
@@ -322,7 +301,6 @@ class ProcessingPage(QtWidgets.QWidget):
         self._busy = bool(busy)
         preview_loading = busy and message == "Loading acquisition detector image…"
         self.table.setEnabled(not busy or preview_loading)
-        self.reference_transmissions_table.setDisabled(busy)
         self.integration_group.setDisabled(busy and not preview_loading)
         self._update_action_controls()
 

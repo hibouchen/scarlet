@@ -120,10 +120,15 @@ merged = stitching.run_new(
     scale_on="config_1",
     normalization_factor=1.0,
 )
+
+# Optional: stitch one sector without mixing it with the other directions.
+parallel = stitching.run_new(sector_name="parallel")
 ```
 
 The optional normalization factor multiplies the stitched `I` and `I_error`
 values. It does not alter q or `q_error`.
+Sector stitching requires the same named sector, angle, width, and
+opposite-direction setting in every processed configuration.
 
 See [Workflow context](workflow.md) for CSV filtering, exclusion history,
 on-demand conversion, processing status, and context persistence.

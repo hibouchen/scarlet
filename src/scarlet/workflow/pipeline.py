@@ -1638,21 +1638,96 @@ class StichingPipeline:
             and run_key.sample_name == sample_name
         ]
 
-    def _output_path(self, sample_name: str) -> Path:
-        """Return the deterministic merged-text output path for one sample."""
-        return (self.workflow.output_dir / f"{sample_name}_merged.txt").resolve()
+    def output_path(self, sample_name: str, sector_name: str | None = None) -> Path:
+        """Return the deterministic merged-text output path for one curve group."""
+        # Preserve the historical isotropic output name for existing workflows.
+        sample_token = sample_name
+        if sector_name is None:
+            file_name = f"{sample_token}_merged.txt"
+        else:
+            sector_token = _sanitize_output_token(sector_name)
+            file_name = f"{sample_token}_sector_{sector_token}_merged.txt"
+        return (self.workflow.output_dir / file_name).resolve()
 
-    def is_sample_ready(self, sample_name: str) -> bool:
-        """Return whether every registered scattering run for a sample is processed."""
+    def _output_path(self, sample_name: str, sector_name: str | None = None) -> Path:
+        """Backward-compatible private alias for :meth:`output_path`."""
+        return self.output_path(sample_name, sector_name)
+
+    @staticmethod
+    def _compatible_sector_definitions(
+        first: tuple[float, float, bool],
+        second: tuple[float, float, bool],
+    ) -> bool:
+        angle_delta = ((first[0] - second[0] + 180.0) % 360.0) - 180.0
+        return (
+            np.isclose(angle_delta, 0.0)
+            and np.isclose(first[1], second[1])
+            and first[2] == second[2]
+        )
+
+    def available_sector_names(self, sample_name: str) -> tuple[str, ...]:
+        """Return sectors present with compatible definitions in every processed run."""
+        run_keys = [
+            run_key
+            for run_key in self._sample_run_keys(sample_name)
+            if self.workflow.is_run_processed(run_key)
+        ]
+        if not run_keys:
+            return ()
+
+        names_by_run: list[set[str]] = []
+        definitions: dict[str, list[tuple[float, float, bool]]] = {}
+        for run_key in run_keys:
+            file_path = self.workflow.get_run_nexus_path(run_key)
+            if file_path is None:
+                return ()
+            sectors = nexus_reader.read_processed_sectors(file_path)
+            names_by_run.append(set(sectors))
+            for name, sector in sectors.items():
+                definitions.setdefault(name, []).append(sector.definition)
+
+        common_names = set.intersection(*names_by_run) if names_by_run else set()
+        return tuple(
+            sorted(
+                name
+                for name in common_names
+                if definitions.get(name)
+                and all(
+                    self._compatible_sector_definitions(
+                        definitions[name][0],
+                        definition,
+                    )
+                    for definition in definitions[name][1:]
+                )
+            )
+        )
+
+    def is_sample_ready(
+        self,
+        sample_name: str,
+        sector_name: str | None = None,
+    ) -> bool:
+        """Return whether all runs and the requested curve group can be stitched."""
         run_keys = self._sample_run_keys(sample_name)
-        return bool(run_keys) and all(self.workflow.is_run_processed(run_key) for run_key in run_keys)
+        processed = bool(run_keys) and all(
+            self.workflow.is_run_processed(run_key) for run_key in run_keys
+        )
+        if not processed or sector_name is None:
+            return processed
+        return sector_name in self.available_sector_names(sample_name)
 
-    def is_sample_stitched(self, sample_name: str) -> bool:
+    def is_sample_stitched(
+        self,
+        sample_name: str,
+        sector_name: str | None = None,
+    ) -> bool:
         """Return whether the merged output is present and newer than its processed inputs."""
         run_keys = self._sample_run_keys(sample_name)
         if not run_keys or not all(self.workflow.is_run_processed(run_key) for run_key in run_keys):
             return False
-        output_path = self._output_path(sample_name)
+        if sector_name is not None and not self.is_sample_ready(sample_name, sector_name):
+            return False
+        output_path = self.output_path(sample_name, sector_name)
         if not output_path.exists():
             return False
         input_paths = [self.workflow.get_run_nexus_path(run_key) for run_key in run_keys]
@@ -1671,22 +1746,54 @@ class StichingPipeline:
         scale_on: str | None = None,
         normalization_factor: float = 1.0,
         options: StitchingOptions | None = None,
+        sector_name: str | None = None,
     ) -> np.ndarray:
-        """Stitch the processed scattering runs currently available for one sample."""
+        """Stitch one isotropic or named-sector curve group for a sample."""
         options = options or StitchingOptions()
+        normalized_sector = None if sector_name is None else str(sector_name).strip()
+        if sector_name is not None and not normalized_sector:
+            raise ValueError("sector_name must not be empty")
         run_keys = self._sample_run_keys(sample_name)
         if not run_keys:
             raise ValueError(f"No sample scattering runs registered for {sample_name!r}")
 
         segments = []
         processed_config_ids: set[str] = set()
+        sector_definition: tuple[float, float, bool] | None = None
         for run_key in run_keys:
             if not self.workflow.is_run_processed(run_key):
                 continue
             file_path = self.workflow.get_run_nexus_path(run_key)
             if file_path is None:
                 continue
-            segments += st.load_segment_from_nexus(file_path, config_id=run_key.config_id)
+            if normalized_sector is None:
+                segments += st.load_segment_from_nexus(
+                    file_path,
+                    config_id=run_key.config_id,
+                )
+            else:
+                sectors = nexus_reader.read_processed_sectors(file_path)
+                sector = sectors.get(normalized_sector)
+                if sector is None:
+                    raise ValueError(
+                        f"Sector {normalized_sector!r} is missing for "
+                        f"{sample_name!r} in {run_key.config_id}."
+                    )
+                if sector_definition is None:
+                    sector_definition = sector.definition
+                elif not self._compatible_sector_definitions(
+                    sector_definition,
+                    sector.definition,
+                ):
+                    raise ValueError(
+                        f"Sector {normalized_sector!r} has incompatible definitions "
+                        f"between configurations of {sample_name!r}."
+                    )
+                segments += st.load_sector_segment_from_nexus(
+                    file_path,
+                    normalized_sector,
+                    config_id=run_key.config_id,
+                )
             processed_config_ids.add(run_key.config_id)
 
         if not segments:
@@ -1712,12 +1819,25 @@ class StichingPipeline:
                 result.origin_segment_id,
             ]
         )
-        header = "q I I_error q_error origin_segment_id\n" + "\n".join(
-            f"origin_segment_id {idx}: {name}" for idx, name in result.origin_map.items()
+        header_lines = []
+        if normalized_sector is not None and sector_definition is not None:
+            header_lines.extend(
+                (
+                    f"sector_name: {normalized_sector}",
+                    f"sector_center_deg: {sector_definition[0]:.12g}",
+                    f"sector_width_deg: {sector_definition[1]:.12g}",
+                    "sector_include_opposite: "
+                    + str(sector_definition[2]).lower(),
+                )
+            )
+        header_lines.append("q I I_error q_error origin_segment_id")
+        header_lines.extend(
+            f"origin_segment_id {idx}: {name}"
+            for idx, name in result.origin_map.items()
         )
-        output_path = self._output_path(sample_name)
+        output_path = self.output_path(sample_name, normalized_sector)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savetxt(output_path, final_data, header=header)
+        np.savetxt(output_path, final_data, header="\n".join(header_lines))
         return final_data
 
     def _sample_names(self) -> list[str]:
@@ -1737,6 +1857,7 @@ class StichingPipeline:
         scale_on: str | None = None,
         normalization_factor: float = 1.0,
         options: StitchingOptions | None = None,
+        sector_name: str | None = None,
     ) -> dict[str, np.ndarray]:
         """Stitch every registered sample, raising on the first failure."""
         kwargs: dict[str, Any] = {
@@ -1745,6 +1866,8 @@ class StichingPipeline:
         }
         if options is not None:
             kwargs["options"] = options
+        if sector_name is not None:
+            kwargs["sector_name"] = sector_name
         return {
             sample_name: self.run_for_sample(sample_name, **kwargs)
             for sample_name in self._sample_names()
@@ -1755,12 +1878,14 @@ class StichingPipeline:
         scale_on: str | None = None,
         normalization_factor: float = 1.0,
         options: StitchingOptions | None = None,
+        sector_name: str | None = None,
     ) -> dict[str, np.ndarray]:
         """Stitch ready samples without current merged outputs, logging failures."""
         pending_samples = [
             sample_name
             for sample_name in self._sample_names()
-            if self.is_sample_ready(sample_name) and not self.is_sample_stitched(sample_name)
+            if self.is_sample_ready(sample_name, sector_name)
+            and not self.is_sample_stitched(sample_name, sector_name)
         ]
         results: dict[str, np.ndarray] = {}
         failed_count = 0
@@ -1770,6 +1895,8 @@ class StichingPipeline:
         }
         if options is not None:
             kwargs["options"] = options
+        if sector_name is not None:
+            kwargs["sector_name"] = sector_name
         for sample_name in pending_samples:
             try:
                 results[sample_name] = self.run_for_sample(sample_name, **kwargs)

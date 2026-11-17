@@ -8,6 +8,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 
+from scarlet.io import read_processed_sectors
 from scarlet.reduction import Sector
 from scarlet.workflow.configuration import Configuration
 from scarlet.workflow.context import RunKey, WorkflowContext
@@ -186,6 +187,12 @@ class TestPipelineSectorStep(unittest.TestCase):
                     float(handle[f"{sector_root}/sector_width"][()]),
                     60.0,
                 )
+
+            sectors = read_processed_sectors(sample_path)
+            self.assertEqual(set(sectors), {"parallel"})
+            self.assertEqual(sectors["parallel"].definition, (0.0, 60.0, True))
+            self.assertEqual(len(sectors["parallel"].detectors), 1)
+            self.assertEqual(sectors["parallel"].detectors[0].shape, (3, 4))
 
             sector_path = root / "out" / "sample_config_cfg_sector_parallel.txt"
             self.assertTrue(sector_path.exists())
