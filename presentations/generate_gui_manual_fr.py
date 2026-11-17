@@ -649,7 +649,7 @@ def build_presentation(shots: dict[str, Path]) -> None:
     _round_rect(slide, 0.75, 3.55, 7.4, 2.25, fill=WHITE, line=LINE)
     _add_text(slide, "Ce guide accompagne l’opérateur page par page :", 1.02, 3.86, 6.8, 0.35, size=16, bold=True)
     _add_bullets(slide, ["préparer et valider le workflow", "réduire en isotrope ou par secteurs", "raccorder puis comparer les courbes"], 1.02, 4.30, 6.65, 1.25, size=15)
-    _add_text(slide, "Version 0.4.0 · 17 novembre 2026", 0.75, 6.75, 5.4, 0.3, size=11, color=MUTED)
+    _add_text(slide, "Version 0.5.0 · 17 novembre 2026", 0.75, 6.75, 5.4, 0.3, size=11, color=MUTED)
 
     slide = _new_slide(prs, "Le parcours en 6 étapes", "Vue d’ensemble", 2)
     cards = (

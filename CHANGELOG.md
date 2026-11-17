@@ -10,6 +10,15 @@ The project follows a simple Semantic Versioning policy:
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-17
+
+- Reduction: added directional sector integration alongside the isotropic average, with configurable direction, angular width, opposite-sector combination, and detector preview overlays.
+- Stitching: added stitching for individual named sectors or every compatible sector shared by a sample's processed configurations.
+- GUI: added sector controls and visualization to Processing, sector-family selection to Stitching, and sector-specific result types to Results.
+- GUI: moved the effective water and empty-cell transmission table from Processing to Settings below the configuration overview.
+- NeXus I/O: added reading and validation of processed sector curves and their angular definitions.
+- Documentation: updated the workflow and tutorial documentation and added graphical user interface manuals with current application screenshots.
+
 ## [0.4.0] - 2026-10-15
 
 - GUI: added the desktop workflow interface for acquisition review, instrument settings, processing, stitching, and result visualization.

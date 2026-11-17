@@ -20,7 +20,7 @@ TRANSLATIONS = {
     "•  préparer et valider le workflow": "•  prepare and validate the workflow",
     "•  réduire en isotrope ou par secteurs": "•  reduce isotropic or sector data",
     "•  raccorder puis comparer les courbes": "•  stitch and compare the curves",
-    "Version 0.4.0 · 17 novembre 2026": "Version 0.4.0 · November 17, 2026",
+    "Version 0.5.0 · 17 novembre 2026": "Version 0.5.0 · November 17, 2026",
     "VUE D’ENSEMBLE": "OVERVIEW",
     "Le parcours en 6 étapes": "The 6-step workflow",
     "SCARLET · Manuel de l’interface graphique": "SCARLET · Graphical User Interface Manual",
